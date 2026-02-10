@@ -1,0 +1,65 @@
+{
+  "name": "@prostojs/redisjm",
+  "version": "0.0.1",
+  "description": "Redis Job Manager for distributed job queues in k8s-like multi-instance environments",
+  "type": "module",
+  "main": "dist/index.cjs",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "sideEffects": false,
+  "exports": {
+    "./package.json": "./package.json",
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "rolldown -c rolldown.config.ts && tsc && rollup -c rollup.config.js && rm -rf .types",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:cov": "vitest run --coverage",
+    "lint": "eslint --ext .ts src/**.ts --fix",
+    "changelog": "conventional-changelog -p angular -i CHANGELOG.md -s",
+    "version": "pnpm changelog && git add CHANGELOG.md && git commit -m 'chore: update changelog'",
+    "release": "pnpm test && pnpm build && npm version patch && git push --follow-tags && npm publish --access public",
+    "release:patch": "pnpm test && pnpm build && npm version patch && git push --follow-tags && npm publish --access public",
+    "release:minor": "pnpm test && pnpm build && npm version minor && git push --follow-tags && npm publish --access public",
+    "release:major": "pnpm test && pnpm build && npm version major && git push --follow-tags && npm publish --access public",
+    "prepare": "husky"
+  },
+  "keywords": [
+    "redis",
+    "job",
+    "queue",
+    "manager",
+    "distributed",
+    "k8s"
+  ],
+  "author": "Artem Maltsev",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/prostojs/redisjm/issues"
+  },
+  "homepage": "https://github.com/prostojs/redisjm#readme",
+  "devDependencies": {
+    "@commitlint/cli": "^19.8.1",
+    "@commitlint/config-conventional": "^19.8.1",
+    "@types/node": "^24.10.12",
+    "conventional-changelog-cli": "^5.0.0",
+    "husky": "^9.1.7",
+    "rolldown": "1.0.0-beta.19",
+    "rollup": "^4.57.1",
+    "rollup-plugin-dts": "^6.3.0",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4"
+  },
+  "dependencies": {
+    "hookable": "^5.5.3",
+    "ioredis": "^5.9.2"
+  }
+}
