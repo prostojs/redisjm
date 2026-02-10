@@ -1,6 +1,6 @@
 {
   "name": "@prostojs/redisjm",
-  "version": "0.0.1",
+  "version": "0.0.0",
   "description": "Redis Job Manager for distributed job queues in k8s-like multi-instance environments",
   "type": "module",
   "main": "dist/index.cjs",
