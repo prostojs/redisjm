@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { RedisJM } from '../redisjm'
 import { Job } from '../job'
+import { createMaintenanceJob } from '../maintenance'
 import type { JobContext, JobLogRecord } from '../types'
 import { createMockRedis } from './mock-redis'
 
@@ -25,6 +26,7 @@ describe('RedisJM', () => {
         heartbeatInterval: 5000,
         roundsToStale: 2,
         keepFinishedInterval: 0,
+        maintenanceInterval: 10000, // heartbeatInterval * roundsToStale
       })
     })
 
@@ -34,7 +36,13 @@ describe('RedisJM', () => {
         heartbeatInterval: 1000,
         roundsToStale: 2,
         keepFinishedInterval: 60000,
+        maintenanceInterval: 2000, // derived from custom heartbeatInterval
       })
+    })
+
+    it('should accept explicit maintenanceInterval', () => {
+      const m = new RedisJM(redis, 'g', { maintenanceInterval: 0 })
+      expect(m.getOptions().maintenanceInterval).toBe(0)
     })
   })
 
@@ -542,6 +550,194 @@ describe('RedisJM', () => {
 
       const result = await m.performMaintenance()
       expect(result.cleanedCount).toBe(2)
+    })
+
+    it('should reclaim an orphaned queued record in two passes', async () => {
+      // Simulates an instance that died between lpop and the 'start' event:
+      // record is 'queued' + locked but absent from the queue list.
+      const m = new RedisJM(redis, 'test-group', {
+        heartbeatInterval: 1000,
+        roundsToStale: 2,
+        keepFinishedInterval: 60000,
+      })
+      const jobId = 'orphan#run1'
+      await redis.sadd('redisjm:test-group:locks', jobId)
+      await redis.hset('redisjm:test-group:log', jobId, JSON.stringify({
+        jobId, jobName: 'orphan', runId: 'run1', inputs: null,
+        targetGroup: 'test-group', status: 'queued', progress: 0,
+      }))
+
+      // Pass 1: marks the record as a suspect, keeps the lock
+      let result = await m.performMaintenance()
+      expect(result.staleCount).toBe(0)
+      let record = JSON.parse((await redis.hget('redisjm:test-group:log', jobId))!) as JobLogRecord
+      expect(record.status).toBe('queued')
+      expect(record.suspectedAt).toBeGreaterThan(0)
+      expect(await redis.sismember('redisjm:test-group:locks', jobId)).toBe(1)
+
+      // Pass 2 within the threshold: still a suspect, nothing reclaimed
+      result = await m.performMaintenance()
+      expect(result.staleCount).toBe(0)
+
+      // Pass 3 past the threshold: reclaimed
+      record.suspectedAt = Date.now() - 3000 // > heartbeatInterval * roundsToStale
+      await redis.hset('redisjm:test-group:log', jobId, JSON.stringify(record))
+      result = await m.performMaintenance()
+      expect(result.staleCount).toBe(1)
+
+      record = JSON.parse((await redis.hget('redisjm:test-group:log', jobId))!) as JobLogRecord
+      expect(record.status).toBe('stale')
+      expect(record.suspectedAt).toBeUndefined()
+      expect(await redis.sismember('redisjm:test-group:locks', jobId)).toBe(0)
+    })
+
+    it('should not suspect a queued record that is still in the queue', async () => {
+      const m = new RedisJM(redis, 'test-group', {
+        heartbeatInterval: 1000,
+        roundsToStale: 2,
+        keepFinishedInterval: 60000,
+      })
+      const job = new Job({ jobName: 'waiting' }, vi.fn())
+      await m.queue(job, 'run1', null)
+
+      const result = await m.performMaintenance()
+      expect(result.staleCount).toBe(0)
+      const record = JSON.parse((await redis.hget('redisjm:test-group:log', 'waiting#run1'))!) as JobLogRecord
+      expect(record.suspectedAt).toBeUndefined()
+    })
+
+    it('should clear suspectedAt when the record reappears in the queue', async () => {
+      const m = new RedisJM(redis, 'test-group', {
+        heartbeatInterval: 1000,
+        roundsToStale: 2,
+        keepFinishedInterval: 60000,
+      })
+      const jobId = 'requeued#run1'
+      await redis.sadd('redisjm:test-group:locks', jobId)
+      await redis.rpush('redisjm:test-group:queue', jobId)
+      await redis.hset('redisjm:test-group:log', jobId, JSON.stringify({
+        jobId, jobName: 'requeued', runId: 'run1', inputs: null,
+        targetGroup: 'test-group', status: 'queued', progress: 0,
+        suspectedAt: Date.now() - 10000,
+      }))
+
+      const result = await m.performMaintenance()
+      expect(result.staleCount).toBe(0)
+      const record = JSON.parse((await redis.hget('redisjm:test-group:log', jobId))!) as JobLogRecord
+      expect(record.suspectedAt).toBeUndefined()
+      expect(record.status).toBe('queued')
+    })
+
+    it('should clear suspectedAt when the job starts normally', async () => {
+      const m = new RedisJM(redis, 'test-group', { keepFinishedInterval: 60000 })
+      const job = m.createJob({ jobName: 'survivor' }, vi.fn())
+      await m.queue(job, 'run1', null)
+
+      // Maintenance stamped the record while it sat in the pop→start window
+      const jobId = 'survivor#run1'
+      const stamped = JSON.parse((await redis.hget('redisjm:test-group:log', jobId))!) as JobLogRecord
+      stamped.suspectedAt = Date.now()
+      await redis.hset('redisjm:test-group:log', jobId, JSON.stringify(stamped))
+
+      await m.popAndExecute()
+
+      const record = JSON.parse((await redis.hget('redisjm:test-group:log', jobId))!) as JobLogRecord
+      expect(record.status).toBe('finished')
+      expect(record.suspectedAt).toBeUndefined()
+    })
+  })
+
+  describe('auto-maintenance via start()', () => {
+    afterEach(() => {
+      manager.stop()
+    })
+
+    it('should enqueue and run maintenance on start', async () => {
+      vi.useFakeTimers()
+      const m = new RedisJM(redis, 'test-group', {
+        heartbeatInterval: 1000,
+        roundsToStale: 2,
+        keepFinishedInterval: 60000,
+      })
+      // Stale record left behind by a "crashed" instance
+      const jobId = 'crashed#run1'
+      await redis.sadd('redisjm:test-group:locks', jobId)
+      await redis.hset('redisjm:test-group:log', jobId, JSON.stringify({
+        jobId, jobName: 'crashed', runId: 'run1', inputs: null,
+        targetGroup: 'test-group', status: 'running', progress: 0,
+        startedAt: Date.now() - 10000, heartbeat: Date.now() - 10000,
+      }))
+
+      m.start(100)
+      // The enqueue is async: the first poll may race it, so the maintenance run
+      // lands on the next poll tick at the latest.
+      await vi.advanceTimersByTimeAsync(100)
+
+      const record = JSON.parse((await redis.hget('redisjm:test-group:log', jobId))!) as JobLogRecord
+      expect(record.status).toBe('stale')
+      expect(await redis.sismember('redisjm:test-group:locks', jobId)).toBe(0)
+
+      m.stop()
+      vi.useRealTimers()
+    })
+
+    it('should re-enqueue maintenance every maintenanceInterval', async () => {
+      vi.useFakeTimers()
+      const m = new RedisJM(redis, 'test-group', { maintenanceInterval: 500 })
+      const spy = vi.spyOn(m, 'performMaintenance')
+
+      m.start(100)
+      await vi.advanceTimersByTimeAsync(100) // immediate enqueue picked up by next poll
+      expect(spy).toHaveBeenCalledTimes(1)
+
+      await vi.advanceTimersByTimeAsync(700) // interval tick at 500 + a poll to execute it
+      expect(spy.mock.calls.length).toBeGreaterThanOrEqual(2)
+
+      m.stop()
+      vi.useRealTimers()
+    })
+
+    it('should not enqueue maintenance when maintenanceInterval is 0', async () => {
+      vi.useFakeTimers()
+      const m = new RedisJM(redis, 'test-group', { maintenanceInterval: 0 })
+      const spy = vi.spyOn(m, 'performMaintenance')
+
+      m.start(100)
+      await vi.advanceTimersByTimeAsync(1000)
+      expect(spy).not.toHaveBeenCalled()
+
+      m.stop()
+      vi.useRealTimers()
+    })
+
+    it('should reuse a consumer-registered maintenance job', async () => {
+      vi.useFakeTimers()
+      const m = new RedisJM(redis, 'test-group', { maintenanceInterval: 500 })
+      const job = createMaintenanceJob(m)
+      expect(job.getName()).toBe('__redisjm_maintenance')
+
+      // start() must not throw "already registered"
+      expect(() => m.start(100)).not.toThrow()
+      await vi.advanceTimersByTimeAsync(0)
+
+      m.stop()
+      vi.useRealTimers()
+    })
+
+    it('should stop enqueuing maintenance after stop()', async () => {
+      vi.useFakeTimers()
+      const m = new RedisJM(redis, 'test-group', { maintenanceInterval: 500 })
+      const spy = vi.spyOn(m, 'performMaintenance')
+
+      m.start(100)
+      await vi.advanceTimersByTimeAsync(0)
+      const callsAtStop = spy.mock.calls.length
+      m.stop()
+
+      await vi.advanceTimersByTimeAsync(2000)
+      expect(spy.mock.calls.length).toBe(callsAtStop)
+
+      vi.useRealTimers()
     })
   })
 

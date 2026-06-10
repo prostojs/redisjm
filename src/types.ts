@@ -25,6 +25,12 @@ export interface RedisJMOptions {
   roundsToStale?: number
   /** Milliseconds to keep finished/error/stale records in the log; `0` removes immediately (default: `0`) */
   keepFinishedInterval?: number
+  /**
+   * Milliseconds between automatic maintenance enqueues while `start()` is polling;
+   * `0` disables auto-maintenance (default: `heartbeatInterval * roundsToStale`).
+   * All instances enqueue concurrently — the lock ensures only one maintenance run executes.
+   */
+  maintenanceInterval?: number
 }
 
 /** Resolved version of `RedisJMOptions` with all defaults applied. */
@@ -32,6 +38,7 @@ export interface ResolvedRedisJMOptions {
   heartbeatInterval: number
   roundsToStale: number
   keepFinishedInterval: number
+  maintenanceInterval: number
 }
 
 /** A full job state record stored in the Redis log hash. */
@@ -56,6 +63,12 @@ export interface JobLogRecord<TInputs = unknown, TAttrs extends { [K in keyof TA
   attrs?: TAttrs
   /** Error message if the job failed */
   error?: string
+  /**
+   * Epoch ms when maintenance first observed this `queued` record missing from the queue list
+   * (orphan suspect — popped by an instance that died before the `start` event). Cleared when
+   * the job starts normally; if still set and expired on a later scan, the record goes `stale`.
+   */
+  suspectedAt?: number
 }
 
 /** Options for `Job.execute()`. */

@@ -68,6 +68,12 @@ export function createMockRedis(): Redis & { _dump: () => { store: Map<string, s
       list.splice(idx, 1)
       return 1
     }),
+    lpos: vi.fn(async (key: string, value: string) => {
+      const list = lists.get(key)
+      if (!list) return null
+      const idx = list.indexOf(value)
+      return idx === -1 ? null : idx
+    }),
 
     // Hash commands
     hget: vi.fn(async (key: string, field: string) => {

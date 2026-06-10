@@ -1,6 +1,7 @@
 import { Hookable } from 'hookable'
 import type Redis from 'ioredis'
 import { Job } from './job'
+import { createMaintenanceJob, MAINTENANCE_JOB_NAME } from './maintenance'
 import type {
   JobAttrs,
   JobAttrValue,
@@ -16,7 +17,7 @@ import type {
   ResolvedRedisJMOptions,
 } from './types'
 
-const DEFAULT_OPTIONS: ResolvedRedisJMOptions = {
+const DEFAULT_OPTIONS: Omit<ResolvedRedisJMOptions, 'maintenanceInterval'> = {
   heartbeatInterval: 5000,
   roundsToStale: 2,
   keepFinishedInterval: 0,
@@ -50,17 +51,25 @@ export class RedisJM extends Hookable<RedisJMHooks> {
 
   private pollTimer: ReturnType<typeof setTimeout> | undefined
   private polling = false
+  private maintenanceTimer: ReturnType<typeof setInterval> | undefined
 
   /**
    * @param redis - An ioredis client instance
    * @param targetGroup - String prefix for all Redis keys; only managers sharing the same target group share queues
-   * @param options - Optional configuration for heartbeat, stale detection, and log retention
+   * @param options - Optional configuration for heartbeat, stale detection, log retention, and auto-maintenance
    */
   constructor(redis: Redis, targetGroup: string, options?: RedisJMOptions) {
     super()
     this.redis = redis
     this.targetGroup = targetGroup
-    this.options = { ...DEFAULT_OPTIONS, ...options }
+    const heartbeatInterval = options?.heartbeatInterval ?? DEFAULT_OPTIONS.heartbeatInterval
+    const roundsToStale = options?.roundsToStale ?? DEFAULT_OPTIONS.roundsToStale
+    this.options = {
+      heartbeatInterval,
+      roundsToStale,
+      keepFinishedInterval: options?.keepFinishedInterval ?? DEFAULT_OPTIONS.keepFinishedInterval,
+      maintenanceInterval: options?.maintenanceInterval ?? heartbeatInterval * roundsToStale,
+    }
   }
 
   /** Returns the target group identifier for this manager. */
@@ -191,6 +200,7 @@ export class RedisJM extends Hookable<RedisJMHooks> {
         record.status = 'running'
         record.startedAt = Date.now()
         record.heartbeat = Date.now()
+        delete record.suspectedAt
       })
       await this.callHook('start', payload as unknown as JobEventPayload)
     }
@@ -342,6 +352,10 @@ export class RedisJM extends Hookable<RedisJMHooks> {
    * Starts a polling loop that calls `popAndExecute()`. Polls immediately after a job executes;
    * waits `interval` ms when the queue is empty.
    *
+   * Unless `maintenanceInterval` is `0`, also enqueues the built-in maintenance job — once
+   * immediately (so locks orphaned by a crash are reclaimed soon after restart) and then every
+   * `maintenanceInterval` ms. All instances enqueue concurrently; the lock dedupes the runs.
+   *
    * @param interval - Milliseconds to wait between polls when idle
    *
    * @example
@@ -352,6 +366,15 @@ export class RedisJM extends Hookable<RedisJMHooks> {
   start(interval: number): void {
     if (this.polling) return
     this.polling = true
+
+    if (this.options.maintenanceInterval > 0) {
+      const job = this.jobsByName.get(MAINTENANCE_JOB_NAME) ?? createMaintenanceJob(this)
+      const tryQueue = () => {
+        this.queue(job, '', null).catch(() => {})
+      }
+      tryQueue()
+      this.maintenanceTimer = setInterval(tryQueue, this.options.maintenanceInterval)
+    }
 
     const poll = async () => {
       if (!this.polling) return
@@ -382,12 +405,20 @@ export class RedisJM extends Hookable<RedisJMHooks> {
       clearTimeout(this.pollTimer)
       this.pollTimer = undefined
     }
+    if (this.maintenanceTimer) {
+      clearInterval(this.maintenanceTimer)
+      this.maintenanceTimer = undefined
+    }
   }
 
   /**
    * Scans the job log for stale and expired records:
    * 1. Marks running jobs as `"stale"` if heartbeat expired (`now - lastHeartbeat > heartbeatInterval * roundsToStale`)
-   * 2. Removes finished/error/stale records older than `keepFinishedInterval`
+   * 2. Marks orphaned queued jobs as `"stale"` — a `queued` record that is no longer in the queue
+   *    list was popped by an instance that died before the `start` event fired. Detection is
+   *    two-pass to avoid racing the normal pop→start window: the first scan stamps `suspectedAt`,
+   *    a later scan reclaims the lock if the record is still orphaned past the stale threshold.
+   * 3. Removes finished/error/stale records older than `keepFinishedInterval`
    *
    * @returns Counts of stale and cleaned records
    *
@@ -417,6 +448,24 @@ export class RedisJM extends Hookable<RedisJMHooks> {
           await this.redis.hset(logKey, jobId, JSON.stringify(record))
           await this.redis.srem(locksKey, jobId)
           staleCount++
+        }
+      } else if (record.status === 'queued') {
+        const queuePosition = await this.redis.lpos(this.getQueueKey(), jobId)
+        if (queuePosition === null) {
+          if (record.suspectedAt === undefined) {
+            record.suspectedAt = now
+            await this.redis.hset(logKey, jobId, JSON.stringify(record))
+          } else if (now - record.suspectedAt > staleThreshold) {
+            record.status = 'stale'
+            record.finishedAt = now
+            delete record.suspectedAt
+            await this.redis.hset(logKey, jobId, JSON.stringify(record))
+            await this.redis.srem(locksKey, jobId)
+            staleCount++
+          }
+        } else if (record.suspectedAt !== undefined) {
+          delete record.suspectedAt
+          await this.redis.hset(logKey, jobId, JSON.stringify(record))
         }
       } else if (record.status === 'finished' || record.status === 'error' || record.status === 'stale') {
         if (record.finishedAt !== undefined && now - record.finishedAt > this.options.keepFinishedInterval) {

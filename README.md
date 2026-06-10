@@ -84,6 +84,7 @@ new RedisJM(redis: Redis, targetGroup: string, options?: RedisJMOptions)
 | `heartbeatInterval` | `5000` | Milliseconds between heartbeat updates during job execution |
 | `roundsToStale` | `2` | Number of missed heartbeat intervals before a job is considered stale |
 | `keepFinishedInterval` | `0` | Milliseconds to keep finished/error/stale records in the log (0 = remove immediately) |
+| `maintenanceInterval` | `heartbeatInterval * roundsToStale` | Milliseconds between automatic maintenance enqueues while `start()` is polling (0 = disable auto-maintenance) |
 
 #### Methods
 
@@ -152,19 +153,22 @@ If the job name is not registered, the log record is set to status `"error"` wit
 
 Starts a polling loop that calls `popAndExecute()`. When a job is executed, the next poll fires immediately. When the queue is empty, waits `interval` ms before the next poll.
 
+Unless `maintenanceInterval` is `0`, `start()` also auto-wires maintenance: it enqueues the built-in maintenance job once immediately (so locks orphaned by a crashed instance are reclaimed soon after restart) and then every `maintenanceInterval` ms. All instances enqueue concurrently — the lock ensures only one maintenance run executes at a time.
+
 ```typescript
 manager.start(1000) // poll every 1 second when idle
 ```
 
 ##### `stop(): void`
 
-Stops the polling loop. The currently executing job (if any) will finish.
+Stops the polling loop and the auto-maintenance timer. The currently executing job (if any) will finish.
 
 ##### `performMaintenance(): Promise<MaintenanceResult>`
 
 Scans the job log and:
 1. Marks running jobs as `"stale"` if `now - lastHeartbeat > heartbeatInterval * roundsToStale`, removes their lock
-2. Removes finished/error/stale log records older than `keepFinishedInterval`
+2. Marks orphaned queued jobs as `"stale"` and removes their lock — a `queued` record that is no longer in the queue list was popped by an instance that died before the `start` event fired. Detection is two-pass to avoid racing the normal pop→start window: the first scan stamps `suspectedAt` on the record; a later scan reclaims it if it is still orphaned after the stale threshold.
+3. Removes finished/error/stale log records older than `keepFinishedInterval`
 
 Returns `{ staleCount, cleanedCount }`.
 
@@ -240,6 +244,8 @@ Returns `"jobName#runId"`.
 ### `createMaintenanceJob(manager): Job<null>`
 
 Factory function that creates and registers a pre-defined maintenance job. When executed, it calls `manager.performMaintenance()` to detect stale jobs and clean up expired log records.
+
+> **Note:** `manager.start()` wires maintenance automatically (see the `maintenanceInterval` option). Manual wiring as shown below is only needed when auto-maintenance is disabled (`maintenanceInterval: 0`) or when maintenance must run on a separate schedule. `start()` reuses a maintenance job you registered yourself.
 
 Maintenance is idempotent -- each run scans the full log regardless of prior state. Use an empty `runId` (`''`) so that at most one maintenance job is queued or running at any time. The lock is released on completion, allowing the next `queue` call to succeed. There is no need for time-based runIds.
 
@@ -371,6 +377,7 @@ interface RedisJMOptions {
   heartbeatInterval?: number    // default 5000
   roundsToStale?: number        // default 2
   keepFinishedInterval?: number // default 0
+  maintenanceInterval?: number  // default heartbeatInterval * roundsToStale; 0 disables
 }
 
 interface JobLogRecord<TInputs = unknown, TAttrs extends JobAttrs = JobAttrs> {
@@ -386,6 +393,7 @@ interface JobLogRecord<TInputs = unknown, TAttrs extends JobAttrs = JobAttrs> {
   progress: number
   attrs?: TAttrs
   error?: string
+  suspectedAt?: number          // internal: orphaned-queued suspect timestamp (maintenance)
 }
 
 interface JobContext<TAttrs extends JobAttrs = JobAttrs> {
