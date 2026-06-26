@@ -1,3 +1,12 @@
+## [0.0.3](https://github.com/prostojs/redisjm/compare/v0.0.2...v0.0.3) (2026-06-26)
+
+
+### Features
+
+* default error logging, bounded unknown-job requeue, awaitable stop, resilience hardening ([42a39a9](https://github.com/prostojs/redisjm/commit/42a39a904d85dd21740a1edf89bcf763dac2d1f9))
+
+
+
 ## [0.0.2](https://github.com/prostojs/redisjm/compare/v0.0.1...v0.0.2) (2026-06-10)
 
 
