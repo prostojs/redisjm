@@ -27,6 +27,7 @@ describe('RedisJM', () => {
         roundsToStale: 2,
         keepFinishedInterval: 0,
         maintenanceInterval: 10000, // heartbeatInterval * roundsToStale
+        unknownJobRequeueLimit: 5,
       })
     })
 
@@ -37,6 +38,7 @@ describe('RedisJM', () => {
         roundsToStale: 2,
         keepFinishedInterval: 60000,
         maintenanceInterval: 2000, // derived from custom heartbeatInterval
+        unknownJobRequeueLimit: 5,
       })
     })
 
@@ -353,8 +355,12 @@ describe('RedisJM', () => {
       expect(fn).toHaveBeenCalledWith({ data: 'test' }, expect.any(Object))
     })
 
-    it('should handle unknown job name gracefully', async () => {
-      const m = new RedisJM(redis, 'test-group', { keepFinishedInterval: 60000 })
+    it('should drop an unknown job name immediately when unknownJobRequeueLimit is 0', async () => {
+      const m = new RedisJM(redis, 'test-group', {
+        keepFinishedInterval: 60000,
+        unknownJobRequeueLimit: 0,
+        logger: false,
+      })
       const jobId = 'unknownJob#run1'
       await redis.sadd('redisjm:test-group:locks', jobId)
       await redis.rpush('redisjm:test-group:queue', jobId)
@@ -371,6 +377,56 @@ describe('RedisJM', () => {
       expect(record.status).toBe('error')
       expect(record.error).toBe('Job name is unknown')
       expect(await m.isQueued(jobId)).toBe(false)
+    })
+
+    it('should re-queue an unknown job name up to the limit, keeping the lock, then drop it', async () => {
+      const m = new RedisJM(redis, 'test-group', {
+        keepFinishedInterval: 60000,
+        unknownJobRequeueLimit: 2,
+        logger: false,
+      })
+      const jobId = 'unknownJob#run1'
+      await redis.sadd('redisjm:test-group:locks', jobId)
+      await redis.rpush('redisjm:test-group:queue', jobId)
+      await redis.hset('redisjm:test-group:log', jobId, JSON.stringify({
+        jobId, jobName: 'unknownJob', runId: 'run1', inputs: null,
+        targetGroup: 'test-group', status: 'queued', progress: 0,
+      }))
+
+      // Pop 1 + 2: re-queued each time (returns false = deferred, not executed), lock retained,
+      // still back in the queue.
+      for (let i = 1; i <= 2; i++) {
+        expect(await m.popAndExecute()).toBe(false)
+        const record = JSON.parse((await redis.hget('redisjm:test-group:log', jobId))!) as JobLogRecord
+        expect(record.status).toBe('queued')
+        expect(record.requeueCount).toBe(i)
+        expect(await m.isQueued(jobId)).toBe(true)
+        expect(await redis.lpos('redisjm:test-group:queue', jobId)).not.toBeNull()
+      }
+
+      // Pop 3: budget exhausted → mark error and release the lock.
+      expect(await m.popAndExecute()).toBe(true)
+      const record = JSON.parse((await redis.hget('redisjm:test-group:log', jobId))!) as JobLogRecord
+      expect(record.status).toBe('error')
+      expect(record.error).toBe('Job name is unknown')
+      expect(await m.isQueued(jobId)).toBe(false)
+    })
+
+    it('should let a sibling instance claim a re-queued unknown job', async () => {
+      // Instance A has no handler; instance B (sharing the same Redis/group) does.
+      const a = new RedisJM(redis, 'test-group', { keepFinishedInterval: 60000, logger: false })
+      const b = new RedisJM(redis, 'test-group', { keepFinishedInterval: 60000, logger: false })
+      const handled: string[] = []
+      b.createJob({ jobName: 'rolling' }, vi.fn(async (input: string) => { handled.push(input) }))
+
+      await a.queue(new Job({ jobName: 'rolling' }, vi.fn()), 'run1', 'payload')
+
+      // A pops first and re-queues (no handler → returns false/deferred); B then pops and runs it.
+      expect(await a.popAndExecute()).toBe(false)
+      expect(handled).toEqual([])
+      expect(await b.popAndExecute()).toBe(true)
+      expect(handled).toEqual(['payload'])
+      expect(await b.isQueued('rolling#run1')).toBe(false)
     })
 
     it('should process jobs in FIFO order', async () => {
@@ -669,9 +725,9 @@ describe('RedisJM', () => {
       }))
 
       m.start(100)
-      // The enqueue is async: the first poll may race it, so the maintenance run
-      // lands on the next poll tick at the latest.
-      await vi.advanceTimersByTimeAsync(100)
+      // The async reclaim→enqueue bootstrap plus the pop+execute take several poll cycles to
+      // settle; drain a few so the assertion is deterministic (no flake).
+      for (let i = 0; i < 4; i++) await vi.advanceTimersByTimeAsync(100)
 
       const record = JSON.parse((await redis.hget('redisjm:test-group:log', jobId))!) as JobLogRecord
       expect(record.status).toBe('stale')
@@ -687,7 +743,8 @@ describe('RedisJM', () => {
       const spy = vi.spyOn(m, 'performMaintenance')
 
       m.start(100)
-      await vi.advanceTimersByTimeAsync(100) // immediate enqueue picked up by next poll
+      // Drain the immediate enqueue (still well before the 500ms interval tick).
+      for (let i = 0; i < 3; i++) await vi.advanceTimersByTimeAsync(100)
       expect(spy).toHaveBeenCalledTimes(1)
 
       await vi.advanceTimersByTimeAsync(700) // interval tick at 500 + a poll to execute it
@@ -792,6 +849,212 @@ describe('RedisJM', () => {
       // After finish, lock is removed
       expect(await m.isQueued('blockJob#run1')).toBe(false)
       expect(await m.queue(job, 'run1', 'input')).toBe(true)
+    })
+  })
+
+  describe('get', () => {
+    it('should return a single record by jobId', async () => {
+      const m = new RedisJM(redis, 'test-group', { keepFinishedInterval: 60000 })
+      const job = new Job({ jobName: 'g' }, vi.fn())
+      await m.queue(job, 'r1', { a: 1 })
+      const record = await m.get('g#r1')
+      expect(record?.jobName).toBe('g')
+      expect(record?.status).toBe('queued')
+      expect(record?.inputs).toEqual({ a: 1 })
+    })
+
+    it('should return undefined when the record is absent', async () => {
+      expect(await manager.get('nope#r1')).toBeUndefined()
+    })
+  })
+
+  describe('jobName validation', () => {
+    it('should reject a job name containing "#"', () => {
+      expect(() => manager.registerJob(new Job({ jobName: 'a#b' }, vi.fn()))).toThrow('must not contain "#"')
+      expect(() => manager.createJob({ jobName: 'x#y' }, vi.fn())).toThrow('must not contain "#"')
+    })
+  })
+
+  describe('enqueue ordering', () => {
+    it('should write the log record before pushing the queue entry', async () => {
+      const job = new Job({ jobName: 'order' }, vi.fn())
+      await manager.queue(job, 'r1', 'x')
+      const hsetOrder = (redis.hset as any).mock.invocationCallOrder[0]
+      const rpushOrder = (redis.rpush as any).mock.invocationCallOrder[0]
+      // The queue entry (what makes a job poppable) must never precede its log record.
+      expect(hsetOrder).toBeLessThan(rpushOrder)
+    })
+  })
+
+  describe('list resilience', () => {
+    it('should skip an unparseable record instead of throwing', async () => {
+      const m = new RedisJM(redis, 'test-group', { keepFinishedInterval: 60000, logger: false })
+      const job = new Job({ jobName: 'ok' }, vi.fn())
+      await m.queue(job, 'r1', { a: 1 })
+      await redis.hset('redisjm:test-group:log', 'bad#r1', 'not json{')
+
+      const records = await m.list()
+      expect(records).toHaveLength(1)
+      expect(records[0].jobName).toBe('ok')
+    })
+  })
+
+  describe('start validation', () => {
+    it('should throw on a non-positive interval', () => {
+      expect(() => manager.start(0)).toThrow(TypeError)
+      expect(() => manager.start(-5)).toThrow()
+      expect(() => manager.start(Number.NaN)).toThrow()
+    })
+  })
+
+  describe('graceful stop()', () => {
+    it('should resolve only after the in-flight job settles', async () => {
+      const m = new RedisJM(redis, 'test-group', { keepFinishedInterval: 60000, maintenanceInterval: 0 })
+      let release!: () => void
+      const fn = vi.fn(() => new Promise<void>((r) => { release = r }))
+      const job = m.createJob({ jobName: 'drain' }, fn)
+      await m.queue(job, 'r1', 'x')
+
+      m.start(50)
+      await new Promise((r) => setTimeout(r, 0)) // let the poll pick up and start the job
+      expect(fn).toHaveBeenCalled()
+
+      let stopped = false
+      const stopPromise = m.stop().then(() => { stopped = true })
+      await new Promise((r) => setTimeout(r, 0))
+      expect(stopped).toBe(false) // still draining the in-flight job
+
+      release()
+      await stopPromise
+      expect(stopped).toBe(true)
+    })
+  })
+
+  describe('stale maintenance lock recovery', () => {
+    it('should reclaim a maintenance lock orphaned by a hard kill mid-run', async () => {
+      vi.useFakeTimers()
+      const m = new RedisJM(redis, 'test-group', {
+        heartbeatInterval: 1000,
+        roundsToStale: 2,
+        keepFinishedInterval: 60000,
+        maintenanceInterval: 500,
+      })
+      const spy = vi.spyOn(m, 'performMaintenance')
+
+      // Maintenance was killed mid-run: lock held, status 'running', stale heartbeat, NOT in queue.
+      // Without proactive reclaim this deadlocks — maintenance can't reclaim its own lock.
+      const maintId = '__redisjm_maintenance#'
+      await redis.sadd('redisjm:test-group:locks', maintId)
+      await redis.hset('redisjm:test-group:log', maintId, JSON.stringify({
+        jobId: maintId, jobName: '__redisjm_maintenance', runId: '', inputs: null,
+        targetGroup: 'test-group', status: 'running', progress: 0,
+        startedAt: Date.now() - 10000, heartbeat: Date.now() - 10000,
+      }))
+
+      m.start(100)
+      // Drain the async reclaim→enqueue→pop→execute chain over a few poll cycles (deterministic).
+      for (let i = 0; i < 4; i++) await vi.advanceTimersByTimeAsync(100)
+
+      // The deadlock is broken: maintenance runs again and the orphaned lock is gone.
+      expect(spy).toHaveBeenCalled()
+      expect(await redis.sismember('redisjm:test-group:locks', maintId)).toBe(0)
+
+      m.stop()
+      vi.useRealTimers()
+    })
+
+    it('should reclaim a maintenance lock held with no backing record', async () => {
+      // A lock with no log record is unambiguously orphaned (e.g. crash between sadd and hset).
+      const m = new RedisJM(redis, 'test-group', { maintenanceInterval: 500 })
+      const maintId = '__redisjm_maintenance#'
+      await redis.sadd('redisjm:test-group:locks', maintId)
+      expect(await redis.sismember('redisjm:test-group:locks', maintId)).toBe(1)
+
+      vi.useFakeTimers()
+      m.start(100)
+      for (let i = 0; i < 3; i++) await vi.advanceTimersByTimeAsync(100)
+
+      // Lock reclaimed so maintenance can be enqueued and run again.
+      expect(await redis.sismember('redisjm:test-group:locks', maintId)).toBe(0)
+
+      m.stop()
+      vi.useRealTimers()
+    })
+  })
+
+  describe('observability', () => {
+    it('should report a thrown handler to the logger by default', async () => {
+      const logger = vi.fn()
+      const m = new RedisJM(redis, 'test-group', { keepFinishedInterval: 60000, logger })
+      m.createJob({ jobName: 'boom' }, vi.fn(() => { throw new Error('kaboom') }))
+      await m.queue(new Job({ jobName: 'boom' }, vi.fn()), 'r1', 'x')
+
+      await m.popAndExecute()
+
+      expect(logger).toHaveBeenCalled()
+      const [message, error] = logger.mock.calls[0]
+      expect(message).toContain('boom#r1')
+      expect(error).toBeInstanceOf(Error)
+      expect((error as Error).message).toBe('kaboom')
+    })
+
+    it('should report a missing log record to the logger', async () => {
+      const logger = vi.fn()
+      const m = new RedisJM(redis, 'test-group', { logger })
+      m.createJob({ jobName: 'ghost' }, vi.fn())
+      // Queue entry with no backing log record.
+      await redis.sadd('redisjm:test-group:locks', 'ghost#r1')
+      await redis.rpush('redisjm:test-group:queue', 'ghost#r1')
+
+      expect(await m.popAndExecute()).toBe(true)
+      expect(logger).toHaveBeenCalled()
+      expect(logger.mock.calls[0][0]).toContain('ghost#r1')
+      expect(await m.isQueued('ghost#r1')).toBe(false)
+    })
+  })
+
+  describe('enqueue failure rollback', () => {
+    it('should roll back both lock and log when the queue push fails', async () => {
+      const job = new Job({ jobName: 'rollback' }, vi.fn())
+      ;(redis.rpush as any).mockImplementationOnce(async () => { throw new Error('redis down') })
+
+      await expect(manager.queue(job, 'r1', 'x')).rejects.toThrow('redis down')
+
+      // Neither the lock nor the log record should survive a failed enqueue.
+      expect(await manager.isQueued('rollback#r1')).toBe(false)
+      expect(await redis.hget('redisjm:test-group:log', 'rollback#r1')).toBeNull()
+    })
+  })
+
+  describe('heartbeat guard (onHeartbeat)', () => {
+    it('should not refresh the heartbeat of a record that already left running', async () => {
+      const m = new RedisJM(redis, 'test-group', { keepFinishedInterval: 60000 })
+      const job = m.createJob({ jobName: 'hb' }, vi.fn())
+      const jobId = 'hb#r1'
+      const oldHeartbeat = Date.now() - 50000
+      // A terminal record that a straggling heartbeat must not resurrect.
+      await redis.hset('redisjm:test-group:log', jobId, JSON.stringify({
+        jobId, jobName: 'hb', runId: 'r1', inputs: null,
+        targetGroup: 'test-group', status: 'stale', progress: 0,
+        finishedAt: Date.now() - 50000, heartbeat: oldHeartbeat,
+      }))
+
+      // Fire the manager's heartbeat hook for this run (as a late/leaked timer would).
+      await job.callHook('heartbeat', { job, targetGroup: 'test-group', runId: 'r1', inputs: null })
+
+      const record = JSON.parse((await redis.hget('redisjm:test-group:log', jobId))!) as JobLogRecord
+      expect(record.status).toBe('stale')
+      expect(record.heartbeat).toBe(oldHeartbeat) // unchanged — not refreshed
+    })
+  })
+
+  describe('get after finish', () => {
+    it('should return undefined for a finished run under keepFinishedInterval=0', async () => {
+      const job = manager.createJob({ jobName: 'fin' }, vi.fn())
+      await manager.queue(job, 'r1', 'x')
+      await job.execute('x', { targetGroup: 'test-group', runId: 'r1' })
+      // Default keepFinishedInterval:0 deletes the record on finish.
+      expect(await manager.get('fin#r1')).toBeUndefined()
     })
   })
 })

@@ -13,6 +13,7 @@ import type {
   JobUpdateEventPayload,
   MaintenanceResult,
   RedisJMHooks,
+  RedisJMLogger,
   RedisJMOptions,
   ResolvedRedisJMOptions,
 } from './types'
@@ -21,7 +22,21 @@ const DEFAULT_OPTIONS: Omit<ResolvedRedisJMOptions, 'maintenanceInterval'> = {
   heartbeatInterval: 5000,
   roundsToStale: 2,
   keepFinishedInterval: 0,
+  unknownJobRequeueLimit: 5,
 }
+
+/** Default logger: writes to `console.error`, prefers the error stack when present. */
+const DEFAULT_LOGGER: RedisJMLogger = (message, error) => {
+  if (error?.stack) {
+    console.error(`[redisjm] ${message}\n${error.stack}`)
+  } else if (error) {
+    console.error(`[redisjm] ${message}`, error)
+  } else {
+    console.error(`[redisjm] ${message}`)
+  }
+}
+
+const NOOP_LOGGER: RedisJMLogger = () => {}
 
 /**
  * Redis Job Manager for distributed job queues.
@@ -45,6 +60,7 @@ export class RedisJM extends Hookable<RedisJMHooks> {
   private readonly redis: Redis
   private readonly targetGroup: string
   private readonly options: ResolvedRedisJMOptions
+  private readonly logger: RedisJMLogger
   private readonly registeredJobs = new Set<Job<any, any>>()
   private readonly jobsByName = new Map<string, Job<any, any>>()
   private readonly jobHookCleanups = new Map<Job<any, any>, () => void>()
@@ -52,6 +68,8 @@ export class RedisJM extends Hookable<RedisJMHooks> {
   private pollTimer: ReturnType<typeof setTimeout> | undefined
   private polling = false
   private maintenanceTimer: ReturnType<typeof setInterval> | undefined
+  /** Promise of the job currently being executed by the poll loop, if any. Awaited by `stop()`. */
+  private inFlight: Promise<unknown> | undefined
 
   /**
    * @param redis - An ioredis client instance
@@ -69,7 +87,9 @@ export class RedisJM extends Hookable<RedisJMHooks> {
       roundsToStale,
       keepFinishedInterval: options?.keepFinishedInterval ?? DEFAULT_OPTIONS.keepFinishedInterval,
       maintenanceInterval: options?.maintenanceInterval ?? heartbeatInterval * roundsToStale,
+      unknownJobRequeueLimit: options?.unknownJobRequeueLimit ?? DEFAULT_OPTIONS.unknownJobRequeueLimit,
     }
+    this.logger = options?.logger === false ? NOOP_LOGGER : (options?.logger ?? DEFAULT_LOGGER)
   }
 
   /** Returns the target group identifier for this manager. */
@@ -130,7 +150,30 @@ export class RedisJM extends Hookable<RedisJMHooks> {
    */
   async list(): Promise<JobLogRecord[]> {
     const entries = await this.redis.hgetall(this.getLogKey())
-    return Object.values(entries).map((val) => JSON.parse(val) as JobLogRecord)
+    const records: JobLogRecord[] = []
+    for (const [jobId, val] of Object.entries(entries)) {
+      // A single corrupt/foreign record must not take down the whole listing.
+      const record = this.parseRecord(val, jobId)
+      if (record) records.push(record)
+    }
+    return records
+  }
+
+  /**
+   * Fetches a single job log record by `jobId` (`"jobName#runId"`), or `undefined` if absent.
+   *
+   * Note: with the default `keepFinishedInterval: 0`, finished/error records are deleted the
+   * moment the job leaves `running`, so a successful run returns `undefined` here — `undefined`
+   * means "no record", not "never ran". Set `keepFinishedInterval > 0` to observe terminal states.
+   *
+   * @example
+   * ```ts
+   * const record = await manager.get('send-email#daily-digest')
+   * if (record?.status === 'finished') { ... }
+   * ```
+   */
+  async get(jobId: string): Promise<JobLogRecord | undefined> {
+    return (await this.readRecord(jobId)) ?? undefined
   }
 
   /**
@@ -184,6 +227,11 @@ export class RedisJM extends Hookable<RedisJMHooks> {
     if (this.registeredJobs.has(job)) return
 
     const jobName = job.getName()
+    if (jobName.includes('#')) {
+      // jobId is `${jobName}#${runId}` parsed on the first '#', so a '#' in the name
+      // would alias distinct (jobName, runId) pairs onto the same lock/log key.
+      throw new Error(`Job name "${jobName}" must not contain "#"`)
+    }
     if (this.jobsByName.has(jobName)) {
       throw new Error(`Job with name "${jobName}" is already registered`)
     }
@@ -240,6 +288,9 @@ export class RedisJM extends Hookable<RedisJMHooks> {
       if (payload.targetGroup !== this.targetGroup) return
       const jobId = getJobId(payload.runId)
       await this.updateLog(jobId, (record) => {
+        // Never refresh the heartbeat of a record that has already left `running`:
+        // a late/straggling heartbeat must not resurrect a finished or stale job.
+        if (record.status !== 'running') return false
         record.heartbeat = Date.now()
       })
       await this.callHook('heartbeat', payload as unknown as JobEventPayload)
@@ -315,12 +366,21 @@ export class RedisJM extends Hookable<RedisJMHooks> {
 
     const job = this.jobsByName.get(jobName)
     if (!job) {
+      // This instance has no handler for the popped name. In a rolling deploy / blue-green
+      // topology a sibling instance may have it, so re-queue (keeping the lock held) up to
+      // `unknownJobRequeueLimit` times before giving up and recording the error. A successful
+      // re-queue returns `false` (treated as "no work executed") so the poll loop applies its
+      // idle interval rather than immediately re-popping — spacing retries by `interval` gives
+      // a sibling that *does* have the handler real wall-clock time to claim it.
+      if (await this.requeueUnknownJob(jobId)) return false
+
       const now = Date.now()
       await this.updateLog(jobId, (record) => {
         record.status = 'error'
         record.error = 'Job name is unknown'
         record.finishedAt = now
       })
+      this.logger(`job "${jobId}" has no registered handler on this instance; dropping`)
       await this.redis.srem(this.getLocksKey(), jobId)
       if (this.options.keepFinishedInterval === 0) {
         await this.redis.hdel(this.getLogKey(), jobId)
@@ -330,21 +390,61 @@ export class RedisJM extends Hookable<RedisJMHooks> {
 
     const logJson = await this.redis.hget(this.getLogKey(), jobId)
     if (!logJson) {
+      // Popped a queue entry with no backing log record (desynced/cleaned state). Release
+      // the lock and surface it rather than dropping the run completely silently.
+      this.logger(`job "${jobId}" popped with no log record; dropping`)
       await this.redis.srem(this.getLocksKey(), jobId)
       return true
     }
 
-    const logRecord = JSON.parse(logJson) as JobLogRecord
+    const logRecord = this.parseRecord(logJson, jobId)
+    if (!logRecord) {
+      // Corrupt/foreign record: release the lock and clean it up rather than throwing out of
+      // the poll loop (which would leave the lock orphaned).
+      await this.redis.srem(this.getLocksKey(), jobId)
+      if (this.options.keepFinishedInterval === 0) {
+        await this.redis.hdel(this.getLogKey(), jobId)
+      }
+      return true
+    }
     try {
       await job.execute(logRecord.inputs, {
         targetGroup: this.targetGroup,
         heartbeatInterval: this.options.heartbeatInterval,
         runId,
       })
-    } catch {
-      // Error already handled by the error event handler
+    } catch (err) {
+      // The job's `error` event already recorded the failure in Redis and re-broadcast it.
+      // Surface it through the logger too, so a thrown handler is never fully silent when no
+      // `error` hook is wired (and to catch infra/hook failures, which are NOT "already handled").
+      const error = err instanceof Error ? err : new Error(String(err))
+      this.logger(`job "${jobId}" failed: ${error.message}`, error)
     }
 
+    return true
+  }
+
+  /**
+   * Re-queues a job whose name is not registered on this instance, keeping its lock held so a
+   * concurrent enqueue of the same runId can't duplicate it. Returns `true` if re-queued,
+   * `false` if the retry budget is exhausted (or disabled) and the caller should record an error.
+   */
+  private async requeueUnknownJob(jobId: string): Promise<boolean> {
+    const limit = this.options.unknownJobRequeueLimit
+    if (limit <= 0) return false
+
+    const record = await this.readRecord(jobId)
+    if (!record) return false
+
+    const count = record.requeueCount ?? 0
+    if (count >= limit) return false
+
+    record.requeueCount = count + 1
+    record.status = 'queued'
+    await this.redis.hset(this.getLogKey(), jobId, JSON.stringify(record))
+    // Back of the queue (not the front) so this doesn't starve handleable work, and the lock
+    // is intentionally left in place.
+    await this.redis.rpush(this.getQueueKey(), jobId)
     return true
   }
 
@@ -355,8 +455,10 @@ export class RedisJM extends Hookable<RedisJMHooks> {
    * Unless `maintenanceInterval` is `0`, also enqueues the built-in maintenance job — once
    * immediately (so locks orphaned by a crash are reclaimed soon after restart) and then every
    * `maintenanceInterval` ms. All instances enqueue concurrently; the lock dedupes the runs.
+   * Before the first enqueue it also proactively reclaims a stale maintenance lock left by a
+   * hard-killed instance, which would otherwise deadlock maintenance (it can't reclaim its own lock).
    *
-   * @param interval - Milliseconds to wait between polls when idle
+   * @param interval - Milliseconds to wait between polls when idle (must be a positive number)
    *
    * @example
    * ```ts
@@ -364,15 +466,23 @@ export class RedisJM extends Hookable<RedisJMHooks> {
    * ```
    */
   start(interval: number): void {
+    if (!Number.isFinite(interval) || interval <= 0) {
+      throw new TypeError(`start(interval): interval must be a positive number, got ${interval}`)
+    }
     if (this.polling) return
     this.polling = true
 
     if (this.options.maintenanceInterval > 0) {
       const job = this.jobsByName.get(MAINTENANCE_JOB_NAME) ?? createMaintenanceJob(this)
       const tryQueue = () => {
+        // Don't enqueue after stop(): the bootstrap reclaim chain below is async, so a stop()
+        // that lands before it resolves would otherwise leave an orphaned maintenance entry.
+        if (!this.polling) return
         this.queue(job, '', null).catch(() => {})
       }
-      tryQueue()
+      // Reclaim a stale maintenance lock first (no-op when none), THEN enqueue — so a lock
+      // orphaned by a hard kill can't permanently block maintenance from running.
+      this.reclaimStaleMaintenanceLock().then(tryQueue, tryQueue)
       this.maintenanceTimer = setInterval(tryQueue, this.options.maintenanceInterval)
     }
 
@@ -380,9 +490,13 @@ export class RedisJM extends Hookable<RedisJMHooks> {
       if (!this.polling) return
       let executed = false
       try {
-        executed = await this.popAndExecute()
-      } catch {
-        // Swallow poll errors to keep the loop alive
+        this.inFlight = this.popAndExecute()
+        executed = (await this.inFlight) as boolean
+      } catch (err) {
+        // Keep the loop alive, but surface the failure instead of swallowing it silently.
+        this.logger('poll loop error', err instanceof Error ? err : new Error(String(err)))
+      } finally {
+        this.inFlight = undefined
       }
       if (!this.polling) return
       const delay = executed ? 0 : interval
@@ -392,14 +506,15 @@ export class RedisJM extends Hookable<RedisJMHooks> {
   }
 
   /**
-   * Stops the polling loop. The currently executing job (if any) will finish.
+   * Stops the polling loop and returns a promise that resolves once the in-flight job (if any)
+   * has settled, so callers (e.g. a SIGTERM handler) can await a graceful drain before exiting.
    *
    * @example
    * ```ts
-   * manager.stop()
+   * process.on('SIGTERM', async () => { await manager.stop() })
    * ```
    */
-  stop(): void {
+  stop(): Promise<void> {
     this.polling = false
     if (this.pollTimer) {
       clearTimeout(this.pollTimer)
@@ -408,6 +523,50 @@ export class RedisJM extends Hookable<RedisJMHooks> {
     if (this.maintenanceTimer) {
       clearInterval(this.maintenanceTimer)
       this.maintenanceTimer = undefined
+    }
+    // Swallow a rejected in-flight here — the poll loop already logs it; `stop()` should resolve.
+    return Promise.resolve(this.inFlight).then(() => {}, () => {})
+  }
+
+  /**
+   * Reclaims the built-in maintenance job's lock if it was orphaned by a hard-killed instance.
+   * Because maintenance is the only thing that reclaims stale `running` locks, a maintenance run
+   * killed mid-execution would hold its own lock forever and block all future reclamation for the
+   * group — this breaks that deadlock at startup.
+   *
+   * Only reclaims locks that are *demonstrably* stale: a `running` record past the heartbeat
+   * threshold, or a lock with no backing record. It intentionally does NOT reclaim a `queued`
+   * record absent from the queue — that state is indistinguishable from a live instance's normal
+   * pop→start window, so reclaiming it would race a healthy run. (A maintenance job orphaned in
+   * that sub-millisecond window is the price of avoiding that race; prefer graceful `stop()` over
+   * SIGKILL.)
+   */
+  private async reclaimStaleMaintenanceLock(): Promise<void> {
+    const jobId = `${MAINTENANCE_JOB_NAME}#`
+    const locksKey = this.getLocksKey()
+    if ((await this.redis.sismember(locksKey, jobId)) !== 1) return
+
+    const reclaim = async () => {
+      await this.redis.srem(locksKey, jobId)
+      await this.redis.hdel(this.getLogKey(), jobId)
+    }
+
+    const json = await this.redis.hget(this.getLogKey(), jobId)
+    if (!json) {
+      // Lock held with no backing record — unambiguously orphaned; reclaim it.
+      await this.redis.srem(locksKey, jobId)
+      return
+    }
+
+    const record = this.parseRecord(json, jobId)
+    if (!record) {
+      await reclaim()
+      return
+    }
+
+    if (record.status === 'running') {
+      const lastHeartbeat = record.heartbeat ?? record.startedAt ?? 0
+      if (Date.now() - lastHeartbeat > this.getStaleThreshold()) await reclaim()
     }
   }
 
@@ -435,10 +594,13 @@ export class RedisJM extends Hookable<RedisJMHooks> {
     let staleCount = 0
     let cleanedCount = 0
 
-    const staleThreshold = this.options.heartbeatInterval * this.options.roundsToStale
+    const staleThreshold = this.getStaleThreshold()
 
     for (const [jobId, json] of Object.entries(entries)) {
-      const record = JSON.parse(json) as JobLogRecord
+      // Defense-in-depth: one corrupt/foreign record must not abort the whole sweep and
+      // stall stale-reclaim + cleanup for every other job in the group.
+      const record = this.parseRecord(json, jobId)
+      if (!record) continue
 
       if (record.status === 'running') {
         const lastHeartbeat = record.heartbeat ?? record.startedAt ?? 0
@@ -480,6 +642,30 @@ export class RedisJM extends Hookable<RedisJMHooks> {
 
   // -- private helpers --
 
+  /** Milliseconds a `running` heartbeat may lapse before the job is considered stale. */
+  private getStaleThreshold(): number {
+    return this.options.heartbeatInterval * this.options.roundsToStale
+  }
+
+  /**
+   * Parses a stored log record, returning `null` (and logging) on corrupt/foreign JSON so a
+   * single bad entry can never throw out of a scan, a hook, or the poll loop.
+   */
+  private parseRecord(json: string, jobId: string): JobLogRecord | null {
+    try {
+      return JSON.parse(json) as JobLogRecord
+    } catch {
+      this.logger(`skipping unparseable log record "${jobId}"`)
+      return null
+    }
+  }
+
+  /** Fetches and parses a single log record by `jobId`; `null` if absent or unparseable. */
+  private async readRecord(jobId: string): Promise<JobLogRecord | null> {
+    const json = await this.redis.hget(this.getLogKey(), jobId)
+    return json ? this.parseRecord(json, jobId) : null
+  }
+
   private async enqueue<TInputs>(
     job: Job<TInputs, any>,
     runId: string,
@@ -493,8 +679,6 @@ export class RedisJM extends Hookable<RedisJMHooks> {
     if (added === 0) return false
 
     try {
-      await this.redis[pushCmd](this.getQueueKey(), jobId)
-
       const record: JobLogRecord<TInputs> = {
         jobId,
         jobName: job.getName(),
@@ -504,21 +688,27 @@ export class RedisJM extends Hookable<RedisJMHooks> {
         status: 'queued',
         progress: 0,
       }
+      // Write the log record BEFORE the queue entry: the queue entry is what makes the
+      // job poppable, so if it landed first a concurrent poller could pop it before the
+      // record exists and drop it as "no log record". (A crash between these writes
+      // instead leaves a `queued` record absent from the queue — reclaimed by maintenance.)
       await this.redis.hset(this.getLogKey(), jobId, JSON.stringify(record))
+      await this.redis[pushCmd](this.getQueueKey(), jobId)
       return true
     } catch (err) {
       await this.redis.srem(locksKey, jobId).catch(() => {})
+      await this.redis.hdel(this.getLogKey(), jobId).catch(() => {})
       throw err
     }
   }
 
-  private async updateLog(jobId: string, mutate: (record: JobLogRecord) => void): Promise<void> {
-    const logKey = this.getLogKey()
-    const json = await this.redis.hget(logKey, jobId)
-    if (!json) return
-    const record = JSON.parse(json) as JobLogRecord
-    mutate(record)
-    await this.redis.hset(logKey, jobId, JSON.stringify(record))
+  private async updateLog(jobId: string, mutate: (record: JobLogRecord) => void | boolean): Promise<void> {
+    const record = await this.readRecord(jobId)
+    if (!record) return
+    // A mutator may return `false` to abort the write (e.g. the record is no longer
+    // in a state worth touching), avoiding a pointless last-write-wins clobber.
+    if (mutate(record) === false) return
+    await this.redis.hset(this.getLogKey(), jobId, JSON.stringify(record))
   }
 
   private getQueueKey(): string {

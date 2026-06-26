@@ -72,23 +72,25 @@ export class Job<TInputs = unknown, TAttrs extends { [K in keyof TAttrs]: JobAtt
       },
     }
 
+    // The heartbeat timer is created *after* the start hook resolves and torn down in
+    // a `finally`, so a throwing/rejecting `start` (or `finish`) hook can never leak a
+    // timer that keeps firing phantom heartbeats and defeats stale-reclaim.
     let heartbeatTimer: ReturnType<typeof setInterval> | undefined
-    if (heartbeatInterval && heartbeatInterval > 0) {
-      heartbeatTimer = setInterval(() => {
-        this.callHook('heartbeat', payload).catch(() => {})
-      }, heartbeatInterval)
-    }
-
-    await this.callHook('start', payload)
     try {
+      await this.callHook('start', payload)
+      if (heartbeatInterval && heartbeatInterval > 0) {
+        heartbeatTimer = setInterval(() => {
+          this.callHook('heartbeat', payload).catch(() => {})
+        }, heartbeatInterval)
+      }
       await this.fn(inputs, ctx)
-      if (heartbeatTimer) clearInterval(heartbeatTimer)
       await this.callHook('finish', payload)
     } catch (err) {
-      if (heartbeatTimer) clearInterval(heartbeatTimer)
       const error = err instanceof Error ? err : new Error(String(err))
       await this.callHook('error', { ...payload, error })
       throw error
+    } finally {
+      if (heartbeatTimer) clearInterval(heartbeatTimer)
     }
   }
 

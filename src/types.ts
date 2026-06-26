@@ -6,6 +6,14 @@ export type JobAttrValue = string | number | boolean | null | undefined
 /** Default attributes type for job log records. */
 export type JobAttrs = Record<string, JobAttrValue>
 
+/**
+ * Sink for operational errors that would otherwise be silent: a job handler that
+ * threw, a job popped with no registered handler, a job dropped because its log
+ * record vanished, and poll-loop failures. Receives a message and, when available,
+ * the underlying `Error` (so the stack can be logged).
+ */
+export type RedisJMLogger = (message: string, error?: Error) => void
+
 /** Possible statuses of a job in the lifecycle. */
 export type JobStatus = 'queued' | 'running' | 'finished' | 'error' | 'stale'
 
@@ -31,6 +39,23 @@ export interface RedisJMOptions {
    * All instances enqueue concurrently — the lock ensures only one maintenance run executes.
    */
   maintenanceInterval?: number
+  /**
+   * Max number of times a job whose `jobName` is not registered on the popping
+   * instance is re-queued (kept in the queue with its lock held) so another
+   * instance — e.g. a freshly deployed pod that *does* register the handler — can
+   * claim it. Once the budget is exhausted the job is marked
+   * `error: 'Job name is unknown'` and dropped. `0` restores the legacy behavior
+   * (drop immediately on the first pop). Default: `5`.
+   */
+  unknownJobRequeueLimit?: number
+  /**
+   * Sink for operational errors that are otherwise invisible — handler throws,
+   * unknown/dropped jobs, and poll-loop failures. Defaults to a `console.error`
+   * logger that includes the error stack. Pass `false` to silence default logging
+   * (e.g. when you wire your own `manager.hook('error', …)` and don't want
+   * duplicate console output).
+   */
+  logger?: RedisJMLogger | false
 }
 
 /** Resolved version of `RedisJMOptions` with all defaults applied. */
@@ -39,6 +64,7 @@ export interface ResolvedRedisJMOptions {
   roundsToStale: number
   keepFinishedInterval: number
   maintenanceInterval: number
+  unknownJobRequeueLimit: number
 }
 
 /** A full job state record stored in the Redis log hash. */
@@ -69,6 +95,11 @@ export interface JobLogRecord<TInputs = unknown, TAttrs extends { [K in keyof TA
    * the job starts normally; if still set and expired on a later scan, the record goes `stale`.
    */
   suspectedAt?: number
+  /**
+   * Number of times this run has been re-queued because the popping instance had no
+   * registered handler for its `jobName` (see `RedisJMOptions.unknownJobRequeueLimit`).
+   */
+  requeueCount?: number
 }
 
 /** Options for `Job.execute()`. */

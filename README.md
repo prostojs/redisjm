@@ -13,7 +13,9 @@ When running multiple instances of the same application, `@prostojs/redisjm` ens
 - Progress tracking (0-1) and custom attributes per job
 - Event system (start, finish, error, heartbeat, update) built on [hookable](https://github.com/unjs/hookable)
 - Built-in maintenance job for stale detection and log cleanup
-- Polling-based job execution with `start` / `stop`
+- Polling-based job execution with `start` / awaitable `stop` (graceful drain)
+- Failures visible by default — handler errors are logged (configurable / silenceable)
+- Rolling-deploy resilient — a job whose handler isn't registered yet is re-queued for a sibling instance instead of dropped
 - Target group isolation — multiple app groups can share the same Redis instance
 - TypeScript with full generic type inference for job inputs and custom attributes
 
@@ -83,8 +85,10 @@ new RedisJM(redis: Redis, targetGroup: string, options?: RedisJMOptions)
 |---|---|---|
 | `heartbeatInterval` | `5000` | Milliseconds between heartbeat updates during job execution |
 | `roundsToStale` | `2` | Number of missed heartbeat intervals before a job is considered stale |
-| `keepFinishedInterval` | `0` | Milliseconds to keep finished/error/stale records in the log (0 = remove immediately) |
+| `keepFinishedInterval` | `0` | Milliseconds to keep finished/error/stale records in the log (0 = remove immediately — see the caveat under [Job Statuses](#job-statuses)) |
 | `maintenanceInterval` | `heartbeatInterval * roundsToStale` | Milliseconds between automatic maintenance enqueues while `start()` is polling (0 = disable auto-maintenance) |
+| `unknownJobRequeueLimit` | `5` | Times a job whose name isn't registered on the popping instance is re-queued (lock held) for a sibling instance before being dropped as an error. `0` restores the legacy drop-on-first-pop behavior |
+| `logger` | `console.error` | Sink `(message, error?) => void` for operational errors (handler throws, unknown/dropped jobs, poll-loop failures). Pass `false` to silence default logging |
 
 #### Methods
 
@@ -111,6 +115,10 @@ Adds a job run to the end of the queue. Returns `true` if successfully queued, `
 const success = await manager.queue(job, 'order-123', { orderId: '123' })
 ```
 
+> **Dedupe is on the lock, not the log record.** `queue()` dedupes on `jobName#runId` in the locks set, which releases on finish/error (or when maintenance reclaims an orphan). Two consequences for integrators:
+> - **Always check the boolean return.** `false` means "already locked" — a caller that ignores it reports false success.
+> - **A reused `runId` can be swallowed by a stale/orphaned lock after a hard kill** until maintenance reclaims it (bounded by `maintenanceInterval`, or indefinitely if auto-maintenance is off). For idempotent *manual* triggers where you want a fresh run regardless, prefer a unique `runId` per trigger (e.g. append a timestamp). This does **not** apply to the maintenance job, which deliberately uses a stable empty `runId` to self-dedupe.
+
 ##### `queueFirst<TInputs>(job, runId, inputs): Promise<boolean>`
 
 Same as `queue` but adds to the front of the queue (priority insert).
@@ -129,11 +137,21 @@ const locked = await manager.isQueued('process-order#order-123')
 
 ##### `list(): Promise<JobLogRecord[]>`
 
-Returns all job log records (all statuses).
+Returns all job log records (all statuses). A single corrupt/foreign hash field is skipped (and logged) rather than throwing.
 
 ```typescript
 const records = await manager.list()
 ```
+
+##### `get(jobId): Promise<JobLogRecord | undefined>`
+
+Fetches a single record by `jobId` (`"jobName#runId"`), or `undefined` if absent — an O(1) `HGET` instead of scanning `list()`. Handy for "did my trigger finish?" endpoints.
+
+```typescript
+const record = await manager.get('process-order#order-123')
+```
+
+> With the default `keepFinishedInterval: 0`, a successful run's record is deleted the instant it finishes, so `get()` returns `undefined` — `undefined` means "no record", **not** "never ran". Set `keepFinishedInterval > 0` to observe terminal states, or wire the `finish`/`error` hooks.
 
 ##### `unqueue(jobId): Promise<void>`
 
@@ -147,21 +165,21 @@ await manager.unqueue('process-order#order-123')
 
 Pops the next job from the queue, matches it to a registered Job instance by name, and executes it. Returns `true` if a job was popped (even if execution failed), `false` if the queue was empty.
 
-If the job name is not registered, the log record is set to status `"error"` with error `"Job name is unknown"`.
+If the job name is not registered on this instance, it is re-queued (lock held) up to `unknownJobRequeueLimit` times so a sibling instance that *does* register the handler — e.g. a freshly deployed pod — can claim it. Once the budget is exhausted the record is set to status `"error"` with error `"Job name is unknown"` and the lock is released. Handler failures, unknown-name drops, and missing-record drops are reported through the configured `logger`.
 
 ##### `start(interval): void`
 
-Starts a polling loop that calls `popAndExecute()`. When a job is executed, the next poll fires immediately. When the queue is empty, waits `interval` ms before the next poll.
+Starts a polling loop that calls `popAndExecute()`. When a job is executed, the next poll fires immediately. When the queue is empty, waits `interval` ms before the next poll. Throws `TypeError` if `interval` is not a positive number.
 
-Unless `maintenanceInterval` is `0`, `start()` also auto-wires maintenance: it enqueues the built-in maintenance job once immediately (so locks orphaned by a crashed instance are reclaimed soon after restart) and then every `maintenanceInterval` ms. All instances enqueue concurrently — the lock ensures only one maintenance run executes at a time.
+Unless `maintenanceInterval` is `0`, `start()` also auto-wires maintenance: it first proactively reclaims a maintenance lock orphaned by a hard-killed instance (which would otherwise deadlock — maintenance can't reclaim its own lock), then enqueues the built-in maintenance job once immediately and every `maintenanceInterval` ms thereafter. All instances enqueue concurrently — the lock ensures only one maintenance run executes at a time.
 
 ```typescript
 manager.start(1000) // poll every 1 second when idle
 ```
 
-##### `stop(): void`
+##### `stop(): Promise<void>`
 
-Stops the polling loop and the auto-maintenance timer. The currently executing job (if any) will finish.
+Stops the polling loop and the auto-maintenance timer, and resolves once the in-flight job (if any) has settled — so a shutdown handler can `await` a graceful drain before exiting. For locks to release cleanly, prefer graceful shutdown (`stop()` on `SIGTERM`); a hard `SIGKILL` leaves orphaned locks that maintenance reclaims after the stale threshold.
 
 ##### `performMaintenance(): Promise<MaintenanceResult>`
 
@@ -241,7 +259,7 @@ Returns `"jobName#runId"`.
 
 ---
 
-### `createMaintenanceJob(manager): Job<null>`
+### `createMaintenanceJob(manager): Job<null, never>`
 
 Factory function that creates and registers a pre-defined maintenance job. When executed, it calls `manager.performMaintenance()` to detect stale jobs and clean up expired log records.
 
@@ -272,13 +290,35 @@ Both `Job` and `RedisJM` emit events via [hookable](https://github.com/unjs/hook
 
 `RedisJM` re-dispatches events only when `targetGroup` matches and updates the Redis log accordingly.
 
+> `setProgress` and `setAttrs` each emit a **separate** `update` event carrying only its own field — a single `update` payload never contains both `progress` and `attrs`.
+
 ```typescript
 manager.hook('start', (payload) => {
   console.log(`Job ${payload.job.getName()} started`)
 })
 
+// Optional: custom handling. Job errors are ALSO logged by the default `logger`
+// (set `logger: false` to suppress that if you handle errors yourself here).
 manager.hook('error', (payload) => {
   console.error(`Job failed:`, payload.error)
+})
+```
+
+### Observability & error handling
+
+- **Failures are visible by default.** A thrown handler is recorded in the log (`status: 'error'`), re-broadcast on the `error` event, **and** written to the `logger` (default `console.error`, including the stack). Unknown-name drops, missing-record drops, and poll-loop errors also go to the `logger`. Pass `logger: false` to silence, or a custom function to redirect.
+- **Don't blanket-`DEL` the Redis keys.** The `:queue`, `:locks`, and `:log` keys are shared by **every** job in the target group — deleting one wipes all runs in the group, not just yours. Use `unqueue(jobId)` to remove a single run.
+
+### Long-running handlers & heartbeats
+
+Heartbeats are emitted from a timer on the single-threaded event loop. A long, tightly synchronous handler that never `await`s starves that timer, so heartbeats stop landing and maintenance may mark the run `stale` and release its lock — which can let another instance pick up the **same** `runId` and run it concurrently (duplicate execution). Chunk long work and `await` between chunks (e.g. `setProgress`/`setAttrs` per chunk) so heartbeats can fire:
+
+```typescript
+manager.createJob({ jobName: 'backfill' }, async (inputs: { ids: string[] }, ctx) => {
+  for (let i = 0; i < inputs.ids.length; i += 100) {
+    await processChunk(inputs.ids.slice(i, i + 100)) // yields to the loop → heartbeat lands
+    await ctx.setProgress(Math.min(1, (i + 100) / inputs.ids.length))
+  }
 })
 ```
 
@@ -291,6 +331,8 @@ manager.hook('error', (payload) => {
 | `stale` | Heartbeat expired, detected by maintenance | Yes (until maintenance cleans it) | Yes |
 | `finished` | Completed successfully | No | Kept for `keepFinishedInterval` |
 | `error` | Failed with an error | No | Kept for `keepFinishedInterval` |
+
+> **Default `keepFinishedInterval: 0` makes terminal states write-only.** With the default, `finished`/`error`/`stale` records are deleted the instant they're set, so `list()`/`get()` only ever return `queued`/`running` — terminal outcomes are observable only via the `finish`/`error` hooks. Set `keepFinishedInterval > 0` (e.g. `60000`) to keep them queryable.
 
 ## Full Example: Distributed Job Processing
 
@@ -336,9 +378,10 @@ async function onCron() {
   await maintenanceJob.queue('', null)
 }
 
-// Graceful shutdown
-process.on('SIGTERM', () => {
-  manager.stop()
+// Graceful shutdown — await the drain so the in-flight job finishes and its lock releases
+process.on('SIGTERM', async () => {
+  await manager.stop()
+  await redis.quit()
 })
 ```
 
@@ -373,11 +416,15 @@ interface JobMetadata {
   description?: string
 }
 
+type RedisJMLogger = (message: string, error?: Error) => void
+
 interface RedisJMOptions {
-  heartbeatInterval?: number    // default 5000
-  roundsToStale?: number        // default 2
-  keepFinishedInterval?: number // default 0
-  maintenanceInterval?: number  // default heartbeatInterval * roundsToStale; 0 disables
+  heartbeatInterval?: number       // default 5000
+  roundsToStale?: number           // default 2
+  keepFinishedInterval?: number    // default 0
+  maintenanceInterval?: number     // default heartbeatInterval * roundsToStale; 0 disables
+  unknownJobRequeueLimit?: number  // default 5; 0 = drop unknown names immediately
+  logger?: RedisJMLogger | false   // default console.error; false to silence
 }
 
 interface JobLogRecord<TInputs = unknown, TAttrs extends JobAttrs = JobAttrs> {
@@ -394,6 +441,7 @@ interface JobLogRecord<TInputs = unknown, TAttrs extends JobAttrs = JobAttrs> {
   attrs?: TAttrs
   error?: string
   suspectedAt?: number          // internal: orphaned-queued suspect timestamp (maintenance)
+  requeueCount?: number         // internal: times re-queued for an unknown job name
 }
 
 interface JobContext<TAttrs extends JobAttrs = JobAttrs> {

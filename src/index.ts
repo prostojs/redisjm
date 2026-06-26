@@ -16,6 +16,7 @@ export type {
   JobUpdateEventPayload,
   MaintenanceResult,
   RedisJMHooks,
+  RedisJMLogger,
   RedisJMOptions,
   ResolvedRedisJMOptions,
 } from './types'

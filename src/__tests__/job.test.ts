@@ -222,6 +222,32 @@ describe('Job', () => {
       await job.execute('input', { targetGroup: 'g' })
       expect(onHeartbeat).not.toHaveBeenCalled()
     })
+
+    it('should not leak the heartbeat timer when the start hook throws', async () => {
+      // Regression: the timer used to be created before the (un-try/finally'd) start hook,
+      // so a throwing start hook leaked a setInterval that fired phantom heartbeats forever,
+      // defeating stale-reclaim and wedging the lock.
+      vi.useFakeTimers()
+      const fn = vi.fn()
+      const job = new Job<string>(metadata, fn)
+      job.hook('start', () => { throw new Error('start failed') })
+      const onError = vi.fn()
+      const onHeartbeat = vi.fn()
+      job.hook('error', onError)
+      job.hook('heartbeat', onHeartbeat)
+
+      await expect(
+        job.execute('input', { targetGroup: 'g', heartbeatInterval: 100 }),
+      ).rejects.toThrow('start failed')
+      expect(fn).not.toHaveBeenCalled()
+      expect(onError).toHaveBeenCalled()
+
+      // No timer should be left running.
+      await vi.advanceTimersByTimeAsync(1000)
+      expect(onHeartbeat).not.toHaveBeenCalled()
+
+      vi.useRealTimers()
+    })
   })
 
   describe('context callbacks', () => {
