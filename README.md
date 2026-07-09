@@ -17,6 +17,7 @@ When running multiple instances of the same application, `@prostojs/redisjm` ens
 - Failures visible by default — handler errors are logged (configurable / silenceable)
 - Rolling-deploy resilient — a job whose handler isn't registered yet is re-queued for a sibling instance instead of dropped
 - Target group isolation — multiple app groups can share the same Redis instance
+- Lanes — heterogeneous workers share one group, log, and maintenance loop while each instance pops only the lanes it can handle
 - TypeScript with full generic type inference for job inputs and custom attributes
 
 ## Installation
@@ -57,13 +58,16 @@ manager.start(1000) // poll every 1 second
 
 ## Redis Key Structure
 
-Three Redis structures per target group:
+Redis structures per target group:
 
 | Key pattern | Redis type | Purpose |
 |---|---|---|
-| `redisjm:{tg}:queue` | List | Ordered queue of jobId strings (RPUSH/LPUSH + LPOP) |
+| `redisjm:{tg}:queue` | List | Ordered queue of jobId strings for the default lane (RPUSH/LPUSH + LMPOP/LPOP) |
+| `redisjm:{tg}:lane:{lane}:queue` | List | Ordered queue for a named lane (see [Lanes](#lanes)) |
 | `redisjm:{tg}:locks` | Set | Locked jobIds (queued + running + stale). Atomic via SADD |
 | `redisjm:{tg}:log` | Hash | jobId -> JSON record with full job state |
+
+> A job with **no lane** keeps the exact legacy key `redisjm:{tg}:queue`; only a named lane gets its own `:lane:{lane}:queue` list. The locks set and log hash stay **group-wide** across all lanes — one lock namespace and a single monitoring pane for every worker type.
 
 ## API Reference
 
@@ -78,7 +82,7 @@ new RedisJM(redis: Redis, targetGroup: string, options?: RedisJMOptions)
 ```
 
 - `redis` -- An [ioredis](https://github.com/redis/ioredis) client instance
-- `targetGroup` -- A string prefix for all Redis keys; only clients sharing the same target group share queues and locks
+- `targetGroup` -- A string prefix for all Redis keys; only clients sharing the same target group share queues and locks. Must not contain `:` (reserved for the lane-key infix)
 - `options` -- Optional configuration:
 
 | Option | Default | Description |
@@ -88,6 +92,8 @@ new RedisJM(redis: Redis, targetGroup: string, options?: RedisJMOptions)
 | `keepFinishedInterval` | `0` | Milliseconds to keep finished/error/stale records in the log (0 = remove immediately — see the caveat under [Job Statuses](#job-statuses)) |
 | `maintenanceInterval` | `heartbeatInterval * roundsToStale` | Milliseconds between automatic maintenance enqueues while `start()` is polling (0 = disable auto-maintenance) |
 | `unknownJobRequeueLimit` | `5` | Times a job whose name isn't registered on the popping instance is re-queued (lock held) for a sibling instance before being dropped as an error. `0` restores the legacy drop-on-first-pop behavior |
+| `laneStrategy` | `'roundRobin'` | How subscribed lanes are ordered each poll: `'roundRobin'` rotates the work-lane order to avoid starvation, `'priority'` uses `lanePriority`. See [Lanes](#lanes) |
+| `lanePriority` | `[]` | Explicit high→low lane order used when `laneStrategy: 'priority'`; lanes not listed trail in registration order |
 | `logger` | `console.error` | Sink `(message, error?) => void` for operational errors (handler throws, unknown/dropped jobs, poll-loop failures). Pass `false` to silence default logging |
 
 #### Methods
@@ -106,6 +112,8 @@ const job = manager.createJob(
   }
 )
 ```
+
+Pass an optional `lane` in the metadata to route the job to a named sub-queue serviced only by consumers that register it — see [Lanes](#lanes).
 
 ##### `queue<TInputs>(job, runId, inputs): Promise<boolean>`
 
@@ -334,6 +342,87 @@ manager.createJob({ jobName: 'backfill' }, async (inputs: { ids: string[] }, ctx
 
 > **Default `keepFinishedInterval: 0` makes terminal states write-only.** With the default, `finished`/`error`/`stale` records are deleted the instant they're set, so `list()`/`get()` only ever return `queued`/`running` — terminal outcomes are observable only via the `finish`/`error` hooks. Set `keepFinishedInterval > 0` (e.g. `60000`) to keep them queryable.
 
+## Lanes
+
+A **lane** is a named sub-queue within a target group. The group keeps **one** shared log, **one** lock set, and **one** maintenance loop — only the poppable work list splits by lane. This lets heterogeneous workers share a single job system while each instance pops only the work it can handle: e.g. light web pods and a dedicated heavy image worker enqueuing and monitoring in one place, with no web pod ever popping the heavy image job.
+
+Jobs with **no lane** use the **default lane**, which maps to the exact legacy queue key `redisjm:<group>:queue`. Lanes are fully opt-in — code that never declares a lane behaves exactly as before.
+
+### Declaring a lane
+
+Pass an optional `lane` on the job metadata:
+
+```typescript
+const storeImages = manager.createJob(
+  { jobName: 'store-images', lane: 'images' },
+  async (inputs: { url: string }, ctx) => {
+    // fetch → resize → upload
+  }
+)
+```
+
+Lane names must match `^[A-Za-z0-9_-]+$` and must not start with `__` (reserved). The target group must not contain `:` (reserved for the lane-key infix).
+
+### Auto-subscription
+
+A consumer that calls `start()` polls exactly the **union of its registered jobs' lanes** (plus the reserved `__maintenance` lane) — there is no separate subscription config. A dedicated worker that registers only `store-images` services only the `images` lane and never pops default-lane work:
+
+```typescript
+const worker = new RedisJM(redis, 'portal')
+worker.createJob({ jobName: 'store-images', lane: 'images' }, storeImagesFn)
+worker.start(1000) // polls `images` (+ `__maintenance`) — never the default lane
+```
+
+### Produce vs. consume
+
+**Producing a job needs only a `Job` instance and the manager — no registration.** Registration is what auto-subscribes a consumer to a lane. So a pod that must **enqueue** a laned job but must **not run** it (e.g. a web pod that also `start()`s to consume its own default-lane jobs) must **not** register that job — registering it would subscribe the pod to the lane, and it would then pop the heavy work.
+
+To produce without consuming, construct an **unregistered** `Job` and queue through it:
+
+```typescript
+import { RedisJM, Job } from '@prostojs/redisjm'
+
+const manager = new RedisJM(redis, 'portal')
+manager.createJob({ jobName: 'render-page' }, renderFn) // default-lane job this web pod consumes
+manager.start(1000)
+
+// Enqueue image work WITHOUT registering it, so this pod never pops the heavy handler:
+const imageJob = new Job<{ url: string }>(
+  { jobName: 'store-images', lane: 'images' },
+  async () => {}, // never runs on this pod
+  manager,
+)
+await imageJob.queue('img-42', { url: 'https://example.com/img.png' })
+```
+
+Rule of thumb: **register to consume, construct-without-register to only produce.**
+
+### Lane ordering (`laneStrategy`)
+
+Each poll checks lanes in order and takes the first available job. The reserved `__maintenance` lane is always polled first; the work lanes are ordered by `laneStrategy`:
+
+- `'roundRobin'` (default) — rotates the work-lane order each poll, so no lane is starved by a busier one.
+- `'priority'` — uses `lanePriority`, an explicit high→low list of lane names. Work lanes absent from the list trail in registration order.
+
+```typescript
+new RedisJM(redis, 'portal', {
+  laneStrategy: 'priority',
+  lanePriority: ['images', 'thumbnails'],
+})
+```
+
+### One lane per handler set
+
+Lanes isolate at **lane** granularity, not per-jobName. If two consumers share a lane but register disjoint job names, each keeps popping names it can't handle and requeues them — reintroducing wasted contention within that lane. The supported pattern is **one lane per disjoint handler set**: every subscriber of a lane should register every jobName on that lane.
+
+### Redis requirement
+
+Lane polling uses `LMPOP`, which requires **Redis ≥ 7**. On older servers the library automatically falls back to sequential `LPOP` with the same routing and ordering, so lanes stay usable everywhere.
+
+### Adopting lanes on an existing group
+
+Roll the lane-aware version out to **every** instance in the group **before** any producer starts declaring non-default lanes. A pre-lane instance's maintenance loop mishandles laned records — it looks for them on the legacy queue and can wrongly mark them stale — so no laned work should exist until the whole group is lane-aware. Rollback is the mirror image: stop emitting laned work and let the lanes drain before rolling back to a lane-unaware binary.
+
 ## Full Example: Distributed Job Processing
 
 ```typescript
@@ -410,10 +499,12 @@ await job.queue('run-1', { source: 'api' }, managerB)
 ```typescript
 type JobAttrs = Record<string, string | number | boolean | null | undefined>
 type JobStatus = 'queued' | 'running' | 'finished' | 'error' | 'stale'
+type LaneStrategy = 'roundRobin' | 'priority'
 
 interface JobMetadata {
   jobName: string
   description?: string
+  lane?: string                    // named sub-queue; omitted → default (legacy) lane
 }
 
 type RedisJMLogger = (message: string, error?: Error) => void
@@ -424,6 +515,8 @@ interface RedisJMOptions {
   keepFinishedInterval?: number    // default 0
   maintenanceInterval?: number     // default heartbeatInterval * roundsToStale; 0 disables
   unknownJobRequeueLimit?: number  // default 5; 0 = drop unknown names immediately
+  laneStrategy?: LaneStrategy      // default 'roundRobin'
+  lanePriority?: string[]          // default []; high→low lane order for 'priority'
   logger?: RedisJMLogger | false   // default console.error; false to silence
 }
 
@@ -433,6 +526,7 @@ interface JobLogRecord<TInputs = unknown, TAttrs extends JobAttrs = JobAttrs> {
   runId: string
   inputs: TInputs
   targetGroup: string
+  lane?: string                 // lane the run was enqueued on (persisted for maintenance/unqueue)
   status: JobStatus
   startedAt?: number
   finishedAt?: number
@@ -459,6 +553,8 @@ interface MaintenanceResult {
   cleanedCount: number
 }
 ```
+
+The `LaneStrategy` type and the reserved-lane constant `MAINTENANCE_LANE` (`'__maintenance'`) are also exported for use when configuring or inspecting lanes.
 
 ## License
 
