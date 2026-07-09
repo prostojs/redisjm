@@ -319,6 +319,67 @@ describe('Job', () => {
     })
   })
 
+  describe('abort signal', () => {
+    // WHY: every context exposes a cooperative AbortSignal, and the event payload's abort() aborts it
+    // with the given reason (default 'aborted') — the manager's heartbeat hook uses this on loss.
+    it('exposes ctx.signal and aborts it via payload.abort with a reason', async () => {
+      let ctxRef!: JobContext
+      let payloadAbort!: (reason?: string) => void
+      const job = new Job<string>(metadata, vi.fn((_i: string, ctx: JobContext) => { ctxRef = ctx }))
+      job.hook('start', (p) => { payloadAbort = p.abort })
+      await job.execute('x', { targetGroup: 'g' })
+
+      expect(ctxRef.signal).toBeInstanceOf(AbortSignal)
+      expect(ctxRef.signal.aborted).toBe(false)
+      payloadAbort('kill')
+      expect(ctxRef.signal.aborted).toBe(true)
+      expect(ctxRef.signal.reason).toBe('kill')
+    })
+
+    // WHY: an external signal (options.signal — e.g. shutdown) must be forwarded to ctx.signal,
+    // carrying its reason, so the manager can drive aborts from outside the execution.
+    it('forwards an external abort signal to ctx.signal, carrying the reason', async () => {
+      const external = new AbortController()
+      let ctxRef!: JobContext
+      const job = new Job<string>(metadata, vi.fn((_i: string, ctx: JobContext) => new Promise<void>((resolve) => {
+        ctxRef = ctx
+        ctx.signal.addEventListener('abort', () => resolve(), { once: true })
+      })))
+      const exec = job.execute('x', { targetGroup: 'g', signal: external.signal })
+      await new Promise((r) => setTimeout(r, 0)) // let the handler attach its listener
+      external.abort('external stop')
+      await exec
+
+      expect(ctxRef.signal.aborted).toBe(true)
+      expect(ctxRef.signal.reason).toBe('external stop')
+    })
+
+    // WHY: an external signal already aborted before execution must abort ctx.signal immediately.
+    it('aborts ctx.signal immediately when the external signal is already aborted', async () => {
+      const external = new AbortController()
+      external.abort('pre-aborted')
+      let ctxRef!: JobContext
+      const job = new Job<string>(metadata, vi.fn((_i: string, ctx: JobContext) => { ctxRef = ctx }))
+      await job.execute('x', { targetGroup: 'g', signal: external.signal })
+
+      expect(ctxRef.signal.aborted).toBe(true)
+      expect(ctxRef.signal.reason).toBe('pre-aborted')
+    })
+
+    // WHY: an execution must not leak a listener on a long-lived external signal — it detaches its
+    // 'abort' listener when it settles, so a signal shared across many runs never accumulates listeners.
+    it('detaches its listener from a long-lived external signal after settling', async () => {
+      const external = new AbortController()
+      const removeSpy = vi.spyOn(external.signal, 'removeEventListener')
+      const job = new Job<string>(metadata, vi.fn())
+      await job.execute('x', { targetGroup: 'g', signal: external.signal })
+
+      expect(removeSpy).toHaveBeenCalledWith('abort', expect.any(Function))
+      // A later abort of the external signal must not reach this settled run's detached listener.
+      expect(() => external.abort('too late')).not.toThrow()
+    })
+  })
+
   describe('queue', () => {
     it('should call manager.queue and return its result', async () => {
       const mockManager = {

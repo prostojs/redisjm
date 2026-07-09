@@ -66,7 +66,31 @@ export class Job<TInputs = unknown, TAttrs extends { [K in keyof TAttrs]: JobAtt
     // A fresh fencing token per execution: the record's owner is whoever's `start` stamped it.
     const executionId = randomUUID()
 
-    const payload = { job: this, targetGroup, runId, inputs, executionId, manager: options?.manager }
+    // Per-execution cooperative abort. `ctx.signal` is aborted when the run loses ownership of its
+    // record (the manager's heartbeat hook calls `payload.abort`) or when an external signal — e.g.
+    // shutdown via `options.signal` — fires. Nothing forcibly kills the handler; it observes the signal.
+    const controller = new AbortController()
+    const externalSignal = options?.signal
+    let onExternalAbort: (() => void) | undefined
+    if (externalSignal) {
+      if (externalSignal.aborted) {
+        // Already aborted before we started following it — mirror it immediately.
+        controller.abort(externalSignal.reason)
+      } else {
+        onExternalAbort = () => controller.abort(externalSignal.reason)
+        externalSignal.addEventListener('abort', onExternalAbort, { once: true })
+      }
+    }
+
+    const payload = {
+      job: this,
+      targetGroup,
+      runId,
+      inputs,
+      executionId,
+      manager: options?.manager,
+      abort: (reason?: string) => controller.abort(reason ?? 'aborted'),
+    }
 
     const ctx: JobContext<TAttrs> = {
       setProgress: (progress: number) => {
@@ -81,6 +105,7 @@ export class Job<TInputs = unknown, TAttrs extends { [K in keyof TAttrs]: JobAtt
       setAttrs: (attrs: TAttrs) => {
         return this.callHook('update', { ...payload, attrs })
       },
+      signal: controller.signal,
     }
 
     // The heartbeat timer is created *after* the start hook resolves and torn down in
@@ -117,6 +142,11 @@ export class Job<TInputs = unknown, TAttrs extends { [K in keyof TAttrs]: JobAtt
       await this.callHook('finish', payload)
     } finally {
       if (heartbeatTimer) clearInterval(heartbeatTimer)
+      // Detach the external-signal listener so a long-lived, shared shutdown signal doesn't accumulate
+      // one dead listener per execution (a slow leak on a signal that outlives many runs).
+      if (externalSignal && onExternalAbort) {
+        externalSignal.removeEventListener('abort', onExternalAbort)
+      }
     }
   }
 

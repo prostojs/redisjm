@@ -19,6 +19,7 @@ import type {
   RedisJMLogger,
   RedisJMOptions,
   ResolvedRedisJMOptions,
+  StopOptions,
 } from './types'
 
 const DEFAULT_OPTIONS: Omit<ResolvedRedisJMOptions, 'maintenanceInterval'> = {
@@ -28,7 +29,16 @@ const DEFAULT_OPTIONS: Omit<ResolvedRedisJMOptions, 'maintenanceInterval'> = {
   unknownJobRequeueLimit: 5,
   laneStrategy: 'roundRobin',
   lanePriority: [],
+  concurrency: 1,
 }
+
+/**
+ * Shared pre-resolved execution thunk for the pop branches that already did their Redis cleanup
+ * inline (garbage drop, unknown-job drop, missing-record drop, non-jobId cleanup). Returning it from
+ * `popNext` makes those branches count as "work found" for pacing (immediate re-poll) exactly like the
+ * old `return true`, without dispatching any actual execution.
+ */
+const NOOP_THUNK = (): Promise<void> => Promise.resolve()
 
 /** Default logger: writes to `console.error`, prefers the error stack when present. */
 const DEFAULT_LOGGER: RedisJMLogger = (message, error) => {
@@ -86,8 +96,26 @@ export class RedisJM extends Hookable<RedisJMHooks> {
   private pollTimer: ReturnType<typeof setTimeout> | undefined
   private polling = false
   private maintenanceTimer: ReturnType<typeof setInterval> | undefined
-  /** Promise of the job currently being executed by the poll loop, if any. Awaited by `stop()`. */
-  private inFlight: Promise<unknown> | undefined
+  /**
+   * Promises of the runs currently executing in the poll loop (up to `concurrency`). The poll loop
+   * dispatches into this set without awaiting so multiple runs can be in flight at once; `stop()`
+   * awaits them all to drain. Each promise swallows its own errors, so members never reject.
+   */
+  private readonly inFlightRuns = new Set<Promise<void>>()
+  /**
+   * Abort controllers of the in-flight runs — one per dispatched execution. `stop({ abort: true })`
+   * aborts every one (cooperative fast shutdown); each is removed when its run settles.
+   */
+  private readonly abortControllers = new Set<AbortController>()
+  /**
+   * Promise of the poll invocation currently executing, assigned synchronously at EVERY invocation
+   * (the initial `poll()` and each timer callback). `stop()` must await it BEFORE snapshotting
+   * `inFlightRuns`: a poll caught mid-pop has already removed the queue entry from Redis, so the run
+   * it is about to dispatch must be part of the drain — snapshotting earlier would let `stop()`
+   * resolve while that popped job still executes (e.g. after the caller has closed Redis). Never
+   * rejects (all of `poll`'s awaits are caught).
+   */
+  private currentPoll: Promise<void> | undefined
   /** Round-robin cursor rotating the work-lane poll order once per poll to prevent starvation. */
   private pollCursor = 0
   /** Lazy `LMPOP` capability flag: `undefined` = not yet probed, `false` = fall back to sequential `LPOP`. */
@@ -112,6 +140,12 @@ export class RedisJM extends Hookable<RedisJMHooks> {
     this.targetGroup = targetGroup
     const heartbeatInterval = options?.heartbeatInterval ?? DEFAULT_OPTIONS.heartbeatInterval
     const roundsToStale = options?.roundsToStale ?? DEFAULT_OPTIONS.roundsToStale
+    const concurrency = options?.concurrency ?? DEFAULT_OPTIONS.concurrency
+    // Validate before flooring: reject NaN/Infinity/< 1 outright, then floor a valid value (2.7 → 2)
+    // so a single instance never runs zero or a fractional number of jobs at once.
+    if (!Number.isFinite(concurrency) || concurrency < 1) {
+      throw new TypeError(`concurrency must be a positive integer >= 1, got ${String(concurrency)}`)
+    }
     this.options = {
       heartbeatInterval,
       roundsToStale,
@@ -120,6 +154,7 @@ export class RedisJM extends Hookable<RedisJMHooks> {
       unknownJobRequeueLimit: options?.unknownJobRequeueLimit ?? DEFAULT_OPTIONS.unknownJobRequeueLimit,
       laneStrategy: options?.laneStrategy ?? DEFAULT_OPTIONS.laneStrategy,
       lanePriority: options?.lanePriority ?? DEFAULT_OPTIONS.lanePriority,
+      concurrency: Math.floor(concurrency),
     }
     this.logger = options?.logger === false ? NOOP_LOGGER : (options?.logger ?? DEFAULT_LOGGER)
   }
@@ -389,13 +424,23 @@ export class RedisJM extends Hookable<RedisJMHooks> {
     const onHeartbeat = async (payload: JobEventPayload<TInputs>) => {
       if (!this.shouldHandle(payload)) return
       const jobId = getJobId(payload.runId)
-      await this.updateLog(jobId, (record) => {
+      const result = await this.updateLog(jobId, (record) => {
         // Never refresh the heartbeat of a record that has left `running` or belongs to a different
         // execution: a late/straggling heartbeat from a finished or superseded run must not resurrect
         // (or keep alive) a record now owned by someone else.
         if (record.status !== 'running' || record.executionId !== payload.executionId) return false
         record.heartbeat = Date.now()
       })
+      // Heartbeat-driven ownership-loss detection: the heartbeat is the ONLY periodic read the executor
+      // already performs, so when its guarded write is not 'written' — 'rejected' (record now owned by a
+      // successor / no longer `running`) or 'missing' (unqueued mid-run) — this execution has lost
+      // ownership of its record. Abort the run's cooperative signal (detected within one
+      // heartbeatInterval, zero extra Redis traffic) and SKIP the manager-level heartbeat event: it
+      // doesn't describe a live, owned run. Abort is cooperative — the handler must observe the signal.
+      if (result !== 'written') {
+        payload.abort('run lost ownership of its record (stale, superseded, or unqueued)')
+        return
+      }
       await this.callHook('heartbeat', payload as unknown as JobEventPayload)
     }
 
@@ -458,6 +503,22 @@ export class RedisJM extends Hookable<RedisJMHooks> {
    * ```
    */
   async popAndExecute(): Promise<boolean> {
+    const thunk = await this.popNext()
+    if (!thunk) return false
+    // Preserve the public contract: resolve only after the popped run completes.
+    await thunk()
+    return true
+  }
+
+  /**
+   * Promotes due delayed runs, pops ONE job, and resolves the pop into either `null` (nothing to do at
+   * idle pacing: empty queue, or an unknown job re-queued for a sibling) or a thunk that performs the
+   * work. The pop's Redis-touching cleanup (unknown-job drop, missing/corrupt-record drop, non-jobId
+   * cleanup) happens inline here; those branches return a pre-resolved no-op thunk so the caller still
+   * counts them as "work found" for pacing. Only a real execution defers into a thunk the poll loop can
+   * run concurrently without awaiting. `popAndExecute` awaits the thunk; the poll loop does not.
+   */
+  private async popNext(): Promise<null | (() => Promise<void>)> {
     // Promote any due delayed runs onto their lane queues before popping, so a run whose delay just
     // elapsed becomes poppable on this same pass.
     await this.promoteDueDelayed()
@@ -466,13 +527,13 @@ export class RedisJM extends Hookable<RedisJMHooks> {
     // ordered by strategy) atomically via `LMPOP`, with a sequential-`LPOP` fallback for Redis < 7.
     const keys = this.getSubscribedQueueKeys()
     const jobId = await this.popFromLanes(keys)
-    if (!jobId) return false
+    if (!jobId) return null
 
     const separatorIndex = jobId.indexOf('#')
     if (separatorIndex === -1) {
       await this.redis.srem(this.getLocksKey(), jobId)
       await this.redis.hdel(this.getLogKey(), jobId)
-      return true
+      return NOOP_THUNK
     }
 
     const jobName = jobId.slice(0, separatorIndex)
@@ -483,10 +544,10 @@ export class RedisJM extends Hookable<RedisJMHooks> {
       // This instance has no handler for the popped name. In a rolling deploy / blue-green
       // topology a sibling instance may have it, so re-queue (keeping the lock held) up to
       // `unknownJobRequeueLimit` times before giving up and recording the error. A successful
-      // re-queue returns `false` (treated as "no work executed") so the poll loop applies its
+      // re-queue returns `null` (treated as "no work executed") so the poll loop applies its
       // idle interval rather than immediately re-popping — spacing retries by `interval` gives
       // a sibling that *does* have the handler real wall-clock time to claim it.
-      if (await this.requeueUnknownJob(jobId)) return false
+      if (await this.requeueUnknownJob(jobId)) return null
 
       const now = Date.now()
       await this.updateLog(jobId, (record) => {
@@ -496,7 +557,7 @@ export class RedisJM extends Hookable<RedisJMHooks> {
       })
       this.logger(`job "${jobId}" has no registered handler on this instance; dropping`)
       await this.releaseLockAndMaybeDropLog(jobId)
-      return true
+      return NOOP_THUNK
     }
 
     const logJson = await this.redis.hget(this.getLogKey(), jobId)
@@ -505,7 +566,7 @@ export class RedisJM extends Hookable<RedisJMHooks> {
       // the lock and surface it rather than dropping the run completely silently.
       this.logger(`job "${jobId}" popped with no log record; dropping`)
       await this.redis.srem(this.getLocksKey(), jobId)
-      return true
+      return NOOP_THUNK
     }
 
     const logRecord = this.parseRecord(logJson, jobId)
@@ -514,33 +575,51 @@ export class RedisJM extends Hookable<RedisJMHooks> {
       // doesn't apply) rather than routing through the retention-aware release, which is what keeps
       // `keepFinishedInterval > 0` from hoarding it forever.
       await this.dropGarbageRecordAndLock(jobId)
-      return true
-    }
-    try {
-      await job.execute(logRecord.inputs, {
-        targetGroup: this.targetGroup,
-        heartbeatInterval: this.options.heartbeatInterval,
-        runId,
-        // Identify this manager as the driver (so only its hooks act) and route infra errors here.
-        manager: this,
-        logger: this.logger,
-      })
-    } catch (err) {
-      if (err instanceof RunSupersededError) {
-        // The entry we popped no longer owns its record — a successor/concurrent claimant does, and
-        // is responsible for the lock and log. Skip without touching either (a re-push would
-        // duplicate the successor's queued entry; an srem would free the successor's lock).
-        this.logger(`job "${jobId}" superseded; skipping`)
-        return true
-      }
-      // The job's `error` event already recorded the failure in Redis and re-broadcast it.
-      // Surface it through the logger too, so a thrown handler is never fully silent when no
-      // `error` hook is wired (and to catch infra/hook failures, which are NOT "already handled").
-      const error = toError(err)
-      this.logger(`job "${jobId}" failed: ${error.message}`, error)
+      return NOOP_THUNK
     }
 
-    return true
+    // Defer the execution into a thunk so the poll loop can run it WITHOUT awaiting (concurrency): the
+    // thunk owns a per-execution AbortController (registered so `stop({ abort: true })` can signal it,
+    // removed when the run settles) and reproduces the serial path's terminal error handling exactly.
+    // Capture only `inputs`, not the whole parsed record: the thunk lives in `inFlightRuns` for the
+    // run's lifetime, so closing over just the payload lets the record wrapper be collected sooner.
+    const { inputs } = logRecord
+    return async () => {
+      const controller = new AbortController()
+      this.abortControllers.add(controller)
+      try {
+        await job.execute(inputs, {
+          targetGroup: this.targetGroup,
+          heartbeatInterval: this.options.heartbeatInterval,
+          runId,
+          // Identify this manager as the driver (so only its hooks act) and route infra errors here.
+          manager: this,
+          logger: this.logger,
+          // Cooperative abort: the heartbeat hook fires this on ownership loss; stop({abort:true}) fires
+          // it on shutdown. WHY (abort meets retries): if an aborted attempt still throws, the error
+          // path may schedule a retry — and that's CORRECT. If the abort came from staleness/supersession
+          // the retry's writes are fenced out by the executionId claim/mutator guards (it never lands);
+          // if it came from local shutdown the retry legitimately belongs to another instance. No
+          // special-casing is needed here.
+          signal: controller.signal,
+        })
+      } catch (err) {
+        if (err instanceof RunSupersededError) {
+          // The entry we popped no longer owns its record — a successor/concurrent claimant does, and
+          // is responsible for the lock and log. Skip without touching either (a re-push would
+          // duplicate the successor's queued entry; an srem would free the successor's lock).
+          this.logger(`job "${jobId}" superseded; skipping`)
+          return
+        }
+        // The job's `error` event already recorded the failure in Redis and re-broadcast it.
+        // Surface it through the logger too, so a thrown handler is never fully silent when no
+        // `error` hook is wired (and to catch infra/hook failures, which are NOT "already handled").
+        const error = toError(err)
+        this.logger(`job "${jobId}" failed: ${error.message}`, error)
+      } finally {
+        this.abortControllers.delete(controller)
+      }
+    }
   }
 
   /**
@@ -743,35 +822,70 @@ export class RedisJM extends Hookable<RedisJMHooks> {
       this.maintenanceTimer = setInterval(tryQueue, this.options.maintenanceInterval)
     }
 
+    const concurrency = this.options.concurrency
     const poll = async () => {
       if (!this.polling) return
-      let executed = false
+
+      // All execution slots busy: wait for one run to free a slot, then re-poll immediately (a slot
+      // just opened). Do NOT pop while full — that would exceed the concurrency cap. In-flight runs
+      // swallow their own errors, so the race never rejects (the `.catch` is belt-and-suspenders).
+      if (this.inFlightRuns.size >= concurrency) {
+        await Promise.race(this.inFlightRuns).catch(() => {})
+        if (!this.polling) return
+        this.pollTimer = setTimeout(() => { this.currentPoll = poll() }, 0)
+        return
+      }
+
+      let thunk: null | (() => Promise<void>) = null
       try {
-        this.inFlight = this.popAndExecute()
-        executed = (await this.inFlight) as boolean
+        thunk = await this.popNext()
       } catch (err) {
         // Keep the loop alive, but surface the failure instead of swallowing it silently.
         this.logger('poll loop error', toError(err))
-      } finally {
-        this.inFlight = undefined
       }
+
+      if (thunk) {
+        // Dispatch WITHOUT awaiting so the loop can pop the next job concurrently. The thunk already
+        // swallows RunSupersededError and handler errors internally (identical to the serial path); the
+        // outer `.catch` guards against an unexpected infra fault becoming an unhandled rejection. Track
+        // the run so `stop()` can drain it and `concurrency` is enforced.
+        const run = thunk().catch((err) => {
+          this.logger('in-flight run error', toError(err))
+        })
+        this.inFlightRuns.add(run)
+        void run.finally(() => {
+          this.inFlightRuns.delete(run)
+        })
+      }
+
       if (!this.polling) return
-      const delay = executed ? 0 : interval
-      this.pollTimer = setTimeout(poll, delay)
+      // Pacing (unchanged): work found → re-poll immediately; idle (empty queue / requeued unknown) →
+      // wait `interval`.
+      const delay = thunk ? 0 : interval
+      // Track every invocation in `currentPoll` (assigned synchronously inside the timer callback) so
+      // `stop()` can await a poll caught mid-pop before it drains `inFlightRuns` (see `currentPoll`).
+      this.pollTimer = setTimeout(() => { this.currentPoll = poll() }, delay)
     }
-    poll()
+    this.currentPoll = poll()
   }
 
   /**
-   * Stops the polling loop and returns a promise that resolves once the in-flight job (if any)
-   * has settled, so callers (e.g. a SIGTERM handler) can await a graceful drain before exiting.
+   * Stops the polling loop and returns a promise that resolves once all in-flight runs have settled,
+   * so callers (e.g. a SIGTERM handler) can await a drain before exiting.
+   *
+   * Two modes: the default is a GRACEFUL drain — new work stops being popped and `stop()` awaits the
+   * runs already in flight to finish on their own. `stop({ abort: true })` is a FAST abort-and-drain —
+   * it additionally aborts every in-flight run's `ctx.signal` (reason `'manager stopped'`) so
+   * cooperative handlers can bail out of wasted work early; `stop()` still awaits them to settle
+   * (abort is cooperative — nothing forcibly kills a handler).
    *
    * @example
    * ```ts
-   * process.on('SIGTERM', async () => { await manager.stop() })
+   * process.on('SIGTERM', async () => { await manager.stop() })            // graceful
+   * process.on('SIGINT',  async () => { await manager.stop({ abort: true }) }) // fast
    * ```
    */
-  stop(): Promise<void> {
+  stop(options?: StopOptions): Promise<void> {
     this.polling = false
     if (this.pollTimer) {
       clearTimeout(this.pollTimer)
@@ -781,8 +895,32 @@ export class RedisJM extends Hookable<RedisJMHooks> {
       clearInterval(this.maintenanceTimer)
       this.maintenanceTimer = undefined
     }
-    // Swallow a rejected in-flight here — the poll loop already logs it; `stop()` should resolve.
-    return Promise.resolve(this.inFlight).then(() => {}, () => {})
+    const abortAll = () => {
+      for (const controller of this.abortControllers) controller.abort('manager stopped')
+    }
+    if (options?.abort) {
+      // Fast shutdown: signal every in-flight run that it should stop wasting resources. Cooperative —
+      // the handler must observe `ctx.signal`; we still await settlement below. NOTE: a run dispatched
+      // by the still-in-flight final poll registers its controller AFTER this loop and would miss the
+      // signal — the second (idempotent) abortAll after the currentPoll await below closes that gap.
+      abortAll()
+    }
+    const drain = async () => {
+      // Await the in-flight poll invocation FIRST: a poll caught mid-pop has already removed the queue
+      // entry from Redis, so the run it dispatches must be included in the drain — snapshotting
+      // `inFlightRuns` before that dispatch would let `stop()` resolve while the popped job still
+      // executes. (The poll cannot be skipped either: dropping the popped entry would strand the run
+      // until maintenance stales it.) `poll` never rejects (its awaits are caught) — the guard is
+      // belt-and-suspenders so `stop()` keeps its no-reject promise.
+      await Promise.resolve(this.currentPoll).then(() => {}, () => {})
+      // Re-abort so a run the final poll dispatched (controller registered after the early abortAll)
+      // also gets the signal; aborting an already-aborted controller is a no-op.
+      if (options?.abort) abortAll()
+      // Await settlement of ALL in-flight runs. Each run's promise already swallows its own errors (the
+      // poll loop logged them), so `allSettled` just waits without surfacing — `stop()` always resolves.
+      await Promise.allSettled([...this.inFlightRuns])
+    }
+    return drain()
   }
 
   /**

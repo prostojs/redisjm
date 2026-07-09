@@ -30,6 +30,7 @@ describe('RedisJM', () => {
         unknownJobRequeueLimit: 5,
         laneStrategy: 'roundRobin',
         lanePriority: [],
+        concurrency: 1,
       })
     })
 
@@ -43,6 +44,7 @@ describe('RedisJM', () => {
         unknownJobRequeueLimit: 5,
         laneStrategy: 'roundRobin',
         lanePriority: [],
+        concurrency: 1,
       })
     })
 
@@ -1078,6 +1080,229 @@ describe('RedisJM', () => {
       await stopPromise
       expect(stopped).toBe(true)
     })
+
+    // WHY: a stop() that lands while a poll is MID-POP must still drain the job that pop returns — the
+    // queue entry is already off Redis, so the run WILL be dispatched by the in-flight poll; if stop()
+    // snapshotted inFlightRuns before that dispatch it would resolve while the job still executes
+    // (e.g. after the caller closed Redis). With {abort:true}, the late-dispatched run must also
+    // receive the abort signal (its controller registers after the first abort pass).
+    it('stop() during a mid-pop poll waits for the popped run, which still sees the abort signal', async () => {
+      const m = new RedisJM(redis, 'test-group', { keepFinishedInterval: 60000, maintenanceInterval: 0, logger: false })
+      let handlerDone = false
+      let sawAbort = false
+      const job = m.createJob({ jobName: 'midpop' }, vi.fn(async (_i: string, ctx: JobContext) => {
+        // Cooperative handler: wait for the shutdown abort to reach this late-dispatched run, then
+        // finish. If the second abort pass were missing, this would hang and the test would time out.
+        if (!ctx.signal.aborted) {
+          await new Promise<void>((resolve) => ctx.signal.addEventListener('abort', () => resolve(), { once: true }))
+        }
+        sawAbort = ctx.signal.aborted
+        handlerDone = true
+      }))
+      await m.queue(job, 'r1', 'x')
+
+      // Defer the poll's pop: the first lmpop hangs until we release it with the queued jobId.
+      let releasePop!: (v: unknown) => void
+      ;(redis.lmpop as any).mockImplementationOnce(() => new Promise((resolve) => { releasePop = resolve }))
+
+      m.start(50)
+      await new Promise((r) => setTimeout(r, 0)) // let the poll reach the pending lmpop
+
+      let stopped = false
+      const stopPromise = m.stop({ abort: true }).then(() => { stopped = true })
+      await new Promise((r) => setTimeout(r, 0))
+      expect(stopped).toBe(false) // stop is awaiting the mid-pop poll, not resolving early
+
+      // The pop now resolves with the entry it already removed — the final poll dispatches the run.
+      releasePop(['redisjm:test-group:queue', ['midpop#r1']])
+      await stopPromise
+      expect(stopped).toBe(true)
+      expect(handlerDone).toBe(true) // stop() resolved only after the popped run settled
+      expect(sawAbort).toBe(true) // the second abort pass reached the late-dispatched run
+    })
+  })
+
+  describe('concurrency', () => {
+    afterEach(() => { vi.useRealTimers() })
+
+    // The poll loop re-schedules found-work polls at delay 0; a zero-duration timer advance does not
+    // fire such cascading same-tick timers under fake timers, so advance a tiny positive amount to
+    // drain the poll cascade (still well under heartbeatInterval, so no heartbeats fire).
+    const TICK = 1
+
+    // Helper: a job whose handler blocks until its per-input gate is released, recording start order.
+    const gatedJob = (m: RedisJM) => {
+      const started: string[] = []
+      const gates = new Map<string, () => void>()
+      const job = m.createJob({ jobName: 'p' }, vi.fn((input: string) => new Promise<void>((resolve) => {
+        started.push(input)
+        gates.set(input, resolve)
+      })))
+      return { job, started, gates }
+    }
+
+    // WHY: with concurrency > 1 the poll loop must dispatch up to N runs simultaneously — both handlers
+    // start before either resolves. The serial-default counterpart (below) is the regression guard.
+    it('runs up to `concurrency` jobs in parallel', async () => {
+      vi.useFakeTimers()
+      const m = new RedisJM(redis, 'test-group', { keepFinishedInterval: 60000, maintenanceInterval: 0, logger: false, concurrency: 2 })
+      const { job, started, gates } = gatedJob(m)
+      await m.queue(job, 'r1', 'a')
+      await m.queue(job, 'r2', 'b')
+
+      m.start(50)
+      await vi.advanceTimersByTimeAsync(TICK)
+      // Both handlers are in flight with neither gate released.
+      expect([...started].sort()).toEqual(['a', 'b'])
+
+      gates.get('a')!()
+      gates.get('b')!()
+      await m.stop()
+    })
+
+    // WHY: regression guard for the serial default — one long job blocks the instance, so the second
+    // starts only after the first finishes and frees the single slot.
+    it('with default concurrency 1, the second job starts only after the first finishes', async () => {
+      vi.useFakeTimers()
+      const m = new RedisJM(redis, 'test-group', { keepFinishedInterval: 60000, maintenanceInterval: 0, logger: false })
+      const { job, started, gates } = gatedJob(m)
+      await m.queue(job, 'r1', 'a')
+      await m.queue(job, 'r2', 'b')
+
+      m.start(50)
+      await vi.advanceTimersByTimeAsync(TICK)
+      expect(started).toEqual(['a']) // only the first — the single slot is full
+
+      gates.get('a')!()
+      await vi.advanceTimersByTimeAsync(TICK)
+      expect(started).toEqual(['a', 'b']) // slot freed → the second starts
+
+      gates.get('b')!()
+      await m.stop()
+    })
+
+    // WHY: the cap must never be exceeded — with 3 jobs and concurrency 2 the third waits for a slot to
+    // free, then starts.
+    it('never exceeds the concurrency cap (3 jobs, concurrency 2)', async () => {
+      vi.useFakeTimers()
+      const m = new RedisJM(redis, 'test-group', { keepFinishedInterval: 60000, maintenanceInterval: 0, logger: false, concurrency: 2 })
+      const { job, started, gates } = gatedJob(m)
+      for (const [r, v] of [['r1', 'a'], ['r2', 'b'], ['r3', 'c']] as const) await m.queue(job, r, v)
+
+      m.start(50)
+      await vi.advanceTimersByTimeAsync(TICK)
+      expect([...started].sort()).toEqual(['a', 'b']) // two in flight, third waits
+
+      gates.get('a')!()
+      await vi.advanceTimersByTimeAsync(TICK)
+      expect([...started].sort()).toEqual(['a', 'b', 'c']) // a freed a slot → c starts
+
+      gates.get('b')!()
+      gates.get('c')!()
+      await m.stop()
+    })
+
+    // WHY: stop() must drain EVERY in-flight run before resolving, not just one — the graceful contract
+    // holds under concurrency too.
+    it('graceful stop() drains multiple in-flight runs before resolving', async () => {
+      vi.useFakeTimers()
+      const m = new RedisJM(redis, 'test-group', { keepFinishedInterval: 60000, maintenanceInterval: 0, logger: false, concurrency: 2 })
+      const finished: string[] = []
+      const gates: Array<() => void> = []
+      const job = m.createJob({ jobName: 'd' }, vi.fn((input: string) => new Promise<void>((resolve) => {
+        gates.push(() => { finished.push(input); resolve() })
+      })))
+      await m.queue(job, 'r1', 'a')
+      await m.queue(job, 'r2', 'b')
+
+      m.start(50)
+      await vi.advanceTimersByTimeAsync(TICK)
+      expect(gates).toHaveLength(2) // both in flight
+
+      let stopped = false
+      const stopPromise = m.stop().then(() => { stopped = true })
+      await Promise.resolve()
+      expect(stopped).toBe(false) // still draining both
+
+      gates[0]()
+      gates[1]()
+      await stopPromise
+      expect(stopped).toBe(true)
+      expect(finished.sort()).toEqual(['a', 'b'])
+    })
+
+    // WHY: stop({ abort: true }) fires ctx.signal for a fast shutdown — a cooperative handler observes
+    // aborted + the 'manager stopped' reason and can finish early; stop still resolves once it settles.
+    it('stop({ abort: true }) aborts in-flight handlers so they can finish early', async () => {
+      vi.useFakeTimers()
+      const m = new RedisJM(redis, 'test-group', { keepFinishedInterval: 60000, maintenanceInterval: 0, logger: false })
+      let observedAborted = false
+      let observedReason: unknown
+      const job = m.createJob({ jobName: 'ab' }, vi.fn((_input: string, ctx: JobContext) => new Promise<void>((resolve) => {
+        ctx.signal.addEventListener('abort', () => {
+          observedAborted = ctx.signal.aborted
+          observedReason = ctx.signal.reason
+          resolve() // cooperative: bail out of the remaining work
+        }, { once: true })
+      })))
+      await m.queue(job, 'r1', 'x')
+
+      m.start(50)
+      await vi.advanceTimersByTimeAsync(TICK) // dispatch and start the handler
+
+      await m.stop({ abort: true })
+      expect(observedAborted).toBe(true)
+      expect(observedReason).toBe('manager stopped')
+    })
+
+    // WHY: heartbeat-driven ownership-loss detection — when the guarded heartbeat write is rejected
+    // (record staled/superseded under the run), onHeartbeat aborts ctx.signal with the ownership-loss
+    // reason and fires NO manager-level heartbeat event for that lost beat.
+    it('a heartbeat that detects ownership loss aborts the run and fires no heartbeat event', async () => {
+      vi.useFakeTimers()
+      const m = new RedisJM(redis, 'test-group', {
+        heartbeatInterval: 100, keepFinishedInterval: 60000, maintenanceInterval: 0, logger: false,
+      })
+      const heartbeatEvents = vi.fn()
+      m.hook('heartbeat', heartbeatEvents)
+      let ctxRef!: JobContext
+      const job = m.createJob({ jobName: 'hbloss' }, vi.fn((_i: string, ctx: JobContext) => new Promise<void>((resolve) => {
+        ctxRef = ctx
+        ctx.signal.addEventListener('abort', () => resolve(), { once: true })
+      })))
+      await m.queue(job, 'r1', 'x')
+
+      const exec = job.execute('x', { targetGroup: 'test-group', runId: 'r1', heartbeatInterval: 100, manager: m })
+      await vi.advanceTimersByTimeAsync(0) // claim settles, handler running
+
+      // Simulate ownership loss: overwrite the record so the guarded heartbeat write is rejected
+      // (executionId no longer matches), as maintenance-stale + a successor reclaim would leave it.
+      const jobId = 'hbloss#r1'
+      const rec = JSON.parse((await redis.hget('redisjm:test-group:log', jobId))!) as JobLogRecord
+      rec.status = 'stale'
+      rec.executionId = 'someone-else'
+      await redis.hset('redisjm:test-group:log', jobId, JSON.stringify(rec))
+
+      // Advance one heartbeat interval → onHeartbeat runs, guarded write rejected → abort fires.
+      await vi.advanceTimersByTimeAsync(100)
+      await exec
+
+      expect(ctxRef.signal.aborted).toBe(true)
+      expect(String(ctxRef.signal.reason)).toContain('lost ownership')
+      expect(heartbeatEvents).not.toHaveBeenCalled() // no manager heartbeat event for the lost beat
+    })
+  })
+
+  describe('concurrency validation', () => {
+    // WHY: concurrency must be a positive integer — reject 0/-1/NaN/Infinity, floor a fractional value.
+    it('rejects non-positive / non-finite concurrency and floors a fractional value', () => {
+      expect(() => new RedisJM(redis, 'g', { concurrency: 0 })).toThrow(TypeError)
+      expect(() => new RedisJM(redis, 'g', { concurrency: -1 })).toThrow(TypeError)
+      expect(() => new RedisJM(redis, 'g', { concurrency: Number.NaN })).toThrow(TypeError)
+      expect(() => new RedisJM(redis, 'g', { concurrency: Number.POSITIVE_INFINITY })).toThrow(TypeError)
+      expect(new RedisJM(redis, 'g', { concurrency: 2.7 }).getOptions().concurrency).toBe(2)
+      expect(new RedisJM(redis, 'g', { concurrency: 1 }).getOptions().concurrency).toBe(1)
+    })
   })
 
   describe('stale maintenance lock recovery', () => {
@@ -1235,8 +1460,10 @@ describe('RedisJM', () => {
         finishedAt: Date.now() - 50000, heartbeat: oldHeartbeat,
       }))
 
-      // Fire the manager's heartbeat hook for this run (as a late/leaked timer would).
-      await job.callHook('heartbeat', { job, targetGroup: 'test-group', runId: 'r1', inputs: null, executionId: 'x' })
+      // Fire the manager's heartbeat hook for this run (as a late/leaked timer would). The guarded
+      // write is rejected (record already left running), so onHeartbeat now calls payload.abort — pass
+      // a no-op abort since this hand-built payload has no real execution behind it.
+      await job.callHook('heartbeat', { job, targetGroup: 'test-group', runId: 'r1', inputs: null, executionId: 'x', abort: () => {} })
 
       const record = JSON.parse((await redis.hget('redisjm:test-group:log', jobId))!) as JobLogRecord
       expect(record.status).toBe('stale')

@@ -93,6 +93,14 @@ export interface RedisJMOptions {
    */
   lanePriority?: string[]
   /**
+   * Max number of jobs a single instance executes simultaneously. Default `1` — today's serial
+   * behavior, where one long-running job blocks the instance from popping anything else (including the
+   * reserved `__maintenance` lane). Set `> 1` for I/O-bound workloads that need N runs in flight. Must
+   * be a positive integer; the constructor floors it and throws a `TypeError` if it is `< 1` or not
+   * finite.
+   */
+  concurrency?: number
+  /**
    * Sink for operational errors that are otherwise invisible — handler throws,
    * unknown/dropped jobs, and poll-loop failures. Defaults to a `console.error`
    * logger that includes the error stack. Pass `false` to silence default logging
@@ -100,6 +108,17 @@ export interface RedisJMOptions {
    * duplicate console output).
    */
   logger?: RedisJMLogger | false
+}
+
+/** Options for `RedisJM.stop()`. */
+export interface StopOptions {
+  /**
+   * When `true`, abort every in-flight run's `ctx.signal` (reason `'manager stopped'`) before draining
+   * — a fast shutdown that lets cooperative handlers bail out of wasted work early. Abort is
+   * cooperative: nothing forcibly kills a handler; `stop()` still awaits all in-flight runs to settle.
+   * Default `false` — a graceful drain that lets in-flight runs finish on their own.
+   */
+  abort?: boolean
 }
 
 /** Resolved version of `RedisJMOptions` with all defaults applied. */
@@ -111,6 +130,7 @@ export interface ResolvedRedisJMOptions {
   unknownJobRequeueLimit: number
   laneStrategy: LaneStrategy
   lanePriority: string[]
+  concurrency: number
 }
 
 /** A full job state record stored in the Redis log hash. */
@@ -187,6 +207,13 @@ export interface JobExecuteOptions {
    * a throwing `error` hook), which would otherwise be swallowed.
    */
   logger?: RedisJMLogger
+  /**
+   * External abort signal plumbed into `ctx.signal`. When it aborts, this execution's context signal
+   * aborts with the same reason. The manager passes one per execution to wire ownership-loss and
+   * shutdown aborts. The execution follows the signal for its lifetime and detaches its listener when
+   * it settles, so a long-lived external signal never accumulates a listener per execution.
+   */
+  signal?: AbortSignal
 }
 
 /** Context object passed to the job function during execution. */
@@ -195,6 +222,15 @@ export interface JobContext<TAttrs extends { [K in keyof TAttrs]: JobAttrValue }
   setProgress: (progress: number) => Promise<void>
   /** Updates the job's custom attributes in the log via an `update` event. */
   setAttrs: (attrs: TAttrs) => Promise<void>
+  /**
+   * Aborted when this run loses ownership of its record — staled by maintenance, superseded by a
+   * re-enqueue of the same runId, or unqueued (detected by the heartbeat hook's guarded write being
+   * rejected) — or when the manager shuts down with `stop({ abort: true })`. Abort is COOPERATIVE:
+   * nothing forcibly stops the handler, so check `signal.aborted` (or listen for `'abort'`) at natural
+   * checkpoints to stop wasted work whose writes would only be fenced out. `signal.reason` carries a
+   * short string cause.
+   */
+  signal: AbortSignal
 }
 
 /** The job function signature. Receives inputs and a context for progress/attrs updates. */
@@ -213,6 +249,13 @@ export interface JobEventPayload<TInputs = unknown> {
   executionId: string
   /** The manager driving this execution, when run through one (absent for direct `job.execute()`). */
   manager?: RedisJM
+  /**
+   * Aborts THIS execution's context signal (`ctx.signal`) with the given reason (default `'aborted'`).
+   * The manager's heartbeat hook calls it on ownership loss (stale/superseded/unqueued); it is also
+   * exposed to user hooks as a custom kill-switch. Cooperative — the handler must observe the signal
+   * to actually stop.
+   */
+  abort: (reason?: string) => void
 }
 
 /** Payload for `error` events. Extends `JobEventPayload` with the caught error. */
