@@ -1,4 +1,5 @@
 import type { Job } from './job'
+import type { RedisJM } from './redisjm'
 
 /** Allowed value types for custom job attributes. */
 export type JobAttrValue = string | number | boolean | null | undefined
@@ -126,6 +127,17 @@ export interface JobLogRecord<TInputs = unknown, TAttrs extends { [K in keyof TA
    * registered handler for its `jobName` (see `RedisJMOptions.unknownJobRequeueLimit`).
    */
   requeueCount?: number
+  /**
+   * Fencing token stamped when an execution claims this record (the `start` hook flips it to
+   * `running`). Lifecycle hooks refuse to mutate a record whose token doesn't match theirs, so a
+   * zombie execution can't overwrite/clean a record now owned by a successor that reclaimed the runId.
+   */
+  executionId?: string
+  /**
+   * 1-based count of executions that have started (claimed) this queued run. Incremented on each
+   * successful claim; groundwork for retries (a re-run of the same queued entry bumps it).
+   */
+  attempt?: number
 }
 
 /** Options for `Job.execute()`. */
@@ -136,6 +148,16 @@ export interface JobExecuteOptions {
   heartbeatInterval?: number
   /** Explicit runId (otherwise derived from serialized inputs) */
   runId?: string
+  /**
+   * The manager driving this execution. Stamped onto every event payload so that when two managers
+   * in one process share a Job and a targetGroup, only the driving manager's hooks act on the events.
+   */
+  manager?: RedisJM
+  /**
+   * Sink for infrastructure errors that surface during execution (e.g. a failed heartbeat write or
+   * a throwing `error` hook), which would otherwise be swallowed.
+   */
+  logger?: RedisJMLogger
 }
 
 /** Context object passed to the job function during execution. */
@@ -158,6 +180,10 @@ export interface JobEventPayload<TInputs = unknown> {
   targetGroup: string
   runId: string
   inputs: TInputs
+  /** Fencing token unique to this execution; stamped onto the record when the run claims it. */
+  executionId: string
+  /** The manager driving this execution, when run through one (absent for direct `job.execute()`). */
+  manager?: RedisJM
 }
 
 /** Payload for `error` events. Extends `JobEventPayload` with the caught error. */

@@ -12,7 +12,7 @@ if (fs.existsSync(distPath)) {
 
 export default defineConfig({
   input: "src/index.ts",
-  external: ['ioredis', 'hookable'],
+  external: ['ioredis', 'hookable', 'node:crypto'],
   output: [
     {
       file: "dist/index.mjs",

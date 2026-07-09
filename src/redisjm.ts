@@ -2,6 +2,7 @@ import { Hookable } from 'hookable'
 import type Redis from 'ioredis'
 import { Job } from './job'
 import { createMaintenanceJob, MAINTENANCE_JOB_NAME, MAINTENANCE_LANE } from './maintenance'
+import { toError } from './utils'
 import type {
   JobAttrs,
   JobAttrValue,
@@ -39,6 +40,19 @@ const DEFAULT_LOGGER: RedisJMLogger = (message, error) => {
 }
 
 const NOOP_LOGGER: RedisJMLogger = () => {}
+
+/**
+ * Thrown out of an execution whose popped queue entry no longer owns its log record — another run
+ * (a successor re-enqueued under the same runId, or a concurrent claimant) has claimed it first.
+ * Callers of `popAndExecute` inside the lib treat it as a benign skip: the record's new owner is
+ * responsible for its lock and log, so the superseded execution must touch neither.
+ */
+export class RunSupersededError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'RunSupersededError'
+  }
+}
 
 /**
  * Redis Job Manager for distributed job queues.
@@ -261,66 +275,90 @@ export class RedisJM extends Hookable<RedisJMHooks> {
     const getJobId = (runId: string) => job.getJobId(runId)
 
     const onStart = async (payload: JobEventPayload<TInputs>) => {
-      if (payload.targetGroup !== this.targetGroup) return
+      if (!this.shouldHandle(payload)) return
       const jobId = getJobId(payload.runId)
-      await this.updateLog(jobId, (record) => {
+      // `start` is the CLAIM: it only fires on a record that is still `queued`, flipping it to
+      // `running` and stamping this execution's fencing token. A rejected claim means the entry we
+      // popped no longer owns its record — a successor that re-enqueued the same runId (fresh
+      // `queued` record) or a concurrent claimant owns it now — so this execution is superseded.
+      const result = await this.updateLog(jobId, (record) => {
+        if (record.status !== 'queued') return false
         record.status = 'running'
         record.startedAt = Date.now()
         record.heartbeat = Date.now()
+        record.executionId = payload.executionId
+        record.attempt = (record.attempt ?? 0) + 1
         delete record.suspectedAt
       })
+      if (result === 'rejected') {
+        throw new RunSupersededError(`run "${jobId}" was superseded before it could claim its record`)
+      }
+      // 'missing' → no backing record (direct `job.execute()` pattern); proceed silently.
       await this.callHook('start', payload as unknown as JobEventPayload)
     }
 
     const onFinish = async (payload: JobEventPayload<TInputs>) => {
-      if (payload.targetGroup !== this.targetGroup) return
+      if (!this.shouldHandle(payload)) return
       const jobId = getJobId(payload.runId)
       const now = Date.now()
-      await this.updateLog(jobId, (record) => {
+      // Fences the zombie-run scenario: a stalled handler is staled by maintenance (lock released),
+      // a producer re-enqueues the same runId (fresh record, NO executionId), then the original
+      // handler finally finishes. Its executionId no longer matches, so the mutator rejects — the
+      // zombie can't overwrite the successor's record, srem its lock, or (under keepFinishedInterval=0)
+      // delete it out from under a run that hasn't happened yet.
+      const result = await this.updateLog(jobId, (record) => {
+        if (record.executionId !== payload.executionId) return false
         record.status = 'finished'
         record.finishedAt = now
       })
-      await this.redis.srem(this.getLocksKey(), jobId)
-      if (this.options.keepFinishedInterval === 0) {
-        await this.redis.hdel(this.getLogKey(), jobId)
-      }
+      // 'rejected' → the record's owner changed under us: touch nothing, and skip the manager-level
+      // event too (it doesn't describe the record's current owner).
+      if (result === 'rejected') return
+      // 'written' or 'missing' (record unqueued mid-run — the srem is a harmless no-op).
+      await this.releaseLockAndMaybeDropLog(jobId)
       await this.callHook('finish', payload as unknown as JobEventPayload)
     }
 
     const onError = async (payload: JobErrorEventPayload<TInputs>) => {
-      if (payload.targetGroup !== this.targetGroup) return
+      if (!this.shouldHandle(payload)) return
       const jobId = getJobId(payload.runId)
       const now = Date.now()
-      await this.updateLog(jobId, (record) => {
+      // Same fencing as `onFinish`: a superseded execution's error must not clobber the successor's
+      // record or release its lock.
+      const result = await this.updateLog(jobId, (record) => {
+        if (record.executionId !== payload.executionId) return false
         record.status = 'error'
         record.error = payload.error.message
         record.finishedAt = now
       })
-      await this.redis.srem(this.getLocksKey(), jobId)
-      if (this.options.keepFinishedInterval === 0) {
-        await this.redis.hdel(this.getLogKey(), jobId)
-      }
+      if (result === 'rejected') return
+      await this.releaseLockAndMaybeDropLog(jobId)
       await this.callHook('error', payload as unknown as JobErrorEventPayload)
     }
 
     const onHeartbeat = async (payload: JobEventPayload<TInputs>) => {
-      if (payload.targetGroup !== this.targetGroup) return
+      if (!this.shouldHandle(payload)) return
       const jobId = getJobId(payload.runId)
       await this.updateLog(jobId, (record) => {
-        // Never refresh the heartbeat of a record that has already left `running`:
-        // a late/straggling heartbeat must not resurrect a finished or stale job.
-        if (record.status !== 'running') return false
+        // Never refresh the heartbeat of a record that has left `running` or belongs to a different
+        // execution: a late/straggling heartbeat from a finished or superseded run must not resurrect
+        // (or keep alive) a record now owned by someone else.
+        if (record.status !== 'running' || record.executionId !== payload.executionId) return false
         record.heartbeat = Date.now()
       })
       await this.callHook('heartbeat', payload as unknown as JobEventPayload)
     }
 
     const onUpdate = async (payload: JobUpdateEventPayload<TInputs, TAttrs>) => {
-      if (payload.targetGroup !== this.targetGroup) return
+      if (!this.shouldHandle(payload)) return
       const jobId = getJobId(payload.runId)
       await this.updateLog(jobId, (record) => {
+        // Same fencing as heartbeat: only the running execution that owns the record may write its
+        // progress/attrs, so a superseded run's late update can't leak into the successor's record.
+        if (record.status !== 'running' || record.executionId !== payload.executionId) return false
         if (payload.progress !== undefined) record.progress = payload.progress
-        if (payload.attrs !== undefined) record.attrs = payload.attrs
+        // Merge, not replace: successive setAttrs calls accumulate keys instead of clobbering.
+        if (payload.attrs !== undefined) record.attrs = { ...record.attrs, ...payload.attrs }
       })
       await this.callHook('update', payload as unknown as JobUpdateEventPayload)
     }
@@ -403,10 +441,7 @@ export class RedisJM extends Hookable<RedisJMHooks> {
         record.finishedAt = now
       })
       this.logger(`job "${jobId}" has no registered handler on this instance; dropping`)
-      await this.redis.srem(this.getLocksKey(), jobId)
-      if (this.options.keepFinishedInterval === 0) {
-        await this.redis.hdel(this.getLogKey(), jobId)
-      }
+      await this.releaseLockAndMaybeDropLog(jobId)
       return true
     }
 
@@ -423,10 +458,7 @@ export class RedisJM extends Hookable<RedisJMHooks> {
     if (!logRecord) {
       // Corrupt/foreign record: release the lock and clean it up rather than throwing out of
       // the poll loop (which would leave the lock orphaned).
-      await this.redis.srem(this.getLocksKey(), jobId)
-      if (this.options.keepFinishedInterval === 0) {
-        await this.redis.hdel(this.getLogKey(), jobId)
-      }
+      await this.releaseLockAndMaybeDropLog(jobId)
       return true
     }
     try {
@@ -434,12 +466,22 @@ export class RedisJM extends Hookable<RedisJMHooks> {
         targetGroup: this.targetGroup,
         heartbeatInterval: this.options.heartbeatInterval,
         runId,
+        // Identify this manager as the driver (so only its hooks act) and route infra errors here.
+        manager: this,
+        logger: this.logger,
       })
     } catch (err) {
+      if (err instanceof RunSupersededError) {
+        // The entry we popped no longer owns its record — a successor/concurrent claimant does, and
+        // is responsible for the lock and log. Skip without touching either (a re-push would
+        // duplicate the successor's queued entry; an srem would free the successor's lock).
+        this.logger(`job "${jobId}" superseded; skipping`)
+        return true
+      }
       // The job's `error` event already recorded the failure in Redis and re-broadcast it.
       // Surface it through the logger too, so a thrown handler is never fully silent when no
       // `error` hook is wired (and to catch infra/hook failures, which are NOT "already handled").
-      const error = err instanceof Error ? err : new Error(String(err))
+      const error = toError(err)
       this.logger(`job "${jobId}" failed: ${error.message}`, error)
     }
 
@@ -603,7 +645,7 @@ export class RedisJM extends Hookable<RedisJMHooks> {
         executed = (await this.inFlight) as boolean
       } catch (err) {
         // Keep the loop alive, but surface the failure instead of swallowing it silently.
-        this.logger('poll loop error', err instanceof Error ? err : new Error(String(err)))
+        this.logger('poll loop error', toError(err))
       } finally {
         this.inFlight = undefined
       }
@@ -772,6 +814,30 @@ export class RedisJM extends Hookable<RedisJMHooks> {
 
   // -- private helpers --
 
+  /**
+   * Decides whether a job event belongs to this manager. Two managers in one process can share one
+   * Job (and even a targetGroup); this filters out events whose `manager` isn't this one, so only the
+   * manager that DROVE the execution reacts (no double writes/events). Payloads without a `manager`
+   * come from a direct `job.execute()` and keep the legacy targetGroup-only filtering.
+   */
+  private shouldHandle(payload: JobEventPayload<any>): boolean {
+    if (payload.targetGroup !== this.targetGroup) return false
+    if (payload.manager && payload.manager !== this) return false
+    return true
+  }
+
+  /**
+   * Releases a jobId's lock and, unless finished records are being retained
+   * (`keepFinishedInterval > 0`), drops its log entry too. Shared by every terminal path
+   * (finish, error, unknown-job drop, corrupt-record cleanup) so the retention policy lives in one spot.
+   */
+  private async releaseLockAndMaybeDropLog(jobId: string): Promise<void> {
+    await this.redis.srem(this.getLocksKey(), jobId)
+    if (this.options.keepFinishedInterval === 0) {
+      await this.redis.hdel(this.getLogKey(), jobId)
+    }
+  }
+
   /** Milliseconds a `running` heartbeat may lapse before the job is considered stale. */
   private getStaleThreshold(): number {
     return this.options.heartbeatInterval * this.options.roundsToStale
@@ -839,13 +905,22 @@ export class RedisJM extends Hookable<RedisJMHooks> {
     }
   }
 
-  private async updateLog(jobId: string, mutate: (record: JobLogRecord) => void | boolean): Promise<void> {
+  /**
+   * Read-modify-write of a single log record. Returns `'missing'` when there is no record,
+   * `'rejected'` when the mutator returned `false` (a deliberate abort — the record isn't in a
+   * state worth touching, or no longer belongs to this execution), and `'written'` otherwise.
+   * The distinction lets fencing hooks tell "the record's owner changed" (rejected) apart from
+   * "the record was unqueued/cleaned mid-run" (missing).
+   */
+  private async updateLog(
+    jobId: string,
+    mutate: (record: JobLogRecord) => void | boolean,
+  ): Promise<'written' | 'rejected' | 'missing'> {
     const record = await this.readRecord(jobId)
-    if (!record) return
-    // A mutator may return `false` to abort the write (e.g. the record is no longer
-    // in a state worth touching), avoiding a pointless last-write-wins clobber.
-    if (mutate(record) === false) return
+    if (!record) return 'missing'
+    if (mutate(record) === false) return 'rejected'
     await this.redis.hset(this.getLogKey(), jobId, JSON.stringify(record))
+    return 'written'
   }
 
   /**

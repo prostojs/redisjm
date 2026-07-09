@@ -240,7 +240,9 @@ describe('Job', () => {
         job.execute('input', { targetGroup: 'g', heartbeatInterval: 100 }),
       ).rejects.toThrow('start failed')
       expect(fn).not.toHaveBeenCalled()
-      expect(onError).toHaveBeenCalled()
+      // A failed claim at start is NOT a job failure: the `error` hook must not fire (a start throw
+      // propagates directly, so a superseded/failed claim can never be mistaken for a job error).
+      expect(onError).not.toHaveBeenCalled()
 
       // No timer should be left running.
       await vi.advanceTimersByTimeAsync(1000)
@@ -275,6 +277,25 @@ describe('Job', () => {
       expect(onUpdate).toHaveBeenCalledWith(
         expect.objectContaining({ attrs: { status: 'processing' } }),
       )
+    })
+
+    it('should reject non-finite progress and clamp out-of-range values', async () => {
+      // WHY: setProgress used to accept garbage; a progress bar outside [0,1] (or NaN/Infinity) is
+      // meaningless, so it must throw on non-finite input and clamp valid-but-out-of-range values.
+      const progresses: number[] = []
+      let ctx!: JobContext
+      const fn = vi.fn(async (_input: string, c: JobContext) => { ctx = c })
+      const job = new Job<string>(metadata, fn)
+      job.hook('update', (p) => { if (p.progress !== undefined) progresses.push(p.progress) })
+      await job.execute('input', { targetGroup: 'g' })
+
+      expect(() => ctx.setProgress(Number.NaN)).toThrow(TypeError)
+      expect(() => ctx.setProgress(Number.POSITIVE_INFINITY)).toThrow(TypeError)
+      expect(() => (ctx.setProgress as (v: unknown) => unknown)('x')).toThrow(TypeError)
+
+      await ctx.setProgress(1.5)
+      await ctx.setProgress(-0.2)
+      expect(progresses).toEqual([1, 0])
     })
   })
 

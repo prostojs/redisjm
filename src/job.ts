@@ -1,5 +1,7 @@
+import { randomUUID } from 'node:crypto'
 import { Hookable } from 'hookable'
 import type { RedisJM } from './redisjm'
+import { toError } from './utils'
 import type {
   JobAttrs,
   JobAttrValue,
@@ -60,12 +62,20 @@ export class Job<TInputs = unknown, TAttrs extends { [K in keyof TAttrs]: JobAtt
     const targetGroup = options?.targetGroup ?? this.defaultManager?.getTargetGroup() ?? ''
     const runId = options?.runId ?? (typeof inputs === 'string' ? inputs : JSON.stringify(inputs))
     const heartbeatInterval = options?.heartbeatInterval
+    // A fresh fencing token per execution: the record's owner is whoever's `start` stamped it.
+    const executionId = randomUUID()
 
-    const payload = { job: this, targetGroup, runId, inputs }
+    const payload = { job: this, targetGroup, runId, inputs, executionId, manager: options?.manager }
 
     const ctx: JobContext<TAttrs> = {
       setProgress: (progress: number) => {
-        return this.callHook('update', { ...payload, progress })
+        // `Number.isFinite` does not coerce, so it already rejects non-numbers (NaN, Infinity, 'x', ...).
+        if (!Number.isFinite(progress)) {
+          throw new TypeError(`setProgress(progress): progress must be a finite number, got ${String(progress)}`)
+        }
+        // Clamp into [0, 1] rather than trusting the caller — a progress bar outside the range is meaningless.
+        const clamped = Math.max(0, Math.min(1, progress))
+        return this.callHook('update', { ...payload, progress: clamped })
       },
       setAttrs: (attrs: TAttrs) => {
         return this.callHook('update', { ...payload, attrs })
@@ -77,18 +87,33 @@ export class Job<TInputs = unknown, TAttrs extends { [K in keyof TAttrs]: JobAtt
     // timer that keeps firing phantom heartbeats and defeats stale-reclaim.
     let heartbeatTimer: ReturnType<typeof setInterval> | undefined
     try {
+      // `start` is the claim: a failed claim or Redis outage here is NOT a job failure, so it
+      // propagates directly (via the `finally`) without ever dispatching the `error` hook.
       await this.callHook('start', payload)
       if (heartbeatInterval && heartbeatInterval > 0) {
         heartbeatTimer = setInterval(() => {
-          this.callHook('heartbeat', payload).catch(() => {})
+          // A failed heartbeat write is infra, not job outcome: report it instead of swallowing it.
+          this.callHook('heartbeat', payload).catch((err) =>
+            options?.logger?.('heartbeat update failed', toError(err)),
+          )
         }, heartbeatInterval)
       }
-      await this.fn(inputs, ctx)
+      try {
+        await this.fn(inputs, ctx)
+      } catch (err) {
+        // Only a job-function failure is a real job error. Dispatch the `error` hook, then rethrow
+        // the ORIGINAL error. A throwing `error` hook is itself infra: report it and still rethrow
+        // the job's own error so the true cause is never masked.
+        const error = toError(err)
+        try {
+          await this.callHook('error', { ...payload, error })
+        } catch (hookErr) {
+          options?.logger?.('error hook failed', toError(hookErr))
+        }
+        throw error
+      }
+      // A throwing `finish` hook must never flip a successful run to `error`; let it propagate as-is.
       await this.callHook('finish', payload)
-    } catch (err) {
-      const error = err instanceof Error ? err : new Error(String(err))
-      await this.callHook('error', { ...payload, error })
-      throw error
     } finally {
       if (heartbeatTimer) clearInterval(heartbeatTimer)
     }

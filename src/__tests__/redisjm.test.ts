@@ -1116,7 +1116,7 @@ describe('RedisJM', () => {
       }))
 
       // Fire the manager's heartbeat hook for this run (as a late/leaked timer would).
-      await job.callHook('heartbeat', { job, targetGroup: 'test-group', runId: 'r1', inputs: null })
+      await job.callHook('heartbeat', { job, targetGroup: 'test-group', runId: 'r1', inputs: null, executionId: 'x' })
 
       const record = JSON.parse((await redis.hget('redisjm:test-group:log', jobId))!) as JobLogRecord
       expect(record.status).toBe('stale')
@@ -1412,6 +1412,208 @@ describe('RedisJM', () => {
       expect(await redis.lpos('redisjm:test-group:lane:C:queue', 'c-job#r1')).not.toBeNull()
       // LMPOP was probed exactly once, then abandoned for LPOP.
       expect((redis.lmpop as any).mock.calls.length).toBe(1)
+    })
+  })
+
+  describe('execution fencing', () => {
+    it('zombie finish cannot clobber a successor that reclaimed the same runId', async () => {
+      // WHY: the deepest correctness flaw — a stalled handler is staled + unlocked by maintenance, a
+      // producer re-queues the same runId, then the original "zombie" finishes. Its finish must NOT
+      // overwrite/srem/delete the successor's freshly-queued record (which would silently drop it).
+      const m = new RedisJM(redis, 'test-group', { keepFinishedInterval: 60000, logger: false, maintenanceInterval: 0 })
+      let release!: () => void
+      const gate = new Promise<void>((r) => { release = r })
+      const job = m.createJob({ jobName: 'z' }, vi.fn(async () => { await gate }))
+      const managerFinish = vi.fn()
+      m.hook('finish', managerFinish)
+
+      await m.queue(job, 'r1', 'x')
+      const zombie = m.popAndExecute() // claims the record (running + executionId), then blocks on the gate
+      await new Promise((r) => setTimeout(r, 0))
+
+      // Maintenance stales the zombie: mark the record stale and release its lock (as performMaintenance would).
+      const jobId = 'z#r1'
+      const staled = JSON.parse((await redis.hget('redisjm:test-group:log', jobId))!) as JobLogRecord
+      staled.status = 'stale'
+      staled.finishedAt = Date.now()
+      await redis.hset('redisjm:test-group:log', jobId, JSON.stringify(staled))
+      await redis.srem('redisjm:test-group:locks', jobId)
+
+      // Producer re-enqueues the same runId → fresh `queued` record (no executionId) + new lock.
+      expect(await m.queue(job, 'r1', 'x2')).toBe(true)
+
+      // Now let the zombie finish; its finish hook must be fenced out.
+      release()
+      await zombie
+
+      const successor = JSON.parse((await redis.hget('redisjm:test-group:log', jobId))!) as JobLogRecord
+      expect(successor.status).toBe('queued')
+      expect(successor.executionId).toBeUndefined()
+      expect(await m.isQueued(jobId)).toBe(true) // successor's lock survived
+      expect(managerFinish).not.toHaveBeenCalled() // no finish event for the zombie
+    })
+
+    it('zombie error cannot clobber a successor that reclaimed the same runId', async () => {
+      // WHY: same fence, but for a throwing zombie — its error hook must not flip/srem/delete the
+      // successor's record either.
+      const m = new RedisJM(redis, 'test-group', { keepFinishedInterval: 60000, logger: false, maintenanceInterval: 0 })
+      let release!: () => void
+      const gate = new Promise<void>((r) => { release = r })
+      const job = m.createJob({ jobName: 'ze' }, vi.fn(async () => { await gate; throw new Error('late boom') }))
+      const managerError = vi.fn()
+      m.hook('error', managerError)
+
+      await m.queue(job, 'r1', 'x')
+      const zombie = m.popAndExecute()
+      await new Promise((r) => setTimeout(r, 0))
+
+      const jobId = 'ze#r1'
+      const staled = JSON.parse((await redis.hget('redisjm:test-group:log', jobId))!) as JobLogRecord
+      staled.status = 'stale'
+      staled.finishedAt = Date.now()
+      await redis.hset('redisjm:test-group:log', jobId, JSON.stringify(staled))
+      await redis.srem('redisjm:test-group:locks', jobId)
+      expect(await m.queue(job, 'r1', 'x2')).toBe(true)
+
+      release()
+      await zombie // popAndExecute swallows the thrown handler error internally
+
+      const successor = JSON.parse((await redis.hget('redisjm:test-group:log', jobId))!) as JobLogRecord
+      expect(successor.status).toBe('queued')
+      expect(successor.executionId).toBeUndefined()
+      expect(await m.isQueued(jobId)).toBe(true)
+      expect(managerError).not.toHaveBeenCalled()
+    })
+
+    it('rejects a claim on an already-running record and skips without touching lock/log', async () => {
+      // WHY: a popped entry whose record is already `running` (a concurrent claimant owns it) must be
+      // skipped as superseded — the handler never runs and the owner's lock/record are left intact.
+      const logger = vi.fn()
+      const m = new RedisJM(redis, 'test-group', { keepFinishedInterval: 60000, logger, maintenanceInterval: 0 })
+      const fn = vi.fn()
+      m.createJob({ jobName: 'c' }, fn)
+      const jobId = 'c#r1'
+      await redis.sadd('redisjm:test-group:locks', jobId)
+      await redis.rpush('redisjm:test-group:queue', jobId)
+      await redis.hset('redisjm:test-group:log', jobId, JSON.stringify({
+        jobId, jobName: 'c', runId: 'r1', inputs: 'x',
+        targetGroup: 'test-group', status: 'running', progress: 0,
+        executionId: 'someone-else', startedAt: Date.now(), heartbeat: Date.now(),
+      }))
+
+      expect(await m.popAndExecute()).toBe(true)
+      expect(fn).not.toHaveBeenCalled()
+      expect(await m.isQueued(jobId)).toBe(true)
+      const record = JSON.parse((await redis.hget('redisjm:test-group:log', jobId))!) as JobLogRecord
+      expect(record.status).toBe('running')
+      expect(record.executionId).toBe('someone-else')
+      expect(logger.mock.calls.some(([msg]) => /supersed/i.test(msg as string))).toBe(true)
+    })
+
+    it('a throwing manager finish hook does not flip a finished run to error', async () => {
+      // WHY: a user finish hook that throws is infra, not job outcome — the run stays `finished`, the
+      // `error` hook never fires, and the failure is reported via the logger.
+      const logger = vi.fn()
+      const m = new RedisJM(redis, 'test-group', { keepFinishedInterval: 60000, logger, maintenanceInterval: 0 })
+      const job = m.createJob({ jobName: 'f' }, vi.fn())
+      m.hook('finish', () => { throw new Error('finish hook boom') })
+      const onError = vi.fn()
+      m.hook('error', onError)
+
+      await m.queue(job, 'r1', 'x')
+      expect(await m.popAndExecute()).toBe(true)
+
+      const record = JSON.parse((await redis.hget('redisjm:test-group:log', 'f#r1'))!) as JobLogRecord
+      expect(record.status).toBe('finished')
+      expect(onError).not.toHaveBeenCalled()
+      expect(logger.mock.calls.some(([, err]) => err instanceof Error && /finish hook boom/.test(err.message))).toBe(true)
+    })
+
+    it('error hook still fires on a job-function throw', async () => {
+      // WHY: guard against over-fencing — a genuine fn failure must still record `error` and dispatch
+      // the manager `error` event.
+      const m = new RedisJM(redis, 'test-group', { keepFinishedInterval: 60000, logger: false, maintenanceInterval: 0 })
+      const job = m.createJob({ jobName: 'boom' }, vi.fn(() => { throw new Error('kaboom') }))
+      const onError = vi.fn()
+      m.hook('error', onError)
+
+      await m.queue(job, 'r1', 'x')
+      expect(await m.popAndExecute()).toBe(true)
+
+      expect(onError).toHaveBeenCalledWith(expect.objectContaining({ error: expect.any(Error) }))
+      const record = JSON.parse((await redis.hget('redisjm:test-group:log', 'boom#r1'))!) as JobLogRecord
+      expect(record.status).toBe('error')
+      expect(record.error).toBe('kaboom')
+    })
+
+    it('setAttrs merges keys across calls instead of replacing the attrs object', async () => {
+      // WHY: setAttrs used to REPLACE the whole attrs object, silently dropping earlier keys.
+      const m = new RedisJM(redis, 'test-group', { keepFinishedInterval: 60000, maintenanceInterval: 0 })
+      const fn = vi.fn(async (_i: string, ctx: JobContext<{ a?: string; b?: string }>) => {
+        await ctx.setAttrs({ a: '1' })
+        await ctx.setAttrs({ b: '2' })
+      })
+      const job = m.createJob<string, { a?: string; b?: string }>({ jobName: 'merge' }, fn)
+      await m.queue(job, 'r1', 'x')
+      await job.execute('x', { targetGroup: 'test-group', runId: 'r1', manager: m })
+
+      const record = JSON.parse((await redis.hget('redisjm:test-group:log', 'merge#r1'))!) as JobLogRecord
+      expect(record.attrs).toEqual({ a: '1', b: '2' })
+    })
+
+    it('only the driving manager reacts when two managers share a Job and targetGroup', async () => {
+      // WHY: two managers in one process sharing a Job + targetGroup both used to react to every event
+      // (double writes/events). The `manager` fencing token makes only the driver act.
+      const a = new RedisJM(redis, 'test-group', { keepFinishedInterval: 60000, logger: false, maintenanceInterval: 0 })
+      const b = new RedisJM(redis, 'test-group', { keepFinishedInterval: 60000, logger: false, maintenanceInterval: 0 })
+      const job = new Job({ jobName: 'shared' }, vi.fn(async (_i: string, ctx: JobContext) => { await ctx.setProgress(0.5) }))
+      a.registerJob(job)
+      b.registerJob(job)
+      const onStartB = vi.fn()
+      const onUpdateB = vi.fn()
+      const onFinishB = vi.fn()
+      b.hook('start', onStartB)
+      b.hook('update', onUpdateB)
+      b.hook('finish', onFinishB)
+
+      await a.queue(job, 'r1', 'x')
+      const before = (redis.hset as any).mock.calls.length
+      expect(await a.popAndExecute()).toBe(true)
+      const writes = (redis.hset as any).mock.calls.length - before
+
+      expect(onStartB).not.toHaveBeenCalled()
+      expect(onUpdateB).not.toHaveBeenCalled()
+      expect(onFinishB).not.toHaveBeenCalled()
+      // Exactly three log writes (claim + one progress update + finish), each performed once — not
+      // doubled by manager B reacting to the same events.
+      expect(writes).toBe(3)
+    })
+
+    it('reports a failed heartbeat write to the logger and still completes the job', async () => {
+      // WHY: heartbeat write failures used to be swallowed by `.catch(() => {})`; they must reach the
+      // logger, and one failed heartbeat must not sink an otherwise healthy run.
+      vi.useFakeTimers()
+      const logger = vi.fn()
+      const m = new RedisJM(redis, 'test-group', {
+        heartbeatInterval: 100, keepFinishedInterval: 60000, logger, maintenanceInterval: 0,
+      })
+      const job = m.createJob({ jobName: 'hb' }, vi.fn(async () => { await new Promise((r) => setTimeout(r, 250)) }))
+      await m.queue(job, 'r1', 'x')
+
+      const exec = job.execute('x', { targetGroup: 'test-group', runId: 'r1', heartbeatInterval: 100, manager: m, logger })
+      await vi.advanceTimersByTimeAsync(0) // let the claim settle
+
+      // Fail exactly the next hset — the first heartbeat write.
+      ;(redis.hset as any).mockImplementationOnce(async () => { throw new Error('redis unavailable') })
+      await vi.advanceTimersByTimeAsync(100)
+      expect(logger.mock.calls.some(([msg]) => /heartbeat/i.test(msg as string))).toBe(true)
+
+      await vi.advanceTimersByTimeAsync(200) // drive the handler to completion
+      await exec
+
+      const record = JSON.parse((await redis.hget('redisjm:test-group:log', 'hb#r1'))!) as JobLogRecord
+      expect(record.status).toBe('finished')
+      vi.useRealTimers()
     })
   })
 })
