@@ -5,6 +5,9 @@ import type { MaintenanceResult } from './types'
 /** Reserved name of the built-in maintenance job. */
 export const MAINTENANCE_JOB_NAME = '__redisjm_maintenance'
 
+/** Reserved lane the built-in maintenance job runs on; every instance implicitly polls it first. */
+export const MAINTENANCE_LANE = '__maintenance'
+
 /**
  * Creates and registers a maintenance job that detects stale jobs and cleans up expired log records.
  * Maintenance is idempotent — use an empty `runId` (`''`) to ensure at most one is queued at a time.
@@ -25,7 +28,13 @@ export const MAINTENANCE_JOB_NAME = '__redisjm_maintenance'
  */
 export function createMaintenanceJob(manager: RedisJM): Job<null, never> {
   const job = new Job<null, never>(
-    { jobName: MAINTENANCE_JOB_NAME, description: 'Scans for stale jobs and cleans up expired log records' },
+    {
+      jobName: MAINTENANCE_JOB_NAME,
+      description: 'Scans for stale jobs and cleans up expired log records',
+      // Reserved lane every instance implicitly subscribes to, so even a pure worker (no default-lane
+      // subscription) still helps run group-wide maintenance without polling any work lane.
+      lane: MAINTENANCE_LANE,
+    },
     async (): Promise<void> => {
       await manager.performMaintenance()
     },

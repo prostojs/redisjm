@@ -1,7 +1,7 @@
 import { Hookable } from 'hookable'
 import type Redis from 'ioredis'
 import { Job } from './job'
-import { createMaintenanceJob, MAINTENANCE_JOB_NAME } from './maintenance'
+import { createMaintenanceJob, MAINTENANCE_JOB_NAME, MAINTENANCE_LANE } from './maintenance'
 import type {
   JobAttrs,
   JobAttrValue,
@@ -72,6 +72,10 @@ export class RedisJM extends Hookable<RedisJMHooks> {
   private maintenanceTimer: ReturnType<typeof setInterval> | undefined
   /** Promise of the job currently being executed by the poll loop, if any. Awaited by `stop()`. */
   private inFlight: Promise<unknown> | undefined
+  /** Round-robin cursor rotating the work-lane poll order once per poll to prevent starvation. */
+  private pollCursor = 0
+  /** Lazy `LMPOP` capability flag: `undefined` = not yet probed, `false` = fall back to sequential `LPOP`. */
+  private lmpopSupported: boolean | undefined
 
   /**
    * @param redis - An ioredis client instance
@@ -366,8 +370,10 @@ export class RedisJM extends Hookable<RedisJMHooks> {
    * ```
    */
   async popAndExecute(): Promise<boolean> {
-    // Step 2 keeps consumption on the default lane; step 3 makes this multi-lane (LMPOP).
-    const jobId = await this.redis.lpop(this.getQueueKey())
+    // Poll the union of this instance's subscribed lanes (`__maintenance` first, then work lanes
+    // ordered by strategy) atomically via `LMPOP`, with a sequential-`LPOP` fallback for Redis < 7.
+    const keys = this.getSubscribedQueueKeys()
+    const jobId = await this.popFromLanes(keys)
     if (!jobId) return false
 
     const separatorIndex = jobId.indexOf('#')
@@ -438,6 +444,92 @@ export class RedisJM extends Hookable<RedisJMHooks> {
     }
 
     return true
+  }
+
+  /**
+   * Computes this instance's subscribed queue keys per poll (§5.6): the reserved `__maintenance`
+   * lane first, then the DISTINCT work-lane queue keys of the registered jobs, ordered by strategy.
+   *
+   * Deduplication is on the resolved queue key (not the lane name) so a no-lane job and an explicit
+   * `lane: 'default'` job don't double-weight the legacy key. Under `roundRobin` (default) the work
+   * keys rotate by a per-manager cursor advanced once per poll (anti-starvation); under `priority`
+   * the `lanePriority` order wins with unlisted work lanes trailing in registration order. The result
+   * is always length ≥ 1 (`__maintenance`), so `numkeys` is never 0.
+   */
+  private getSubscribedQueueKeys(): string[] {
+    const maintenanceKey = this.getQueueKey(MAINTENANCE_LANE)
+
+    // Distinct work-lane keys in registration order, excluding the reserved maintenance key.
+    const workKeys: string[] = []
+    const seen = new Set<string>([maintenanceKey])
+    for (const job of this.registeredJobs) {
+      const key = this.getQueueKey(job.getLane())
+      if (seen.has(key)) continue
+      seen.add(key)
+      workKeys.push(key)
+    }
+
+    let orderedWorkKeys: string[]
+    if (this.options.laneStrategy === 'priority') {
+      // Listed lanes first (in `lanePriority` order), then the remaining work keys in registration
+      // order. `workKeys` is already distinct, so a single set consumed via `Set.delete` handles
+      // both the "am I subscribed?" test and the "don't emit twice" guard in one step.
+      const remaining = new Set(workKeys)
+      const ordered: string[] = []
+      for (const lane of this.options.lanePriority) {
+        // `delete` returns true only when `key` is a still-unemitted work key.
+        const key = this.getQueueKey(lane)
+        if (remaining.delete(key)) ordered.push(key)
+      }
+      // `remaining` now holds only the non-priority work keys; emit them in registration order.
+      for (const key of workKeys) {
+        if (remaining.delete(key)) ordered.push(key)
+      }
+      orderedWorkKeys = ordered
+    } else {
+      // roundRobin: rotate the work-key list by the cursor, then advance it once per poll (only when
+      // there is work to rotate) so no lane is starved by a saturated higher-order lane.
+      const n = workKeys.length
+      if (n > 0) {
+        const offset = this.pollCursor % n
+        orderedWorkKeys = [...workKeys.slice(offset), ...workKeys.slice(0, offset)]
+        this.pollCursor++
+      } else {
+        orderedWorkKeys = workKeys
+      }
+    }
+
+    return [maintenanceKey, ...orderedWorkKeys]
+  }
+
+  /**
+   * Pops the next jobId from the first non-empty of `keys` (in order) via `LMPOP <n> <keys...> LEFT`,
+   * falling back to a sequential `LPOP` per key for Redis < 7. The `LMPOP` capability is probed
+   * lazily and cached: an "unknown command" error on the first attempt (raised BEFORE anything is
+   * popped, so no work is lost) flips the flag and switches to the fallback permanently.
+   */
+  private async popFromLanes(keys: string[]): Promise<string | null> {
+    if (this.lmpopSupported !== false) {
+      try {
+        const res = await this.redis.lmpop(keys.length, ...keys, 'LEFT')
+        this.lmpopSupported = true
+        return res ? (res[1][0] ?? null) : null
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        if (this.lmpopSupported === undefined && message.toLowerCase().includes('unknown command')) {
+          this.lmpopSupported = false
+          // fall through to the sequential path
+        } else {
+          throw err
+        }
+      }
+    }
+
+    for (const key of keys) {
+      const v = await this.redis.lpop(key)
+      if (v) return v
+    }
+    return null
   }
 
   /**

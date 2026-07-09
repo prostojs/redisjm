@@ -1,6 +1,6 @@
 export { RedisJM } from './redisjm'
 export { Job } from './job'
-export { createMaintenanceJob, MAINTENANCE_JOB_NAME } from './maintenance'
+export { createMaintenanceJob, MAINTENANCE_JOB_NAME, MAINTENANCE_LANE } from './maintenance'
 export type {
   JobAttrs,
   JobAttrValue,

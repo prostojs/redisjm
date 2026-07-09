@@ -60,6 +60,22 @@ export function createMockRedis(): Redis & { _dump: () => { store: Map<string, s
       if (!list || list.length === 0) return null
       return list.shift()!
     }),
+    lmpop: vi.fn(async (...args: any[]) => {
+      // ioredis call shape: lmpop(numkeys, key1, key2, ..., direction[, 'COUNT', count]).
+      // Scan the given keys IN ORDER, pop from the first non-empty list, and return
+      // [poppedKey, [element]] (COUNT is unused by redisjm); null when every key is empty.
+      const numkeys = args[0] as number
+      const keys = args.slice(1, 1 + numkeys) as string[]
+      const direction = args[1 + numkeys] as string
+      for (const key of keys) {
+        const list = lists.get(key)
+        if (list && list.length > 0) {
+          const element = direction === 'RIGHT' ? list.pop()! : list.shift()!
+          return [key, [element]]
+        }
+      }
+      return null
+    }),
     lrem: vi.fn(async (key: string, _count: number, value: string) => {
       const list = lists.get(key)
       if (!list) return 0

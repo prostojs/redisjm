@@ -381,6 +381,10 @@ describe('RedisJM', () => {
         unknownJobRequeueLimit: 0,
         logger: false,
       })
+      // Under lanes a manager with zero registered jobs subscribes to no work lane and would never
+      // pop the default-queue entry below. Register a sentinel default-lane job so this manager
+      // subscribes to the default lane and reaches the unknown-job path (its handler is irrelevant).
+      m.createJob({ jobName: 'sentinel' }, vi.fn())
       const jobId = 'unknownJob#run1'
       await redis.sadd('redisjm:test-group:locks', jobId)
       await redis.rpush('redisjm:test-group:queue', jobId)
@@ -405,6 +409,9 @@ describe('RedisJM', () => {
         unknownJobRequeueLimit: 2,
         logger: false,
       })
+      // Register a sentinel default-lane job so the manager subscribes to the default lane and can
+      // pop the seeded unknown job (a zero-job manager subscribes to no work lane under lanes).
+      m.createJob({ jobName: 'sentinel' }, vi.fn())
       const jobId = 'unknownJob#run1'
       await redis.sadd('redisjm:test-group:locks', jobId)
       await redis.rpush('redisjm:test-group:queue', jobId)
@@ -438,6 +445,9 @@ describe('RedisJM', () => {
       const b = new RedisJM(redis, 'test-group', { keepFinishedInterval: 60000, logger: false })
       const handled: string[] = []
       b.createJob({ jobName: 'rolling' }, vi.fn(async (input: string) => { handled.push(input) }))
+      // `rolling` is a default-lane job. A must subscribe to the default lane to pop it, but must NOT
+      // register `rolling` (that would give it the handler): register a sentinel default-lane job.
+      a.createJob({ jobName: 'sentinel' }, vi.fn())
 
       await a.queue(new Job({ jobName: 'rolling' }, vi.fn()), 'run1', 'payload')
 
@@ -1160,6 +1170,202 @@ describe('RedisJM', () => {
       const record = JSON.parse((await redis.hget('redisjm:test-group:log', 'store-images#run1'))!) as JobLogRecord
       expect(record.status).toBe('queued')
       expect(record.suspectedAt).toBeUndefined()
+    })
+  })
+
+  describe('lanes (consumption)', () => {
+    it('routing isolation: never pops a job on an unsubscribed lane (no requeue, no drop)', async () => {
+      // Manager subscribes only to lane A (its one registered job). A lane-B job is enqueued.
+      const m = new RedisJM(redis, 'test-group', { keepFinishedInterval: 60000, logger: false })
+      m.createJob({ jobName: 'a-job', lane: 'A' }, vi.fn())
+      await m.queue(new Job({ jobName: 'b-job', lane: 'B' }, vi.fn()), 'r1', 'x')
+
+      // The §3 regression, asserted directly: nothing is popped from B.
+      expect(await m.popAndExecute()).toBe(false)
+      expect(await redis.lpos('redisjm:test-group:lane:B:queue', 'b-job#r1')).not.toBeNull()
+      const record = JSON.parse((await redis.hget('redisjm:test-group:log', 'b-job#r1'))!) as JobLogRecord
+      expect(record.status).toBe('queued')
+      expect(record.requeueCount).toBeUndefined()
+    })
+
+    it('auto-subscription: pops the subscribed lane, leaves others; default-lane manager serves the legacy key', async () => {
+      const m = new RedisJM(redis, 'test-group', { keepFinishedInterval: 60000, logger: false })
+      const aFn = vi.fn()
+      const aJob = m.createJob({ jobName: 'a-job', lane: 'A' }, aFn)
+      await m.queue(aJob, 'r1', 'x')
+      await m.queue(new Job({ jobName: 'b-job', lane: 'B' }, vi.fn()), 'r1', 'y')
+
+      expect(await m.popAndExecute()).toBe(true)
+      expect(aFn).toHaveBeenCalledWith('x', expect.any(Object))
+      // The B-lane job is untouched.
+      expect(await redis.lpos('redisjm:test-group:lane:B:queue', 'b-job#r1')).not.toBeNull()
+
+      // A default-lane manager pops a default-lane job off the legacy key.
+      const def = new RedisJM(redis, 'test-group', { keepFinishedInterval: 60000, logger: false })
+      const defFn = vi.fn()
+      const defJob = def.createJob({ jobName: 'plain' }, defFn)
+      await def.queue(defJob, 'r1', 'z')
+      expect(await redis.lpos('redisjm:test-group:queue', 'plain#r1')).not.toBeNull()
+      expect(await def.popAndExecute()).toBe(true)
+      expect(defFn).toHaveBeenCalledWith('z', expect.any(Object))
+    })
+
+    it('roundRobin: both lanes drain and pops interleave (no starvation)', async () => {
+      const m = new RedisJM(redis, 'test-group', { keepFinishedInterval: 60000, logger: false })
+      const order: string[] = []
+      const aJob = m.createJob({ jobName: 'a-job', lane: 'A' }, vi.fn(async () => { order.push('A') }))
+      const bJob = m.createJob({ jobName: 'b-job', lane: 'B' }, vi.fn(async () => { order.push('B') }))
+      for (const r of ['r1', 'r2', 'r3']) await m.queue(aJob, r, 'x')
+      for (const r of ['r1', 'r2', 'r3']) await m.queue(bJob, r, 'x')
+
+      for (let i = 0; i < 6; i++) expect(await m.popAndExecute()).toBe(true)
+
+      // Both lanes drained, and the per-poll rotation strictly interleaves them (not lane-at-a-time).
+      expect(order.filter((l) => l === 'A')).toHaveLength(3)
+      expect(order.filter((l) => l === 'B')).toHaveLength(3)
+      expect(order).toEqual(['A', 'B', 'A', 'B', 'A', 'B'])
+    })
+
+    it('priority: drains lanes in lanePriority order (all A before any B)', async () => {
+      const m = new RedisJM(redis, 'test-group', {
+        keepFinishedInterval: 60000,
+        logger: false,
+        laneStrategy: 'priority',
+        lanePriority: ['A', 'B'],
+      })
+      const order: string[] = []
+      const aJob = m.createJob({ jobName: 'a-job', lane: 'A' }, vi.fn(async () => { order.push('A') }))
+      const bJob = m.createJob({ jobName: 'b-job', lane: 'B' }, vi.fn(async () => { order.push('B') }))
+      // Interleave the enqueues to prove ordering is by lane priority, not insertion order.
+      await m.queue(bJob, 'r1', 'x')
+      await m.queue(aJob, 'r1', 'x')
+      await m.queue(bJob, 'r2', 'x')
+      await m.queue(aJob, 'r2', 'x')
+
+      for (let i = 0; i < 4; i++) expect(await m.popAndExecute()).toBe(true)
+      expect(order).toEqual(['A', 'A', 'B', 'B'])
+    })
+
+    it('priority: lanes absent from lanePriority trail in registration order', async () => {
+      const m = new RedisJM(redis, 'test-group', {
+        keepFinishedInterval: 60000,
+        logger: false,
+        laneStrategy: 'priority',
+        lanePriority: ['A'], // only A is listed; C and D must trail, in registration order
+      })
+      const order: string[] = []
+      // Register C before D so the unlisted tail is C then D; listed A must still lead.
+      const cJob = m.createJob({ jobName: 'c-job', lane: 'C' }, vi.fn(async () => { order.push('C') }))
+      const dJob = m.createJob({ jobName: 'd-job', lane: 'D' }, vi.fn(async () => { order.push('D') }))
+      const aJob = m.createJob({ jobName: 'a-job', lane: 'A' }, vi.fn(async () => { order.push('A') }))
+      // Scrambled enqueue order to prove poll order comes from the strategy, not insertion order.
+      await m.queue(dJob, 'r1', 'x')
+      await m.queue(aJob, 'r1', 'x')
+      await m.queue(cJob, 'r1', 'x')
+
+      for (let i = 0; i < 3; i++) expect(await m.popAndExecute()).toBe(true)
+      expect(order).toEqual(['A', 'C', 'D'])
+    })
+
+    it('__maintenance is polled first even under priority with a saturated work lane', async () => {
+      const m = new RedisJM(redis, 'test-group', {
+        keepFinishedInterval: 60000,
+        logger: false,
+        laneStrategy: 'priority',
+        lanePriority: ['A'],
+      })
+      const aFn = vi.fn()
+      const aJob = m.createJob({ jobName: 'a-job', lane: 'A' }, aFn)
+      await m.queue(aJob, 'r1', 'x')
+      await m.queue(aJob, 'r2', 'x')
+
+      // A maintenance run lands on the reserved lane; the work lane A is non-empty and higher-listed.
+      const maint = createMaintenanceJob(m)
+      const maintSpy = vi.spyOn(m, 'performMaintenance')
+      await maint.queue('', null)
+
+      expect(await m.popAndExecute()).toBe(true)
+      // The __maintenance entry was consumed FIRST, not the saturated A lane.
+      expect(maintSpy).toHaveBeenCalledTimes(1)
+      expect(aFn).not.toHaveBeenCalled()
+      expect(await redis.lpos('redisjm:test-group:lane:__maintenance:queue', `${MAINTENANCE_JOB_NAME}#`)).toBeNull()
+      expect(await redis.lpos('redisjm:test-group:lane:A:queue', 'a-job#r1')).not.toBeNull()
+    })
+
+    it('requeue stays on its lane end-to-end: a same-lane sibling then claims it (§5.5)', async () => {
+      // X subscribes to `images` (registers `store`) but has no handler for a different same-lane
+      // jobName `thumb` that gets enqueued on `images`.
+      const x = new RedisJM(redis, 'test-group', { keepFinishedInterval: 60000, logger: false })
+      x.createJob({ jobName: 'store', lane: 'images' }, vi.fn())
+      await x.queue(new Job({ jobName: 'thumb', lane: 'images' }, vi.fn()), 'r1', 'payload')
+
+      // X pops `thumb`, has no handler → requeues it back onto the images lane (deferred → false).
+      expect(await x.popAndExecute()).toBe(false)
+      expect(await redis.lpos('redisjm:test-group:lane:images:queue', 'thumb#r1')).not.toBeNull()
+      expect(await redis.lpos('redisjm:test-group:queue', 'thumb#r1')).toBeNull()
+      const record = JSON.parse((await redis.hget('redisjm:test-group:log', 'thumb#r1'))!) as JobLogRecord
+      expect(record.requeueCount).toBe(1)
+      expect(record.lane).toBe('images')
+
+      // Y registers `thumb` on `images` and pops + executes the requeued run from its lane.
+      const y = new RedisJM(redis, 'test-group', { keepFinishedInterval: 60000, logger: false })
+      const thumbFn = vi.fn()
+      y.createJob({ jobName: 'thumb', lane: 'images' }, thumbFn)
+      expect(await y.popAndExecute()).toBe(true)
+      expect(thumbFn).toHaveBeenCalledWith('payload', expect.any(Object))
+    })
+
+    it('maintenance runs on a pure worker and reclaims a default-lane orphan it never polls', async () => {
+      const m = new RedisJM(redis, 'test-group', {
+        heartbeatInterval: 1000,
+        roundsToStale: 2,
+        keepFinishedInterval: 60000,
+        logger: false,
+      })
+      // Pure image worker: only a lane:'images' job → never subscribes to the default work lane.
+      m.createJob({ jobName: 'store', lane: 'images' }, vi.fn())
+
+      // A stale `running` DEFAULT-lane record + lock left by a crashed instance.
+      const jobId = 'crashed#run1'
+      await redis.sadd('redisjm:test-group:locks', jobId)
+      await redis.hset('redisjm:test-group:log', jobId, JSON.stringify({
+        jobId, jobName: 'crashed', runId: 'run1', inputs: null,
+        targetGroup: 'test-group', status: 'running', progress: 0,
+        startedAt: Date.now() - 10000, heartbeat: Date.now() - 10000,
+      }))
+
+      // Maintenance lands on the reserved lane, which every instance polls (§5.3).
+      const maint = createMaintenanceJob(m)
+      await maint.queue('', null)
+      expect(await m.popAndExecute()).toBe(true)
+
+      // The default-lane orphan was reclaimed even though this worker never polls the default lane.
+      const record = JSON.parse((await redis.hget('redisjm:test-group:log', jobId))!) as JobLogRecord
+      expect(record.status).toBe('stale')
+      expect(await redis.sismember('redisjm:test-group:locks', jobId)).toBe(0)
+    })
+
+    it('sequential-LPOP fallback: same routing + roundRobin behavior when LMPOP is unavailable', async () => {
+      // Simulate Redis < 7: LMPOP is an unknown command, forcing the sequential-LPOP fallback. The
+      // manager probes once, catches the unknown-command error, and switches to LPOP permanently.
+      ;(redis.lmpop as any).mockRejectedValue(new Error("ERR unknown command 'LMPOP'"))
+
+      const m = new RedisJM(redis, 'test-group', { keepFinishedInterval: 60000, logger: false })
+      const order: string[] = []
+      const aJob = m.createJob({ jobName: 'a-job', lane: 'A' }, vi.fn(async () => { order.push('A') }))
+      const bJob = m.createJob({ jobName: 'b-job', lane: 'B' }, vi.fn(async () => { order.push('B') }))
+      // Routing isolation: a lane-C job (unsubscribed) must never be popped via the fallback either.
+      await m.queue(new Job({ jobName: 'c-job', lane: 'C' }, vi.fn()), 'r1', 'x')
+      for (const r of ['r1', 'r2', 'r3']) await m.queue(aJob, r, 'x')
+      for (const r of ['r1', 'r2', 'r3']) await m.queue(bJob, r, 'x')
+
+      for (let i = 0; i < 6; i++) expect(await m.popAndExecute()).toBe(true)
+
+      // Identical fairness (interleaved) and routing (C untouched) via the fallback path.
+      expect(order).toEqual(['A', 'B', 'A', 'B', 'A', 'B'])
+      expect(await redis.lpos('redisjm:test-group:lane:C:queue', 'c-job#r1')).not.toBeNull()
+      // LMPOP was probed exactly once, then abandoned for LPOP.
+      expect((redis.lmpop as any).mock.calls.length).toBe(1)
     })
   })
 })
