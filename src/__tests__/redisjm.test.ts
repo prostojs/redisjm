@@ -1010,6 +1010,52 @@ describe('RedisJM', () => {
       m.stop()
       vi.useRealTimers()
     })
+
+    it('should relocate a maintenance job stranded on the legacy queue by a pre-lanes instance', async () => {
+      // A 0.0.3 instance enqueued maintenance to the LEGACY default queue and holds the group-wide
+      // lock, then the group cut over to lanes. A pure lane worker (below) never polls the legacy
+      // key, so without relocation the entry strands there with the lock held and group-wide
+      // maintenance deadlocks. reclaimStaleMaintenanceLock must move it onto the __maintenance lane.
+      const maintId = '__redisjm_maintenance#'
+      await redis.sadd('redisjm:test-group:locks', maintId)
+      // 0.0.3-style record: status 'queued', NO `lane` field.
+      await redis.hset('redisjm:test-group:log', maintId, JSON.stringify({
+        jobId: maintId, jobName: '__redisjm_maintenance', runId: '', inputs: null,
+        targetGroup: 'test-group', status: 'queued', progress: 0,
+      }))
+      await redis.rpush('redisjm:test-group:queue', maintId)
+
+      // Pure lane worker: only a lane:'images' job → never subscribes to the legacy default lane.
+      const m = new RedisJM(redis, 'test-group', {
+        maintenanceInterval: 500,
+        keepFinishedInterval: 60000,
+        logger: false,
+      })
+      m.createJob({ jobName: 'store', lane: 'images' }, vi.fn())
+      const spy = vi.spyOn(m, 'performMaintenance')
+
+      vi.useFakeTimers()
+      m.start(100)
+
+      // First tick runs the bootstrap reclaim → relocate; assert the mid-state before the entry is
+      // popped: it left the legacy queue and now sits on the __maintenance lane (relocated, not dropped).
+      await vi.advanceTimersByTimeAsync(0)
+      expect(await redis.lpos('redisjm:test-group:queue', maintId)).toBeNull()
+      expect(await redis.lpos('redisjm:test-group:lane:__maintenance:queue', maintId)).not.toBeNull()
+
+      // Drain the relocate→pop→execute chain over a few more poll cycles (deterministic). Stay
+      // below the 500ms maintenanceInterval so the end-state lock reflects the reclaimed run, not a
+      // fresh periodic re-enqueue.
+      for (let i = 0; i < 3; i++) await vi.advanceTimersByTimeAsync(100)
+
+      // The deadlock is broken: maintenance ran and released the lock (the entry already left the
+      // legacy queue at the mid-state assert above, and nothing re-pushes it there).
+      expect(spy).toHaveBeenCalled()
+      expect(await redis.sismember('redisjm:test-group:locks', maintId)).toBe(0)
+
+      m.stop()
+      vi.useRealTimers()
+    })
   })
 
   describe('observability', () => {

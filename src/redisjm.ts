@@ -649,6 +649,10 @@ export class RedisJM extends Hookable<RedisJMHooks> {
    * pop→start window, so reclaiming it would race a healthy run. (A maintenance job orphaned in
    * that sub-millisecond window is the price of avoiding that race; prefer graceful `stop()` over
    * SIGKILL.)
+   *
+   * One cutover exception: a `queued` maintenance record still PRESENT on the legacy default queue
+   * was enqueued by a pre-lanes (0.0.3) instance and would strand there — pure lane workers never
+   * poll that key. It is relocated onto the `__maintenance` lane (lock kept held) so it can run.
    */
   private async reclaimStaleMaintenanceLock(): Promise<void> {
     const jobId = `${MAINTENANCE_JOB_NAME}#`
@@ -676,6 +680,23 @@ export class RedisJM extends Hookable<RedisJMHooks> {
     if (record.status === 'running') {
       const lastHeartbeat = record.heartbeat ?? record.startedAt ?? 0
       if (Date.now() - lastHeartbeat > this.getStaleThreshold()) await reclaim()
+    } else if (record.status === 'queued') {
+      // Cutover safety: a maintenance job enqueued by a pre-lanes (0.0.3) instance sits on the LEGACY
+      // default queue, which pure lane workers never poll — it would strand there with the lock held and
+      // deadlock group-wide maintenance. Relocate it onto the __maintenance lane (polled by every
+      // lane-aware instance), keeping the lock held so no duplicate run is created. Safe against a
+      // concurrent default-lane consumer: if that consumer already popped the entry, our LREM removes
+      // nothing and we skip the re-push.
+      const legacyKey = this.getQueueKey()
+      if ((await this.redis.lpos(legacyKey, jobId)) !== null) {
+        // Stamp the lane BEFORE moving the entry so a concurrent performMaintenance resolves the record
+        // to the __maintenance lane (its two-pass orphan check tolerates the sub-ms move window).
+        record.lane = MAINTENANCE_LANE
+        await this.redis.hset(this.getLogKey(), jobId, JSON.stringify(record))
+        if ((await this.redis.lrem(legacyKey, 1, jobId)) > 0) {
+          await this.redis.rpush(this.getQueueKey(MAINTENANCE_LANE), jobId)
+        }
+      }
     }
   }
 
