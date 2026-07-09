@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { RedisJM } from '../redisjm'
 import { Job } from '../job'
-import { createMaintenanceJob } from '../maintenance'
+import { createMaintenanceJob, MAINTENANCE_JOB_NAME } from '../maintenance'
 import type { JobContext, JobLogRecord } from '../types'
 import { createMockRedis } from './mock-redis'
 
@@ -1075,6 +1075,91 @@ describe('RedisJM', () => {
       await job.execute('x', { targetGroup: 'test-group', runId: 'r1' })
       // Default keepFinishedInterval:0 deletes the record on finish.
       expect(await manager.get('fin#r1')).toBeUndefined()
+    })
+  })
+
+  describe('lanes (write side)', () => {
+    it('should enqueue a laned job to its lane queue and NOT the default queue, stamping lane on the record', async () => {
+      const job = new Job({ jobName: 'store-images', lane: 'images' }, vi.fn())
+      await manager.queue(job, 'run1', { url: 'x' })
+
+      // Routed to the named lane queue, absent from the legacy queue.
+      expect(await redis.lpos('redisjm:test-group:lane:images:queue', 'store-images#run1')).not.toBeNull()
+      expect(await redis.lpos('redisjm:test-group:queue', 'store-images#run1')).toBeNull()
+
+      const record = JSON.parse((await redis.hget('redisjm:test-group:log', 'store-images#run1'))!) as JobLogRecord
+      expect(record.lane).toBe('images')
+    })
+
+    it('should keep a no-lane job on the legacy queue key with no "lane" field in the stored record (0.0.3 byte-for-byte)', async () => {
+      const job = new Job({ jobName: 'plain' }, vi.fn())
+      await manager.queue(job, 'run1', 'input')
+
+      expect(await redis.lpos('redisjm:test-group:queue', 'plain#run1')).not.toBeNull()
+      // Assert on the RAW stored string: a default-lane record must serialize with no `"lane"` key.
+      const raw = (await redis.hget('redisjm:test-group:log', 'plain#run1'))!
+      expect(raw).not.toContain('"lane"')
+    })
+
+    it('should treat lane "default" as an alias for the legacy queue key (no lane:default:queue key)', async () => {
+      const job = new Job({ jobName: 'aliased', lane: 'default' }, vi.fn())
+      await manager.queue(job, 'run1', 'input')
+
+      expect(await redis.lpos('redisjm:test-group:queue', 'aliased#run1')).not.toBeNull()
+      expect(await redis.lpos('redisjm:test-group:lane:default:queue', 'aliased#run1')).toBeNull()
+    })
+
+    it('should reject a targetGroup containing ":" (lane-infix collision-proofing)', () => {
+      expect(() => new RedisJM(redis, 'a:b:c')).toThrow()
+    })
+
+    it('should reject invalid lane names on enqueue and registerJob, and accept a valid one', async () => {
+      // Producer path (enqueue) is authoritative — validates before taking the lock.
+      await expect(manager.queue(new Job({ jobName: 'j1', lane: 'bad:lane' }, vi.fn()), 'r', 'x')).rejects.toThrow()
+      await expect(manager.queue(new Job({ jobName: 'j2', lane: '__nope' }, vi.fn()), 'r', 'x')).rejects.toThrow()
+      expect(await manager.queue(new Job({ jobName: 'j3', lane: 'images-1' }, vi.fn()), 'r', 'x')).toBe(true)
+
+      // registerJob validates too (early feedback).
+      expect(() => manager.registerJob(new Job({ jobName: 'reg1', lane: 'bad#lane' }, vi.fn()))).toThrow()
+      expect(() => manager.registerJob(new Job({ jobName: 'reg2', lane: '__reserved' }, vi.fn()))).toThrow()
+      expect(() => manager.registerJob(new Job({ jobName: 'reg3', lane: 'images-1' }, vi.fn()))).not.toThrow()
+    })
+
+    it('should exempt the internal maintenance job from the "__" lane reservation', () => {
+      // The built-in maintenance job owns the reserved `__maintenance` lane (assigned in a later
+      // step); validation must let it through by jobName even though `__` is otherwise reserved.
+      const job = new Job({ jobName: MAINTENANCE_JOB_NAME, lane: '__maintenance' }, vi.fn())
+      expect(() => manager.registerJob(job)).not.toThrow()
+    })
+
+    it('should unqueue a laned job from its lane queue, locks, and log', async () => {
+      const job = new Job({ jobName: 'store-images', lane: 'images' }, vi.fn())
+      await manager.queue(job, 'run1', 'x')
+      expect(await redis.lpos('redisjm:test-group:lane:images:queue', 'store-images#run1')).not.toBeNull()
+
+      await manager.unqueue('store-images#run1')
+      expect(await redis.lpos('redisjm:test-group:lane:images:queue', 'store-images#run1')).toBeNull()
+      expect(await manager.isQueued('store-images#run1')).toBe(false)
+      expect(await redis.hget('redisjm:test-group:log', 'store-images#run1')).toBeNull()
+    })
+
+    it('should LPOS the record lane during maintenance so a queued laned job is not false-orphaned', async () => {
+      const m = new RedisJM(redis, 'test-group', {
+        heartbeatInterval: 1000,
+        roundsToStale: 2,
+        keepFinishedInterval: 60000,
+      })
+      const job = new Job({ jobName: 'store-images', lane: 'images' }, vi.fn())
+      await m.queue(job, 'run1', null)
+
+      // The entry sits in the images lane queue; maintenance must LPOS THAT lane, else it would
+      // false-orphan the still-queued job. Run twice (the orphan check is two-pass).
+      expect((await m.performMaintenance()).staleCount).toBe(0)
+      expect((await m.performMaintenance()).staleCount).toBe(0)
+
+      const record = JSON.parse((await redis.hget('redisjm:test-group:log', 'store-images#run1'))!) as JobLogRecord
+      expect(record.status).toBe('queued')
+      expect(record.suspectedAt).toBeUndefined()
     })
   })
 })

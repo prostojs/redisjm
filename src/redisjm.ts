@@ -80,6 +80,12 @@ export class RedisJM extends Hookable<RedisJMHooks> {
    */
   constructor(redis: Redis, targetGroup: string, options?: RedisJMOptions) {
     super()
+    if (targetGroup.includes(':')) {
+      // Keys embed a `:lane:` infix; a ':' in the group would let two distinct (group, lane)
+      // pairs alias onto one Redis key (e.g. group "portal" + lane "images" vs. a group literally
+      // named "portal:lane:images"). Reject it to keep the lane-key infix collision-proof.
+      throw new Error(`Target group "${targetGroup}" must not contain ":" (it would collide with the lane-key infix)`)
+    }
     this.redis = redis
     this.targetGroup = targetGroup
     const heartbeatInterval = options?.heartbeatInterval ?? DEFAULT_OPTIONS.heartbeatInterval
@@ -189,7 +195,10 @@ export class RedisJM extends Hookable<RedisJMHooks> {
    * ```
    */
   async unqueue(jobId: string): Promise<void> {
-    await this.redis.lrem(this.getQueueKey(), 1, jobId)
+    // Resolve the lane from the persisted record so we LREM the correct lane queue; if the record
+    // is already gone, fall back to the default key (the locks/log removals below are group-wide).
+    const record = await this.readRecord(jobId)
+    await this.redis.lrem(this.getQueueKey(record?.lane), 1, jobId)
     await this.redis.srem(this.getLocksKey(), jobId)
     await this.redis.hdel(this.getLogKey(), jobId)
   }
@@ -236,6 +245,8 @@ export class RedisJM extends Hookable<RedisJMHooks> {
       // would alias distinct (jobName, runId) pairs onto the same lock/log key.
       throw new Error(`Job name "${jobName}" must not contain "#"`)
     }
+    // Early feedback for a bad lane declaration (enqueue re-validates on the producer path).
+    this.validateLane(job.getLane(), jobName)
     if (this.jobsByName.has(jobName)) {
       throw new Error(`Job with name "${jobName}" is already registered`)
     }
@@ -355,6 +366,7 @@ export class RedisJM extends Hookable<RedisJMHooks> {
    * ```
    */
   async popAndExecute(): Promise<boolean> {
+    // Step 2 keeps consumption on the default lane; step 3 makes this multi-lane (LMPOP).
     const jobId = await this.redis.lpop(this.getQueueKey())
     if (!jobId) return false
 
@@ -447,8 +459,9 @@ export class RedisJM extends Hookable<RedisJMHooks> {
     record.status = 'queued'
     await this.redis.hset(this.getLogKey(), jobId, JSON.stringify(record))
     // Back of the queue (not the front) so this doesn't starve handleable work, and the lock
-    // is intentionally left in place.
-    await this.redis.rpush(this.getQueueKey(), jobId)
+    // is intentionally left in place. RPUSH to the record's own lane so a laned unknown job stays
+    // on its lane for a same-lane sibling to claim (end-to-end coverage lands with the step-3 consumer).
+    await this.redis.rpush(this.getQueueKey(record.lane), jobId)
     return true
   }
 
@@ -616,7 +629,7 @@ export class RedisJM extends Hookable<RedisJMHooks> {
           staleCount++
         }
       } else if (record.status === 'queued') {
-        const queuePosition = await this.redis.lpos(this.getQueueKey(), jobId)
+        const queuePosition = await this.redis.lpos(this.getQueueKey(record.lane), jobId)
         if (queuePosition === null) {
           if (record.suspectedAt === undefined) {
             record.suspectedAt = now
@@ -676,6 +689,10 @@ export class RedisJM extends Hookable<RedisJMHooks> {
     inputs: TInputs,
     pushCmd: 'rpush' | 'lpush',
   ): Promise<boolean> {
+    // Authoritative lane validation: the producer path never goes through registerJob, so validate
+    // here (before taking the lock) as well as at registration.
+    this.validateLane(job.getLane(), job.getName())
+
     const jobId = job.getJobId(runId)
     const locksKey = this.getLocksKey()
 
@@ -689,6 +706,9 @@ export class RedisJM extends Hookable<RedisJMHooks> {
         runId,
         inputs,
         targetGroup: this.targetGroup,
+        // `undefined` for the default lane; JSON.stringify omits it, so a default-lane record
+        // serializes byte-for-byte as in 0.0.3 (no `lane` key).
+        lane: job.getLane(),
         status: 'queued',
         progress: 0,
       }
@@ -697,7 +717,7 @@ export class RedisJM extends Hookable<RedisJMHooks> {
       // record exists and drop it as "no log record". (A crash between these writes
       // instead leaves a `queued` record absent from the queue — reclaimed by maintenance.)
       await this.redis.hset(this.getLogKey(), jobId, JSON.stringify(record))
-      await this.redis[pushCmd](this.getQueueKey(), jobId)
+      await this.redis[pushCmd](this.getQueueKey(job.getLane()), jobId)
       return true
     } catch (err) {
       await this.redis.srem(locksKey, jobId).catch(() => {})
@@ -715,8 +735,33 @@ export class RedisJM extends Hookable<RedisJMHooks> {
     await this.redis.hset(this.getLogKey(), jobId, JSON.stringify(record))
   }
 
-  private getQueueKey(): string {
-    return `redisjm:${this.targetGroup}:queue`
+  /**
+   * Resolves the queue-list key for a lane. The default lane (`undefined` or `'default'`) maps to
+   * the exact legacy key `redisjm:<group>:queue` for backward compatibility; a named lane maps to
+   * `redisjm:<group>:lane:<lane>:queue`. Locks and log stay group-wide (see `getLocksKey`/`getLogKey`).
+   */
+  private getQueueKey(lane?: string): string {
+    if (lane === undefined || lane === 'default') {
+      return `redisjm:${this.targetGroup}:queue`
+    }
+    return `redisjm:${this.targetGroup}:lane:${lane}:queue`
+  }
+
+  /**
+   * Validates a lane name on the write paths. The default lane (`undefined`) and the internal
+   * maintenance job are exempt (the latter owns the reserved `__maintenance` lane, assigned in a
+   * later step); every other lane must match `^[A-Za-z0-9_-]+$` (no `#`, `:`, empty) and must not
+   * start with `__` (reserved).
+   */
+  private validateLane(lane: string | undefined, jobName: string): void {
+    if (lane === undefined) return
+    if (jobName === MAINTENANCE_JOB_NAME) return
+    if (!/^[A-Za-z0-9_-]+$/.test(lane)) {
+      throw new Error(`Lane "${lane}" is invalid — lane names must match /^[A-Za-z0-9_-]+$/`)
+    }
+    if (lane.startsWith('__')) {
+      throw new Error(`Lane "${lane}" is invalid — the "__" prefix is reserved`)
+    }
   }
 
   private getLocksKey(): string {
