@@ -167,11 +167,40 @@ export class Job<TInputs = unknown, TAttrs extends { [K in keyof TAttrs]: JobAtt
    * ```
    */
   async queue(runId: string, inputs: TInputs, manager?: RedisJM, options?: QueueOptions): Promise<boolean> {
+    return this.resolveManager(manager).queue(this as Job<any, any>, runId, inputs, options)
+  }
+
+  /**
+   * Convenience method to priority-insert this job (front of the queue) via a RedisJM instance.
+   * Mirrors {@link queue} but delegates to `manager.queueFirst`. Uses the provided manager or the
+   * default manager set in the constructor.
+   *
+   * @param runId - Unique identifier for this run (duplicates are rejected)
+   * @param inputs - The job inputs to store and pass at execution time
+   * @param manager - Optional RedisJM instance (overrides the default)
+   * @param options - Optional queue options; a priority insert cannot be delayed (`delay > 0` throws)
+   * @returns `true` if queued, `false` if already locked
+   *
+   * @example
+   * ```ts
+   * const queued = await job.queueFirst('urgent-order', { orderId: '456' })
+   * ```
+   */
+  async queueFirst(runId: string, inputs: TInputs, manager?: RedisJM, options?: QueueOptions): Promise<boolean> {
+    return this.resolveManager(manager).queueFirst(this as Job<any, any>, runId, inputs, options)
+  }
+
+  /**
+   * Resolves the RedisJM instance to queue through: the explicit `manager` argument if given, else
+   * the default manager set in the constructor. Throws if neither is available (a missing manager is
+   * an error, not a silent no-op).
+   */
+  private resolveManager(manager?: RedisJM): RedisJM {
     const mgr = manager ?? this.defaultManager
     if (!mgr) {
       throw new Error('No RedisJM instance provided and no default manager set')
     }
-    return mgr.queue(this as Job<any, any>, runId, inputs, options)
+    return mgr
   }
 
   /**

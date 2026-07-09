@@ -25,7 +25,7 @@ describe('RedisJM', () => {
       expect(manager.getOptions()).toEqual({
         heartbeatInterval: 5000,
         roundsToStale: 2,
-        keepFinishedInterval: 0,
+        keepFinishedInterval: 60000,
         maintenanceInterval: 10000, // heartbeatInterval * roundsToStale
         unknownJobRequeueLimit: 5,
         laneStrategy: 'roundRobin',
@@ -294,9 +294,11 @@ describe('RedisJM', () => {
 
   describe('log record lifecycle', () => {
     it('should update log to running on start then remove on finish with keepFinishedInterval=0', async () => {
+      // Explicit opt-in to the legacy write-only behavior (the default is now 60s retention).
+      const m = new RedisJM(redis, 'test-group', { keepFinishedInterval: 0 })
       const fn = vi.fn()
-      const job = manager.createJob({ jobName: 'logJob' }, fn)
-      await manager.queue(job, 'run1', 'input')
+      const job = m.createJob({ jobName: 'logJob' }, fn)
+      await m.queue(job, 'run1', 'input')
       await job.execute('input', { targetGroup: 'test-group', runId: 'run1' })
 
       const logJson = await redis.hget('redisjm:test-group:log', 'logJob#run1')
@@ -1473,11 +1475,13 @@ describe('RedisJM', () => {
 
   describe('get after finish', () => {
     it('should return undefined for a finished run under keepFinishedInterval=0', async () => {
-      const job = manager.createJob({ jobName: 'fin' }, vi.fn())
-      await manager.queue(job, 'r1', 'x')
+      // Explicit opt-in to the legacy write-only behavior (the default now retains for 60s).
+      const m = new RedisJM(redis, 'test-group', { keepFinishedInterval: 0 })
+      const job = m.createJob({ jobName: 'fin' }, vi.fn())
+      await m.queue(job, 'r1', 'x')
       await job.execute('x', { targetGroup: 'test-group', runId: 'r1' })
-      // Default keepFinishedInterval:0 deletes the record on finish.
-      expect(await manager.get('fin#r1')).toBeUndefined()
+      // keepFinishedInterval:0 deletes the record on finish.
+      expect(await m.get('fin#r1')).toBeUndefined()
     })
   })
 
@@ -2251,6 +2255,120 @@ describe('RedisJM', () => {
       expect(rpushed).toBe(0)
       const rec = JSON.parse((await redis.hget('redisjm:test-group:log', 'race#r1'))!) as JobLogRecord
       expect(rec.status).toBe('delayed') // the winner owns the flip; this instance touched nothing
+    })
+  })
+
+  describe('stats', () => {
+    // WHY: dashboards need one call for per-lane queue depths, delayed size, total locks, and a
+    // status histogram — with a stable (zeroed) status shape regardless of which statuses are present.
+    it('reports queue depths, delayed, locks, and a stable status histogram', async () => {
+      const m = new RedisJM(redis, 'test-group', { keepFinishedInterval: 60000, maintenanceInterval: 0, logger: false })
+
+      // 1 finished (popped & run to completion first, so it leaves no queue entry; retained by the 60s policy).
+      const fjob = m.createJob({ jobName: 'fjob' }, vi.fn())
+      await m.queue(fjob, 'r6', 'x')
+      await m.popAndExecute()
+
+      // 2 queued on the default lane, 1 queued on the 'images' lane, 1 delayed.
+      const qjob = m.createJob({ jobName: 'qjob' }, vi.fn())
+      await m.queue(qjob, 'r1', 'x')
+      await m.queue(qjob, 'r2', 'x')
+      const ljob = m.createJob({ jobName: 'ljob', lane: 'images' }, vi.fn())
+      await m.queue(ljob, 'r3', 'x')
+      const djob = m.createJob({ jobName: 'djob' }, vi.fn())
+      await m.queue(djob, 'r4', 'x', { delay: 5000 })
+
+      // 1 running (seed a live record + its held lock; not on any queue list).
+      await redis.hset('redisjm:test-group:log', 'rjob#r5', JSON.stringify({
+        jobId: 'rjob#r5', jobName: 'rjob', runId: 'r5', inputs: 'x', targetGroup: 'test-group',
+        status: 'running', progress: 0, startedAt: Date.now(), heartbeat: Date.now(),
+      }))
+      await redis.sadd('redisjm:test-group:locks', 'rjob#r5')
+
+      const stats = await m.stats()
+      // default lane holds r1/r2; images holds r3; the reserved maintenance lane is empty.
+      expect(stats.queues).toEqual({ default: 2, images: 1, __maintenance: 0 })
+      expect(stats.delayed).toBe(1)
+      // locks: r1, r2, r3, r4 (delayed), r5 (running) — the finished r6's lock was released.
+      expect(stats.locks).toBe(5)
+      // Every status key present (error/stale zeroed) so the shape is stable.
+      expect(stats.statuses).toEqual({ queued: 3, running: 1, finished: 1, error: 0, stale: 0, delayed: 1 })
+    })
+  })
+
+  describe('queueSize', () => {
+    // WHY: single-lane queue-depth read for introspection; default lane when omitted, 0 for an empty lane.
+    it('returns the default and named-lane depths, and 0 for an empty lane', async () => {
+      const m = new RedisJM(redis, 'test-group', { maintenanceInterval: 0, logger: false })
+      const qjob = m.createJob({ jobName: 'q' }, vi.fn())
+      await m.queue(qjob, 'r1', 'x')
+      await m.queue(qjob, 'r2', 'x')
+      expect(await m.queueSize()).toBe(2) // default lane
+
+      const ljob = m.createJob({ jobName: 'l', lane: 'images' }, vi.fn())
+      await m.queue(ljob, 'r3', 'x')
+      expect(await m.queueSize('images')).toBe(1)
+      expect(await m.queueSize('empty-lane')).toBe(0)
+    })
+  })
+
+  describe('isLocked', () => {
+    // WHY: isLocked reflects the LOCK across the whole active lifecycle (queued/delayed/running and a
+    // still-unreclaimed stale lock), false once released — and the deprecated isQueued alias delegates.
+    it('is true for queued/delayed/running/stale and false after finish; isQueued delegates', async () => {
+      const m = new RedisJM(redis, 'test-group', { keepFinishedInterval: 60000, maintenanceInterval: 0, logger: false })
+
+      const qjob = m.createJob({ jobName: 'q' }, vi.fn())
+      await m.queue(qjob, 'r', 'x')
+      expect(await m.isLocked('q#r')).toBe(true)
+      expect(await m.isQueued('q#r')).toBe(true) // deprecated alias still delegates
+
+      const djob = m.createJob({ jobName: 'd' }, vi.fn())
+      await m.queue(djob, 'r', 'x', { delay: 5000 })
+      expect(await m.isLocked('d#r')).toBe(true)
+
+      // running: live record + held lock.
+      await redis.hset('redisjm:test-group:log', 'run#r', JSON.stringify({
+        jobId: 'run#r', jobName: 'run', runId: 'r', inputs: 'x', targetGroup: 'test-group',
+        status: 'running', progress: 0, startedAt: Date.now(), heartbeat: Date.now(),
+      }))
+      await redis.sadd('redisjm:test-group:locks', 'run#r')
+      expect(await m.isLocked('run#r')).toBe(true)
+
+      // stale lock: the run died (heartbeat 0) but maintenance hasn't reclaimed the lock yet.
+      await redis.hset('redisjm:test-group:log', 'stale#r', JSON.stringify({
+        jobId: 'stale#r', jobName: 'stale', runId: 'r', inputs: 'x', targetGroup: 'test-group',
+        status: 'running', progress: 0, startedAt: 0, heartbeat: 0,
+      }))
+      await redis.sadd('redisjm:test-group:locks', 'stale#r')
+      expect(await m.isLocked('stale#r')).toBe(true)
+
+      // false after finish: the terminal path releases the lock.
+      const fjob = m.createJob({ jobName: 'f' }, vi.fn())
+      await m.queue(fjob, 'r', 'x')
+      await fjob.execute('x', { targetGroup: 'test-group', runId: 'r' })
+      expect(await m.isLocked('f#r')).toBe(false)
+      expect(await m.isQueued('f#r')).toBe(false)
+    })
+  })
+
+  describe('default retention', () => {
+    // WHY: the default flipped from 0 → 60000, so a finished run is now observable via get() out of the
+    // box; the legacy write-only drop-on-finish behavior stays available under an explicit 0.
+    it('keeps a finished record observable by default, and drops it under explicit keepFinishedInterval:0', async () => {
+      // NO options: default keepFinishedInterval (60s) retains the terminal record.
+      const def = new RedisJM(redis, 'test-group')
+      const job = def.createJob({ jobName: 'obs' }, vi.fn())
+      await def.queue(job, 'r1', 'x')
+      await job.execute('x', { targetGroup: 'test-group', runId: 'r1' })
+      expect((await def.get('obs#r1'))?.status).toBe('finished')
+
+      // Explicit opt-in to 0: the record is dropped the moment the job leaves running.
+      const drop = new RedisJM(redis, 'test-group', { keepFinishedInterval: 0, logger: false })
+      const job2 = drop.createJob({ jobName: 'drop' }, vi.fn())
+      await drop.queue(job2, 'r1', 'x')
+      await job2.execute('x', { targetGroup: 'test-group', runId: 'r1' })
+      expect(await drop.get('drop#r1')).toBeUndefined()
     })
   })
 })

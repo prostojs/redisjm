@@ -1,7 +1,8 @@
 import { describe, it, expect, vi } from 'vitest'
 import { Job } from '../job'
-import type { RedisJM } from '../redisjm'
+import { RedisJM } from '../redisjm'
 import type { JobContext } from '../types'
+import { createMockRedis } from './mock-redis'
 
 describe('Job', () => {
   const metadata = { jobName: 'testJob', description: 'A test job' }
@@ -423,6 +424,41 @@ describe('Job', () => {
     it('should throw when no manager is available', async () => {
       const job = new Job<string>(metadata, vi.fn())
       await expect(job.queue('run1', 'input1')).rejects.toThrow(
+        'No RedisJM instance provided and no default manager set',
+      )
+    })
+  })
+
+  describe('queueFirst', () => {
+    // WHY: queueFirst mirrors queue but delegates to manager.queueFirst (priority insert), forwarding options.
+    it('should call manager.queueFirst and return its result', async () => {
+      const mockManager = {
+        queueFirst: vi.fn().mockResolvedValue(true),
+        getTargetGroup: () => 'group1',
+      } as unknown as RedisJM
+      const job = new Job<string>(metadata, vi.fn(), mockManager)
+      const result = await job.queueFirst('run1', 'input1')
+      expect(result).toBe(true)
+      expect(mockManager.queueFirst).toHaveBeenCalledWith(job, 'run1', 'input1', undefined)
+    })
+
+    // WHY: a priority insert must be popped before an already-queued run (front-of-queue insert).
+    it('jumps the queue — the queueFirst run is popped before an earlier-queued run', async () => {
+      const redis = createMockRedis()
+      const m = new RedisJM(redis, 'g', { keepFinishedInterval: 60000, maintenanceInterval: 0, logger: false })
+      const order: string[] = []
+      const job = m.createJob({ jobName: 'j' }, async (input: string) => { order.push(input) })
+      await job.queue('first', 'first')
+      await job.queueFirst('urgent', 'urgent')
+      await m.popAndExecute()
+      await m.popAndExecute()
+      expect(order).toEqual(['urgent', 'first'])
+    })
+
+    // WHY: same guard as queue — no manager (explicit or default) is an error, not a silent no-op.
+    it('should throw when no manager is available', async () => {
+      const job = new Job<string>(metadata, vi.fn())
+      await expect(job.queueFirst('run1', 'input1')).rejects.toThrow(
         'No RedisJM instance provided and no default manager set',
       )
     })

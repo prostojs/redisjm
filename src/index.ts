@@ -21,5 +21,6 @@ export type {
   RedisJMHooks,
   RedisJMLogger,
   RedisJMOptions,
+  RedisJMStats,
   ResolvedRedisJMOptions,
 } from './types'

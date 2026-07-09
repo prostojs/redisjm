@@ -12,12 +12,14 @@ import type {
   JobLogRecord,
   JobMetadata,
   JobRetryEventPayload,
+  JobStatus,
   JobUpdateEventPayload,
   MaintenanceResult,
   QueueOptions,
   RedisJMHooks,
   RedisJMLogger,
   RedisJMOptions,
+  RedisJMStats,
   ResolvedRedisJMOptions,
   StopOptions,
 } from './types'
@@ -25,7 +27,9 @@ import type {
 const DEFAULT_OPTIONS: Omit<ResolvedRedisJMOptions, 'maintenanceInterval'> = {
   heartbeatInterval: 5000,
   roundsToStale: 2,
-  keepFinishedInterval: 0,
+  // Observe outcomes out of the box: terminal records linger 60s so `get()`/`list()` can read a
+  // finished/error/stale run. `0` opts into the legacy write-only behavior (drop on leaving running).
+  keepFinishedInterval: 60_000,
   unknownJobRequeueLimit: 5,
   laneStrategy: 'roundRobin',
   lanePriority: [],
@@ -170,16 +174,102 @@ export class RedisJM extends Hookable<RedisJMHooks> {
   }
 
   /**
-   * Checks if a jobId is currently locked (queued, running, or stale).
+   * Checks whether a jobId currently holds a lock. A lock is held for the WHOLE active lifecycle:
+   * `queued` (waiting on a lane list), `delayed` (staged on the delayed set), `running` (executing),
+   * and `stale` (running lapsed, awaiting maintenance) — NOT just "queued". Returns `false` once the
+   * run reaches a terminal state and its lock is released (finished/error, or a reclaimed stale).
    *
    * @example
    * ```ts
-   * const locked = await manager.isQueued('send-email#daily-digest')
+   * const locked = await manager.isLocked('send-email#daily-digest')
    * ```
    */
-  async isQueued(jobId: string): Promise<boolean> {
+  async isLocked(jobId: string): Promise<boolean> {
     const result = await this.redis.sismember(this.getLocksKey(), jobId)
     return result === 1
+  }
+
+  /**
+   * @deprecated Use {@link isLocked}. The name is misleading: it returns `true` for a lock held in
+   * ANY active state (queued, delayed, running, or stale), not only `queued`. Thin delegating alias.
+   */
+  async isQueued(jobId: string): Promise<boolean> {
+    return this.isLocked(jobId)
+  }
+
+  /**
+   * Point-in-time snapshot for dashboards/introspection: per-lane queue depths, the delayed-set size,
+   * total held locks, and log-record counts by status. All reads are best-effort and independent (no
+   * cross-structure transaction), so a run mid-transition may be double- or un-counted for one poll.
+   *
+   * SCOPE (best-effort lane visibility): queue depths are reported for the lanes this instance can
+   * name — the default lane, the reserved `__maintenance` lane, its registered jobs' lanes, plus any
+   * lane discovered on a scanned log record (so a producer-only instance still sees a consumer lane's
+   * backlog once that lane has records). A lane with queue entries but NO log records AND no local
+   * registration is invisible here (nothing names it).
+   *
+   * @example
+   * ```ts
+   * const { queues, delayed, locks, statuses } = await manager.stats()
+   * ```
+   */
+  async stats(): Promise<RedisJMStats> {
+    // Status counts come from a single log scan; initialize every status to 0 so the shape is stable
+    // regardless of which statuses are currently present. That scan also surfaces lanes (below).
+    const statuses: Record<JobStatus, number> = {
+      queued: 0,
+      running: 0,
+      finished: 0,
+      error: 0,
+      stale: 0,
+      delayed: 0,
+    }
+    // Collect the DISTINCT lanes to report on, deduped by their reported label — which collapses a
+    // no-lane job and an explicit `lane: 'default'` job onto the single legacy queue (see laneLabel).
+    const laneLabels = new Set<string>()
+    const addLane = (lane?: string) => laneLabels.add(this.laneLabel(lane))
+    // Always report the default lane and the maintenance lane, plus every registered job's lane.
+    addLane(undefined)
+    addLane(MAINTENANCE_LANE)
+    for (const job of this.registeredJobs) addLane(job.getLane())
+    // Count statuses (single log scan, reusing list()) and pick up any lane seen on a record (a
+    // producer-only instance still observes a consumer lane's backlog once that lane has records —
+    // see the SCOPE note above).
+    for (const record of await this.list()) {
+      // A foreign-but-shape-valid record can carry a status string outside the known set; guard the
+      // increment so it can't seed a NaN bucket in the histogram.
+      if (record.status in statuses) statuses[record.status]++
+      addLane(record.lane)
+    }
+
+    // Fan out every count read in one batch: the delayed/locks cardinalities plus a per-lane LLEN
+    // (report under the resolved label). Independent, non-transactional reads — see the doc note above.
+    const labels = [...laneLabels]
+    const [delayed, locks, ...lens] = await Promise.all([
+      this.redis.zcard(this.getDelayedKey()),
+      this.redis.scard(this.getLocksKey()),
+      ...labels.map((label) => this.redis.llen(this.getQueueKey(label))),
+    ])
+    const queues: Record<string, number> = {}
+    labels.forEach((label, i) => {
+      queues[label] = lens[i]
+    })
+    return { queues, delayed, locks, statuses }
+  }
+
+  /**
+   * Queue depth (LLEN) of a single lane's queue list — the default lane when `lane` is omitted (or
+   * `'default'`). Read-only introspection: any lane string resolves to its key (no lane-name
+   * validation). NOTE: delayed/scheduled runs are NOT on a lane list until promoted, so they are not
+   * counted here — use `stats().delayed` for those.
+   *
+   * @example
+   * ```ts
+   * const pending = await manager.queueSize('images')
+   * ```
+   */
+  async queueSize(lane?: string): Promise<number> {
+    return this.redis.llen(this.getQueueKey(lane))
   }
 
   /**
@@ -234,9 +324,10 @@ export class RedisJM extends Hookable<RedisJMHooks> {
   /**
    * Fetches a single job log record by `jobId` (`"jobName#runId"`), or `undefined` if absent.
    *
-   * Note: with the default `keepFinishedInterval: 0`, finished/error records are deleted the
-   * moment the job leaves `running`, so a successful run returns `undefined` here — `undefined`
-   * means "no record", not "never ran". Set `keepFinishedInterval > 0` to observe terminal states.
+   * Note: by default (`keepFinishedInterval: 60000`) a terminal record lingers ~60s, so a run that
+   * just finished IS observable here (status `finished`/`error`/`stale`). Opting into
+   * `keepFinishedInterval: 0` deletes the record the moment the job leaves `running`, and a finished
+   * run then returns `undefined` — `undefined` means "no record", not "never ran".
    *
    * @example
    * ```ts
@@ -1314,6 +1405,14 @@ export class RedisJM extends Hookable<RedisJMHooks> {
       return `redisjm:${this.targetGroup}:queue`
     }
     return `redisjm:${this.targetGroup}:lane:${lane}:queue`
+  }
+
+  /**
+   * Display label for a lane, mirroring the default-lane rule in {@link getQueueKey}: the default
+   * lane (`undefined` or `'default'`) reports as `'default'`; a named lane reports under its own name.
+   */
+  private laneLabel(lane?: string): string {
+    return lane === undefined || lane === 'default' ? 'default' : lane
   }
 
   /**

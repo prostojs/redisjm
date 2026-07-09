@@ -106,6 +106,10 @@ export function createMockRedis(): Redis & { _dump: () => { store: Map<string, s
       const idx = list.indexOf(value)
       return idx === -1 ? null : idx
     }),
+    llen: vi.fn(async (key: string) => {
+      const list = lists.get(key)
+      return list ? list.length : 0
+    }),
 
     // Hash commands
     hget: vi.fn(async (key: string, field: string) => {

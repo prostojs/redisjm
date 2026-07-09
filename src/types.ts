@@ -64,7 +64,13 @@ export interface RedisJMOptions {
   heartbeatInterval?: number
   /** Number of missed heartbeat intervals before a job is considered stale (default: `2`) */
   roundsToStale?: number
-  /** Milliseconds to keep finished/error/stale records in the log; `0` removes immediately (default: `0`) */
+  /**
+   * Milliseconds to keep finished/error/stale records in the log after they reach a terminal state,
+   * so `get()`/`list()` can observe the outcome. Default `60000` (60s) — terminal records linger a
+   * minute before maintenance sweeps them. Set `0` to opt into the legacy write-only behavior, where
+   * a record is deleted the instant the job leaves `running` (`get()` then returns `undefined` for a
+   * finished run).
+   */
   keepFinishedInterval?: number
   /**
    * Milliseconds between automatic maintenance enqueues while `start()` is polling;
@@ -315,6 +321,22 @@ export interface RedisJMHooks {
   retry: (payload: JobRetryEventPayload) => void | Promise<void>
   heartbeat: (payload: JobEventPayload) => void | Promise<void>
   update: (payload: JobUpdateEventPayload) => void | Promise<void>
+}
+
+/**
+ * Snapshot returned by `RedisJM.stats()` for dashboards/introspection. All counts are best-effort
+ * point-in-time reads (no cross-structure transaction), so a run mid-transition may be double- or
+ * un-counted for one poll.
+ */
+export interface RedisJMStats {
+  /** Queue depth per lane, keyed by lane name ('default' for the legacy/no-lane queue). */
+  queues: Record<string, number>
+  /** Number of runs staged on the delayed set (backoff retries + delay-queued runs). */
+  delayed: number
+  /** Total held locks (queued + delayed + running + stale). */
+  locks: number
+  /** Log record counts by status. */
+  statuses: Record<JobStatus, number>
 }
 
 /** Result returned by `RedisJM.performMaintenance()`. */
