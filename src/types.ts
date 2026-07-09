@@ -16,7 +16,7 @@ export type JobAttrs = Record<string, JobAttrValue>
 export type RedisJMLogger = (message: string, error?: Error) => void
 
 /** Possible statuses of a job in the lifecycle. */
-export type JobStatus = 'queued' | 'running' | 'finished' | 'error' | 'stale'
+export type JobStatus = 'queued' | 'running' | 'finished' | 'error' | 'stale' | 'delayed'
 
 /** Strategy for ordering subscribed lanes when polling with `LMPOP`. */
 export type LaneStrategy = 'roundRobin' | 'priority'
@@ -32,6 +32,30 @@ export interface JobMetadata {
    * a worker services only the lanes of its registered jobs.
    */
   lane?: string
+  /**
+   * Total number of attempts (including the first) before a failed run is considered finally failed.
+   * Must be a positive integer; default `1` = no retries (a single failed attempt is terminal).
+   * Resolved via `Job.getAttempts()` (floored, clamped to ≥ 1).
+   */
+  attempts?: number
+  /**
+   * Delay in ms before the next retry attempt, given the just-failed 1-based attempt number.
+   * Either a fixed number of ms or a function of the failed attempt (e.g. exponential backoff).
+   * Default `0` = re-queue immediately (still routed through the delayed set on the next promotion
+   * pass). Negative / non-finite results are clamped to `0`. Resolved via `Job.getBackoffMs()`.
+   */
+  backoff?: number | ((attempt: number) => number)
+}
+
+/** Options for `queue` / `queueFirst` / `Job.queue`. */
+export interface QueueOptions {
+  /**
+   * Milliseconds to stage the run on the delayed set before it becomes poppable. `> 0` stores the
+   * record as `delayed` (holding the lock so dedupe still applies) and schedules it on the delayed
+   * sorted set; `0`/omitted queues immediately. Must be a finite number ≥ 0. Incompatible with
+   * `queueFirst` (a priority insert cannot be delayed).
+   */
+  delay?: number
 }
 
 /** Optional configuration for `RedisJM`. All fields have defaults. */
@@ -138,6 +162,11 @@ export interface JobLogRecord<TInputs = unknown, TAttrs extends { [K in keyof TA
    * successful claim; groundwork for retries (a re-run of the same queued entry bumps it).
    */
   attempt?: number
+  /**
+   * Epoch ms when a `delayed` run becomes poppable (promotion flips it to `queued` once due).
+   * Present only while `status === 'delayed'`; deleted when the run is promoted.
+   */
+  readyAt?: number
 }
 
 /** Options for `Job.execute()`. */
@@ -191,6 +220,19 @@ export interface JobErrorEventPayload<TInputs = unknown> extends JobEventPayload
   error: Error
 }
 
+/**
+ * Payload for the manager-level `retry` event, fired for each scheduled retry (not final failure).
+ * Extends `JobEventPayload` with the error that caused the retry, the 1-based attempt that failed,
+ * and the epoch-ms time the next attempt becomes poppable.
+ */
+export interface JobRetryEventPayload<TInputs = unknown> extends JobEventPayload<TInputs> {
+  error: Error
+  /** The 1-based attempt number that just failed and triggered the retry. */
+  attempt: number
+  /** Epoch ms when the retried run becomes poppable (its delayed `readyAt`). */
+  nextAttemptAt: number
+}
+
 /** Payload for `update` events. Extends `JobEventPayload` with optional progress and attrs. */
 export interface JobUpdateEventPayload<TInputs = unknown, TAttrs extends { [K in keyof TAttrs]: JobAttrValue } = JobAttrs> extends JobEventPayload<TInputs> {
   progress?: number
@@ -201,16 +243,33 @@ export interface JobUpdateEventPayload<TInputs = unknown, TAttrs extends { [K in
 export interface JobHooks<TInputs = unknown, TAttrs extends { [K in keyof TAttrs]: JobAttrValue } = JobAttrs> {
   start: (payload: JobEventPayload<TInputs>) => void | Promise<void>
   finish: (payload: JobEventPayload<TInputs>) => void | Promise<void>
+  /**
+   * Fires on EVERY failed attempt (each throw of the job function), including attempts that will be
+   * retried. Contrast the manager-level `error` event (`RedisJMHooks`), which fires only on FINAL
+   * failure once the `attempts` budget is exhausted.
+   */
   error: (payload: JobErrorEventPayload<TInputs>) => void | Promise<void>
   heartbeat: (payload: JobEventPayload<TInputs>) => void | Promise<void>
   update: (payload: JobUpdateEventPayload<TInputs, TAttrs>) => void | Promise<void>
 }
 
-/** Event hooks for `RedisJM` instances. Re-dispatched from registered jobs matching the target group. */
+/**
+ * Event hooks for `RedisJM` instances. Re-dispatched from registered jobs matching the target group.
+ *
+ * Retry semantics: a job-level `error` hook (see `JobHooks`) fires on EVERY failed attempt, whereas
+ * the manager-level `error` event here fires only on FINAL failure (the last attempt exhausted the
+ * `attempts` budget). The manager-level `retry` event fires once for each scheduled retry in between.
+ */
 export interface RedisJMHooks {
   start: (payload: JobEventPayload) => void | Promise<void>
   finish: (payload: JobEventPayload) => void | Promise<void>
   error: (payload: JobErrorEventPayload) => void | Promise<void>
+  /**
+   * Fires when a failed attempt is scheduled for retry (attempt N failed, attempt N+1 pending on the
+   * delayed set). Manager-level only — the retry decision lives in the manager, not the job. Does NOT
+   * fire on final failure (the `error` event fires then instead).
+   */
+  retry: (payload: JobRetryEventPayload) => void | Promise<void>
   heartbeat: (payload: JobEventPayload) => void | Promise<void>
   update: (payload: JobUpdateEventPayload) => void | Promise<void>
 }

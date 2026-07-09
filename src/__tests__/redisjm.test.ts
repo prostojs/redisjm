@@ -1736,4 +1736,294 @@ describe('RedisJM', () => {
       vi.useRealTimers()
     })
   })
+
+  describe('delayed enqueue & promotion', () => {
+    afterEach(() => { vi.useRealTimers() })
+
+    // WHY: a delayed run must persist as `delayed` (holding the lock so dedupe still applies), sit on
+    // the delayed zset (not the live queue), be non-poppable until due, then promote+execute on the
+    // first poll after its readyAt — proving the promotion rate-limit doesn't starve it across a >1s gap.
+    it('stages a delayed run, holds the lock, and promotes it once due', async () => {
+      vi.useFakeTimers()
+      const base = 1_700_000_000_000
+      vi.setSystemTime(base)
+      const m = new RedisJM(redis, 'test-group', { keepFinishedInterval: 60000, maintenanceInterval: 0, logger: false })
+      const fn = vi.fn()
+      const job = m.createJob({ jobName: 'delayed' }, fn)
+
+      expect(await m.queue(job, 'run1', { k: 'v' }, { delay: 5000 })).toBe(true)
+
+      const record = JSON.parse((await redis.hget('redisjm:test-group:log', 'delayed#run1'))!) as JobLogRecord
+      expect(record.status).toBe('delayed')
+      expect(record.readyAt).toBe(base + 5000)
+      expect(await m.isQueued('delayed#run1')).toBe(true)
+      expect(await m.queue(job, 'run1', { k: 'v' })).toBe(false) // dedupe holds while waiting
+      expect(await redis.zscore('redisjm:test-group:delayed', 'delayed#run1')).not.toBeNull()
+      expect(await redis.lpos('redisjm:test-group:queue', 'delayed#run1')).toBeNull()
+
+      // Not yet due → not poppable.
+      expect(await m.popAndExecute()).toBe(false)
+      expect(fn).not.toHaveBeenCalled()
+
+      // Advance well past readyAt (and past the 1000ms promotion gap) → promoted and executed.
+      vi.setSystemTime(base + 6000)
+      expect(await m.popAndExecute()).toBe(true)
+      expect(fn).toHaveBeenCalledWith({ k: 'v' }, expect.any(Object))
+      expect(await redis.zscore('redisjm:test-group:delayed', 'delayed#run1')).toBeNull()
+      expect(await m.isQueued('delayed#run1')).toBe(false)
+    })
+
+    // WHY: queueFirst + delay is contradictory (no "front" of a time-ordered set), and delay must be a
+    // finite number ≥ 0; both are producer-input errors that must throw TypeError before taking the lock.
+    it('rejects queueFirst+delay and invalid delay values with TypeError', async () => {
+      const m = new RedisJM(redis, 'test-group', { logger: false })
+      const job = new Job({ jobName: 'd' }, vi.fn())
+      await expect(m.queueFirst(job, 'r1', 'x', { delay: 1000 })).rejects.toThrow(TypeError)
+      await expect(m.queue(job, 'r2', 'x', { delay: -1 })).rejects.toThrow(TypeError)
+      await expect(m.queue(job, 'r3', 'x', { delay: Number.NaN })).rejects.toThrow(TypeError)
+      await expect(m.queue(job, 'r4', 'x', { delay: Number.POSITIVE_INFINITY })).rejects.toThrow(TypeError)
+      // delay: 0 is valid and behaves like a normal (immediate) queue.
+      expect(await m.queue(job, 'r5', 'x', { delay: 0 })).toBe(true)
+      expect(await redis.lpos('redisjm:test-group:queue', 'd#r5')).not.toBeNull()
+      // A rejected delayed enqueue must not leak a lock.
+      expect(await m.isQueued('d#r1')).toBe(false)
+    })
+  })
+
+  describe('retries', () => {
+    afterEach(() => { vi.useRealTimers() })
+
+    // WHY: the core retry story — a handler that fails twice then succeeds must schedule two backoff
+    // retries (manager 'retry' fired with attempts 1 & 2 and the correct nextAttemptAt), hold the lock
+    // across each backoff window, NEVER fire manager 'error', and end finished with record.attempt === 3.
+    it('retries a failing handler through backoff, then succeeds, without firing error', async () => {
+      vi.useFakeTimers()
+      const base = 1_700_000_000_000
+      vi.setSystemTime(base)
+      const m = new RedisJM(redis, 'test-group', { keepFinishedInterval: 60000, maintenanceInterval: 0, logger: false })
+      let calls = 0
+      const job = m.createJob({ jobName: 'retry', attempts: 3, backoff: 1000 }, vi.fn(async () => {
+        calls++
+        if (calls < 3) throw new Error(`boom ${calls}`)
+      }))
+      const retrySpy = vi.fn()
+      const errorSpy = vi.fn()
+      m.hook('retry', retrySpy)
+      m.hook('error', errorSpy)
+
+      await m.queue(job, 'r1', 'x')
+
+      // Attempt 1 fails → retry #1 scheduled at now + backoff; lock HELD through the backoff window.
+      expect(await m.popAndExecute()).toBe(true)
+      expect(retrySpy).toHaveBeenCalledTimes(1)
+      expect(retrySpy).toHaveBeenLastCalledWith(
+        expect.objectContaining({ attempt: 1, nextAttemptAt: base + 1000, error: expect.any(Error) }),
+      )
+      let rec = JSON.parse((await redis.hget('redisjm:test-group:log', 'retry#r1'))!) as JobLogRecord
+      expect(rec.status).toBe('delayed')
+      expect(rec.attempt).toBe(1)
+      expect(await m.queue(job, 'r1', 'x')).toBe(false) // dedupe holds during backoff
+
+      // Attempt 2 fails → retry #2; nextAttemptAt reflects the (advanced) now + backoff.
+      vi.setSystemTime(base + 1500)
+      expect(await m.popAndExecute()).toBe(true)
+      expect(retrySpy).toHaveBeenCalledTimes(2)
+      expect(retrySpy).toHaveBeenLastCalledWith(expect.objectContaining({ attempt: 2, nextAttemptAt: base + 2500 }))
+      expect(await m.queue(job, 'r1', 'x')).toBe(false)
+
+      // Attempt 3 succeeds → finished, no error event ever, attempt reached 3, lock released.
+      vi.setSystemTime(base + 4000)
+      expect(await m.popAndExecute()).toBe(true)
+      expect(calls).toBe(3)
+      expect(retrySpy).toHaveBeenCalledTimes(2)
+      expect(errorSpy).not.toHaveBeenCalled()
+      rec = JSON.parse((await redis.hget('redisjm:test-group:log', 'retry#r1'))!) as JobLogRecord
+      expect(rec.status).toBe('finished')
+      expect(rec.attempt).toBe(3)
+      expect(await m.isQueued('retry#r1')).toBe(false)
+    })
+
+    // WHY: with attempts:2 an always-failing handler retries once, then on the final attempt fires the
+    // manager 'error' event exactly once with the LAST error and leaves the record status 'error'.
+    it('fires error only on final failure after exhausting attempts', async () => {
+      vi.useFakeTimers()
+      const base = 1_700_000_000_000
+      vi.setSystemTime(base)
+      const m = new RedisJM(redis, 'test-group', { keepFinishedInterval: 60000, maintenanceInterval: 0, logger: false })
+      let calls = 0
+      const job = m.createJob({ jobName: 'fail', attempts: 2, backoff: 1000 }, vi.fn(async () => {
+        calls++
+        throw new Error(`boom ${calls}`)
+      }))
+      const retrySpy = vi.fn()
+      const errorSpy = vi.fn()
+      m.hook('retry', retrySpy)
+      m.hook('error', errorSpy)
+
+      await m.queue(job, 'r1', 'x')
+
+      expect(await m.popAndExecute()).toBe(true) // attempt 1 → retry, no error yet
+      expect(retrySpy).toHaveBeenCalledTimes(1)
+      expect(errorSpy).not.toHaveBeenCalled()
+
+      vi.setSystemTime(base + 1500)
+      expect(await m.popAndExecute()).toBe(true) // attempt 2 → final failure
+      expect(retrySpy).toHaveBeenCalledTimes(1)
+      expect(errorSpy).toHaveBeenCalledTimes(1)
+      expect(errorSpy).toHaveBeenCalledWith(expect.objectContaining({ error: expect.objectContaining({ message: 'boom 2' }) }))
+      const rec = JSON.parse((await redis.hget('redisjm:test-group:log', 'fail#r1'))!) as JobLogRecord
+      expect(rec.status).toBe('error')
+      expect(rec.error).toBe('boom 2')
+      expect(await m.isQueued('fail#r1')).toBe(false)
+    })
+
+    // WHY: regression guard for legacy behavior — the default attempts:1 must make a single failure
+    // immediately final (manager 'error', no 'retry', no delayed entry).
+    it('treats attempts:1 (default) failure as immediately final', async () => {
+      const m = new RedisJM(redis, 'test-group', { keepFinishedInterval: 60000, maintenanceInterval: 0, logger: false })
+      const job = m.createJob({ jobName: 'once' }, vi.fn(() => { throw new Error('nope') }))
+      const retrySpy = vi.fn()
+      const errorSpy = vi.fn()
+      m.hook('retry', retrySpy)
+      m.hook('error', errorSpy)
+
+      await m.queue(job, 'r1', 'x')
+      expect(await m.popAndExecute()).toBe(true)
+
+      expect(retrySpy).not.toHaveBeenCalled()
+      expect(errorSpy).toHaveBeenCalledTimes(1)
+      const rec = JSON.parse((await redis.hget('redisjm:test-group:log', 'once#r1'))!) as JobLogRecord
+      expect(rec.status).toBe('error')
+      expect(await redis.zscore('redisjm:test-group:delayed', 'once#r1')).toBeNull()
+      expect(await m.isQueued('once#r1')).toBe(false)
+    })
+
+    // WHY: a superseded (zombie) execution's failure must be fenced by executionId — it schedules NO
+    // retry, fires NO events, and leaves the successor's freshly-queued record and lock untouched.
+    it('a superseded (zombie) failure schedules no retry and fires no events', async () => {
+      const m = new RedisJM(redis, 'test-group', { keepFinishedInterval: 60000, logger: false, maintenanceInterval: 0 })
+      let release!: () => void
+      const gate = new Promise<void>((r) => { release = r })
+      const job = m.createJob({ jobName: 'zr', attempts: 3, backoff: 1000 }, vi.fn(async () => { await gate; throw new Error('late boom') }))
+      const retrySpy = vi.fn()
+      const errorSpy = vi.fn()
+      m.hook('retry', retrySpy)
+      m.hook('error', errorSpy)
+
+      await m.queue(job, 'r1', 'x')
+      const zombie = m.popAndExecute() // claims the record, then blocks on the gate
+      await new Promise((r) => setTimeout(r, 0))
+
+      // Maintenance-style stale + unlock, then a successor re-enqueues the same runId (fresh record).
+      const jobId = 'zr#r1'
+      const staled = JSON.parse((await redis.hget('redisjm:test-group:log', jobId))!) as JobLogRecord
+      staled.status = 'stale'
+      staled.finishedAt = Date.now()
+      await redis.hset('redisjm:test-group:log', jobId, JSON.stringify(staled))
+      await redis.srem('redisjm:test-group:locks', jobId)
+      expect(await m.queue(job, 'r1', 'x2')).toBe(true)
+
+      release()
+      await zombie // popAndExecute swallows the thrown handler error internally
+
+      expect(retrySpy).not.toHaveBeenCalled()
+      expect(errorSpy).not.toHaveBeenCalled()
+      const successor = JSON.parse((await redis.hget('redisjm:test-group:log', jobId))!) as JobLogRecord
+      expect(successor.status).toBe('queued')
+      expect(successor.executionId).toBeUndefined()
+      expect(await redis.zscore('redisjm:test-group:delayed', jobId)).toBeNull() // no phantom retry entry
+      expect(await m.isQueued(jobId)).toBe(true)
+    })
+  })
+
+  describe('maintenance & delayed', () => {
+    // WHY: an overdue-but-present delayed entry is owned by promotion, not maintenance — maintenance
+    // must leave it (and its lock) untouched even across repeated passes.
+    it('leaves a delayed record present on the zset untouched, even when overdue', async () => {
+      const m = new RedisJM(redis, 'test-group', { heartbeatInterval: 1000, roundsToStale: 2, keepFinishedInterval: 60000, logger: false })
+      const jobId = 'dm#r1'
+      await redis.sadd('redisjm:test-group:locks', jobId)
+      await redis.zadd('redisjm:test-group:delayed', Date.now() - 10000, jobId) // overdue but present
+      await redis.hset('redisjm:test-group:log', jobId, JSON.stringify({
+        jobId, jobName: 'dm', runId: 'r1', inputs: null, targetGroup: 'test-group',
+        status: 'delayed', progress: 0, readyAt: Date.now() - 10000,
+      }))
+
+      expect((await m.performMaintenance()).staleCount).toBe(0)
+      expect((await m.performMaintenance()).staleCount).toBe(0)
+      const rec = JSON.parse((await redis.hget('redisjm:test-group:log', jobId))!) as JobLogRecord
+      expect(rec.status).toBe('delayed')
+      expect(rec.suspectedAt).toBeUndefined()
+      expect(await m.isQueued(jobId)).toBe(true)
+    })
+
+    // WHY: a delayed record MISSING from the zset (e.g. an instance that ZREM'd then died before the
+    // flip) is an orphan — the same two-pass suspectedAt reclaim as an orphaned queued record applies.
+    it('reclaims a delayed record missing from the zset in two passes', async () => {
+      const m = new RedisJM(redis, 'test-group', { heartbeatInterval: 1000, roundsToStale: 2, keepFinishedInterval: 60000, logger: false })
+      const jobId = 'dorph#r1'
+      await redis.sadd('redisjm:test-group:locks', jobId)
+      await redis.hset('redisjm:test-group:log', jobId, JSON.stringify({
+        jobId, jobName: 'dorph', runId: 'r1', inputs: null, targetGroup: 'test-group',
+        status: 'delayed', progress: 0, readyAt: Date.now(),
+      }))
+
+      // Pass 1: suspect stamped, lock kept.
+      expect((await m.performMaintenance()).staleCount).toBe(0)
+      let rec = JSON.parse((await redis.hget('redisjm:test-group:log', jobId))!) as JobLogRecord
+      expect(rec.status).toBe('delayed')
+      expect(rec.suspectedAt).toBeGreaterThan(0)
+      expect(await m.isQueued(jobId)).toBe(true)
+
+      // Age the suspicion past the stale threshold → reclaimed on the next pass.
+      rec.suspectedAt = Date.now() - 3000
+      await redis.hset('redisjm:test-group:log', jobId, JSON.stringify(rec))
+      expect((await m.performMaintenance()).staleCount).toBe(1)
+      rec = JSON.parse((await redis.hget('redisjm:test-group:log', jobId))!) as JobLogRecord
+      expect(rec.status).toBe('stale')
+      expect(rec.suspectedAt).toBeUndefined()
+      expect(await m.isQueued(jobId)).toBe(false)
+    })
+  })
+
+  describe('unqueue & delayed', () => {
+    // WHY: unqueue must clear the delayed-set entry too (a delayed run lives there, not on the queue
+    // list), leaving zset entry, lock, and record all gone.
+    it('removes a delayed run entirely', async () => {
+      const m = new RedisJM(redis, 'test-group', { keepFinishedInterval: 60000, maintenanceInterval: 0, logger: false })
+      const job = m.createJob({ jobName: 'u' }, vi.fn())
+      await m.queue(job, 'r1', 'x', { delay: 5000 })
+      expect(await redis.zscore('redisjm:test-group:delayed', 'u#r1')).not.toBeNull()
+
+      await m.unqueue('u#r1')
+      expect(await redis.zscore('redisjm:test-group:delayed', 'u#r1')).toBeNull()
+      expect(await m.isQueued('u#r1')).toBe(false)
+      expect(await redis.hget('redisjm:test-group:log', 'u#r1')).toBeNull()
+    })
+  })
+
+  describe('promotion race', () => {
+    afterEach(() => { vi.useRealTimers() })
+
+    // WHY: two instances may sweep the same due entry; only the one whose ZREM returns 1 owns the
+    // promotion. The loser (ZREM → 0) must skip without RPUSHing (no double-promote) and touch nothing.
+    it('a ZREM race loser does not RPUSH the entry', async () => {
+      vi.useFakeTimers()
+      const base = 1_700_000_000_000
+      vi.setSystemTime(base)
+      const m = new RedisJM(redis, 'test-group', { keepFinishedInterval: 60000, maintenanceInterval: 0, logger: false })
+      const job = m.createJob({ jobName: 'race' }, vi.fn())
+      await m.queue(job, 'r1', 'x', { delay: 1000 })
+
+      // Due now, but a racing instance already claimed it: force this ZREM to report 0 (loser).
+      vi.setSystemTime(base + 2000)
+      ;(redis.zrem as any).mockResolvedValueOnce(0)
+
+      expect(await m.popAndExecute()).toBe(false) // lost the race → nothing promoted, queue empty
+      const rpushed = (redis.rpush as any).mock.calls.filter(([, v]: any[]) => v === 'race#r1').length
+      expect(rpushed).toBe(0)
+      const rec = JSON.parse((await redis.hget('redisjm:test-group:log', 'race#r1'))!) as JobLogRecord
+      expect(rec.status).toBe('delayed') // the winner owns the flip; this instance touched nothing
+    })
+  })
 })

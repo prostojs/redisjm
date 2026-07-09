@@ -10,6 +10,7 @@ import type {
   JobFunction,
   JobHooks,
   JobMetadata,
+  QueueOptions,
 } from './types'
 
 /**
@@ -126,19 +127,41 @@ export class Job<TInputs = unknown, TAttrs extends { [K in keyof TAttrs]: JobAtt
    * @param runId - Unique identifier for this run (duplicates are rejected)
    * @param inputs - The job inputs to store and pass at execution time
    * @param manager - Optional RedisJM instance (overrides the default)
+   * @param options - Optional queue options (e.g. `delay` to stage the run on the delayed set)
    * @returns `true` if queued, `false` if already locked
    *
    * @example
    * ```ts
    * const queued = await job.queue('order-123', { orderId: '123' })
+   * await job.queue('order-456', { orderId: '456' }, undefined, { delay: 5000 })
    * ```
    */
-  async queue(runId: string, inputs: TInputs, manager?: RedisJM): Promise<boolean> {
+  async queue(runId: string, inputs: TInputs, manager?: RedisJM, options?: QueueOptions): Promise<boolean> {
     const mgr = manager ?? this.defaultManager
     if (!mgr) {
       throw new Error('No RedisJM instance provided and no default manager set')
     }
-    return mgr.queue(this as Job<any, any>, runId, inputs)
+    return mgr.queue(this as Job<any, any>, runId, inputs, options)
+  }
+
+  /**
+   * Resolves the total number of attempts (including the first) for this job's runs. Floors and
+   * clamps to a minimum of 1, so `attempts` values below 1 or non-integers never yield zero/partial
+   * attempts. Default (`attempts` unset) is 1 — no retries.
+   */
+  getAttempts(): number {
+    return Math.max(1, Math.floor(this.metadata.attempts ?? 1))
+  }
+
+  /**
+   * Resolves the backoff delay (ms) before the retry that follows the given 1-based failed `attempt`.
+   * Accepts a fixed number or a function of the failed attempt; negative / non-finite results are
+   * clamped to 0 (immediate re-queue via the delayed set). Default (`backoff` unset) is 0.
+   */
+  getBackoffMs(attempt: number): number {
+    const raw = typeof this.metadata.backoff === 'function' ? this.metadata.backoff(attempt) : this.metadata.backoff
+    if (raw === undefined || !Number.isFinite(raw) || raw < 0) return 0
+    return raw
   }
 
   /**

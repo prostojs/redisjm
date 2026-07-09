@@ -1,11 +1,13 @@
 import { vi } from 'vitest'
 import type Redis from 'ioredis'
 
-export function createMockRedis(): Redis & { _dump: () => { store: Map<string, string>; sets: Map<string, Set<string>>; hashes: Map<string, Map<string, string>>; lists: Map<string, string[]> } } {
+export function createMockRedis(): Redis & { _dump: () => { store: Map<string, string>; sets: Map<string, Set<string>>; hashes: Map<string, Map<string, string>>; lists: Map<string, string[]>; zsets: Map<string, Map<string, number>> } } {
   const store = new Map<string, string>()
   const sets = new Map<string, Set<string>>()
   const hashes = new Map<string, Map<string, string>>()
   const lists = new Map<string, string[]>()
+  // Sorted sets: key → Map<member, score>. Ordering is derived on read (zrangebyscore) by score asc.
+  const zsets = new Map<string, Map<string, number>>()
 
   return {
     // String commands
@@ -142,6 +144,52 @@ export function createMockRedis(): Redis & { _dump: () => { store: Map<string, s
       return ['0', flat]
     }),
 
-    _dump: () => ({ store, sets, hashes, lists }),
+    // Sorted-set commands (subset used by the delayed set). Scores are stored as numbers; zscore
+    // returns a string|null to mirror ioredis's reply type.
+    zadd: vi.fn(async (key: string, score: number, member: string) => {
+      if (!zsets.has(key)) zsets.set(key, new Map())
+      const z = zsets.get(key)!
+      const isNew = !z.has(member)
+      z.set(member, Number(score))
+      return isNew ? 1 : 0
+    }),
+    zrem: vi.fn(async (key: string, member: string) => {
+      const z = zsets.get(key)
+      if (!z || !z.has(member)) return 0
+      z.delete(member)
+      return 1
+    }),
+    zscore: vi.fn(async (key: string, member: string) => {
+      const z = zsets.get(key)
+      const score = z?.get(member)
+      return score === undefined ? null : String(score)
+    }),
+    zcard: vi.fn(async (key: string) => {
+      const z = zsets.get(key)
+      return z ? z.size : 0
+    }),
+    // ioredis call shape: zrangebyscore(key, min, max, 'LIMIT', offset, count). Supports '-inf' min
+    // and a numeric max; returns members whose score is in [min, max], sorted by score ascending,
+    // sliced by the LIMIT offset/count. Only the shapes redisjm uses are implemented.
+    zrangebyscore: vi.fn(async (key: string, min: any, max: any, ...args: any[]) => {
+      const z = zsets.get(key)
+      if (!z) return []
+      const minScore = min === '-inf' ? Number.NEGATIVE_INFINITY : Number(min)
+      const maxScore = max === '+inf' ? Number.POSITIVE_INFINITY : Number(max)
+      let members = [...z.entries()]
+        .filter(([, score]) => score >= minScore && score <= maxScore)
+        .sort((a, b) => a[1] - b[1])
+        .map(([member]) => member)
+      // Optional LIMIT offset count.
+      const limitIdx = args.findIndex((a) => typeof a === 'string' && a.toUpperCase() === 'LIMIT')
+      if (limitIdx !== -1) {
+        const offset = Number(args[limitIdx + 1])
+        const count = Number(args[limitIdx + 2])
+        members = members.slice(offset, offset + count)
+      }
+      return members
+    }),
+
+    _dump: () => ({ store, sets, hashes, lists, zsets }),
   } as unknown as Redis & { _dump: () => any }
 }

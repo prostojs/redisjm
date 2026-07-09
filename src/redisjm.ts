@@ -11,8 +11,10 @@ import type {
   JobFunction,
   JobLogRecord,
   JobMetadata,
+  JobRetryEventPayload,
   JobUpdateEventPayload,
   MaintenanceResult,
+  QueueOptions,
   RedisJMHooks,
   RedisJMLogger,
   RedisJMOptions,
@@ -90,6 +92,8 @@ export class RedisJM extends Hookable<RedisJMHooks> {
   private pollCursor = 0
   /** Lazy `LMPOP` capability flag: `undefined` = not yet probed, `false` = fall back to sequential `LPOP`. */
   private lmpopSupported: boolean | undefined
+  /** Epoch ms of the last delayed-set promotion sweep; rate-limits `promoteDueDelayed` (see there). */
+  private lastPromotionCheck = 0
 
   /**
    * @param redis - An ioredis client instance
@@ -145,26 +149,29 @@ export class RedisJM extends Hookable<RedisJMHooks> {
 
   /**
    * Adds a job run to the end of the queue. Returns `true` if queued, `false` if already locked.
+   * Pass `options.delay` (ms) to stage the run on the delayed set instead of the live queue.
    *
    * @example
    * ```ts
    * const success = await manager.queue(job, 'order-123', { orderId: '123' })
+   * await manager.queue(job, 'order-456', { orderId: '456' }, { delay: 5000 })
    * ```
    */
-  async queue<TInputs>(job: Job<TInputs, any>, runId: string, inputs: TInputs): Promise<boolean> {
-    return this.enqueue(job, runId, inputs, 'rpush')
+  async queue<TInputs>(job: Job<TInputs, any>, runId: string, inputs: TInputs, options?: QueueOptions): Promise<boolean> {
+    return this.enqueue(job, runId, inputs, 'rpush', options)
   }
 
   /**
    * Adds a job run to the front of the queue (priority insert). Returns `true` if queued, `false` if already locked.
+   * A priority insert cannot be delayed — passing `options.delay > 0` throws a TypeError.
    *
    * @example
    * ```ts
    * await manager.queueFirst(job, 'urgent-order', { orderId: '456' })
    * ```
    */
-  async queueFirst<TInputs>(job: Job<TInputs, any>, runId: string, inputs: TInputs): Promise<boolean> {
-    return this.enqueue(job, runId, inputs, 'lpush')
+  async queueFirst<TInputs>(job: Job<TInputs, any>, runId: string, inputs: TInputs, options?: QueueOptions): Promise<boolean> {
+    return this.enqueue(job, runId, inputs, 'lpush', options)
   }
 
   /**
@@ -219,6 +226,9 @@ export class RedisJM extends Hookable<RedisJMHooks> {
     // is already gone, fall back to the default key (the locks/log removals below are group-wide).
     const record = await this.readRecord(jobId)
     await this.redis.lrem(this.getQueueKey(record?.lane), 1, jobId)
+    // Also drop any delayed-set entry for this jobId (a `delayed`/retry-scheduled run lives there,
+    // not on the queue list); harmless no-op for a non-delayed run.
+    await this.redis.zrem(this.getDelayedKey(), jobId)
     await this.redis.srem(this.getLocksKey(), jobId)
     await this.redis.hdel(this.getLogKey(), jobId)
     // Also clear any pending orphan-suspicion for this jobId: a manually removed run must not leave
@@ -328,15 +338,50 @@ export class RedisJM extends Hookable<RedisJMHooks> {
       if (!this.shouldHandle(payload)) return
       const jobId = getJobId(payload.runId)
       const now = Date.now()
-      // Same fencing as `onFinish`: a superseded execution's error must not clobber the successor's
-      // record or release its lock.
+      const maxAttempts = job.getAttempts()
+      // The mutator is synchronous, so compute the retry-vs-final decision inside it (setting the
+      // record fields accordingly) and capture the outcome in this closure; then act on it after the
+      // write. `scheduledRetry` set ⇒ we chose to retry.
+      let scheduledRetry: { readyAt: number; attempt: number } | undefined
       const result = await this.updateLog(jobId, (record) => {
+        // Same fencing as `onFinish`: a superseded execution's error must not clobber the successor's
+        // record, schedule a phantom retry, or release its lock.
         if (record.executionId !== payload.executionId) return false
-        record.status = 'error'
+        // The 1-based attempt that just failed (stamped by onStart's claim).
+        const attempt = record.attempt ?? 1
+        // Last error kept for observability in BOTH branches.
         record.error = payload.error.message
-        record.finishedAt = now
+        if (attempt < maxAttempts) {
+          // RETRY: stage the run back on the delayed set and KEEP the lock (do not srem) — the held
+          // lock is what prevents a duplicate enqueue of the same runId while the backoff elapses.
+          // `finishedAt` stays unset (the run isn't terminal). Backoff 0 still routes through the
+          // delayed set (readyAt = now) so promotion has a single code path; the next sweep picks it
+          // up within ~1s.
+          const readyAt = now + job.getBackoffMs(attempt)
+          record.status = 'delayed'
+          record.readyAt = readyAt
+          scheduledRetry = { readyAt, attempt }
+        } else {
+          // FINAL failure: terminal error (lock released + `error` hook fired below).
+          record.status = 'error'
+          record.finishedAt = now
+        }
       })
+      // Zombie fencing: the record's owner changed under us — touch nothing, fire nothing.
       if (result === 'rejected') return
+      if (result === 'written' && scheduledRetry) {
+        // Write the zset entry BEFORE the retry hook (mirrors enqueue: the zset entry is what makes
+        // the run promotable). Do NOT release the lock and do NOT fire the manager-level `error` hook
+        // — the run isn't finally failed, so `retry` fires instead.
+        await this.redis.zadd(this.getDelayedKey(), scheduledRetry.readyAt, jobId)
+        await this.callHook('retry', {
+          ...(payload as unknown as JobErrorEventPayload),
+          attempt: scheduledRetry.attempt,
+          nextAttemptAt: scheduledRetry.readyAt,
+        } as JobRetryEventPayload)
+        return
+      }
+      // Final failure (or a 'missing' record — unqueued mid-run): existing behavior exactly.
       await this.releaseLockAndMaybeDropLog(jobId)
       await this.callHook('error', payload as unknown as JobErrorEventPayload)
     }
@@ -413,6 +458,10 @@ export class RedisJM extends Hookable<RedisJMHooks> {
    * ```
    */
   async popAndExecute(): Promise<boolean> {
+    // Promote any due delayed runs onto their lane queues before popping, so a run whose delay just
+    // elapsed becomes poppable on this same pass.
+    await this.promoteDueDelayed()
+
     // Poll the union of this instance's subscribed lanes (`__maintenance` first, then work lanes
     // ordered by strategy) atomically via `LMPOP`, with a sequential-`LPOP` fallback for Redis < 7.
     const keys = this.getSubscribedQueueKeys()
@@ -578,6 +627,57 @@ export class RedisJM extends Hookable<RedisJMHooks> {
       if (v) return v
     }
     return null
+  }
+
+  /**
+   * Promotes delayed runs whose `readyAt` has elapsed onto their lane queues. For each due id: `ZREM`
+   * first — a reply of 1 is the atomic claim (a racing instance may sweep the same entry; the loser
+   * skips) — then flip the record `delayed`→`queued` (clearing `readyAt`) and `RPUSH` it onto its
+   * persisted lane. A won ZREM whose record is missing/rejected is garbage: log it and release the lock.
+   *
+   * Rate-limited to at most once per 1000 ms via `lastPromotionCheck`: `popAndExecute` calls this on
+   * every pop, and a busy queue re-polls immediately (interval 0), so without the cap each pop would
+   * pay a ZRANGEBYSCORE. A delayed run still becomes poppable within ~1s of its `readyAt`, well inside
+   * the coarse delay/backoff granularity this targets.
+   */
+  private async promoteDueDelayed(): Promise<void> {
+    const now = Date.now()
+    if (now - this.lastPromotionCheck < 1000) return
+    this.lastPromotionCheck = now
+
+    const delayedKey = this.getDelayedKey()
+    // Bounded batch: each due id costs ~3 serial round trips (ZREM → updateLog → RPUSH), so cap the
+    // sweep at 8 ids/pass to keep the promote step (awaited on the pop hot path) cheap. Combined with
+    // the 1000 ms rate-limit this promotes ~8 delayed runs/sec/instance; anything still due is picked
+    // up on the next sweep. Ids are independent (distinct hash fields / lane lists, and Redis resolves
+    // the ZREM claim race per-member), so promote them concurrently — each id's own ZREM→flip→RPUSH
+    // ordering is preserved within its chain.
+    const dueIds = await this.redis.zrangebyscore(delayedKey, '-inf', now, 'LIMIT', 0, 8)
+    await Promise.all(dueIds.map(async (jobId) => {
+      // The ZREM is the claim. Crash window: an instance that ZREM'd then died before the flip/RPUSH
+      // leaves the record `delayed` (or `queued`) but absent from the zset — maintenance's delayed
+      // branch reclaims it via the same two-pass suspectedAt flow as an orphaned queued record.
+      if ((await this.redis.zrem(delayedKey, jobId)) !== 1) return
+
+      // Capture the lane inside the (synchronous) mutator so the RPUSH targets the record's own lane.
+      let lane: string | undefined
+      const result = await this.updateLog(jobId, (record) => {
+        // Only a still-`delayed` record is promotable; anything else means the won claim points at a
+        // record that no longer owns this delayed slot.
+        if (record.status !== 'delayed') return false
+        record.status = 'queued'
+        delete record.readyAt
+        lane = record.lane
+      })
+      if (result === 'written') {
+        await this.redis.rpush(this.getQueueKey(lane), jobId)
+      } else {
+        // Missing or rejected after a won ZREM: a delayed entry without a healthy `delayed` record is
+        // garbage. Release the lock so the runId isn't blocked forever.
+        this.logger(`delayed job "${jobId}" had no promotable record; releasing lock`)
+        await this.redis.srem(this.getLocksKey(), jobId)
+      }
+    }))
   }
 
   /**
@@ -805,9 +905,15 @@ export class RedisJM extends Hookable<RedisJMHooks> {
           await this.redis.srem(locksKey, jobId)
           staleCount++
         }
-      } else if (record.status === 'queued') {
-        const queuePosition = await this.redis.lpos(this.getQueueKey(record.lane), jobId)
-        if (queuePosition === null) {
+      } else if (record.status === 'queued' || record.status === 'delayed') {
+        // Liveness proof differs by status: a `queued` record must still be on its lane queue; a
+        // `delayed` record must still be on the delayed zset. An overdue-but-present delayed entry is
+        // healthy — promotion owns due entries, so maintenance must NOT stale it. The two-pass
+        // suspectedAt reclaim below is identical for both (only the presence check above differs).
+        const present = record.status === 'queued'
+          ? (await this.redis.lpos(this.getQueueKey(record.lane), jobId)) !== null
+          : (await this.redis.zscore(this.getDelayedKey(), jobId)) !== null
+        if (!present) {
           if (record.suspectedAt === undefined) {
             record.suspectedAt = now
             await this.redis.hset(logKey, jobId, JSON.stringify(record))
@@ -980,10 +1086,23 @@ export class RedisJM extends Hookable<RedisJMHooks> {
     runId: string,
     inputs: TInputs,
     pushCmd: 'rpush' | 'lpush',
+    options?: QueueOptions,
   ): Promise<boolean> {
     // Authoritative lane validation: the producer path never goes through registerJob, so validate
     // here (before taking the lock) as well as at registration.
     this.validateLane(job.getLane(), job.getName())
+
+    const delay = options?.delay
+    if (delay !== undefined) {
+      if (!Number.isFinite(delay) || delay < 0) {
+        throw new TypeError(`queue(options.delay): delay must be a finite number >= 0, got ${String(delay)}`)
+      }
+      // A priority insert stages the run at the FRONT of the live queue; there is no "front" of a
+      // time-ordered delayed set, so combining the two is contradictory — reject it.
+      if (delay > 0 && pushCmd === 'lpush') {
+        throw new TypeError('queueFirst() cannot be combined with a delay — a priority insert cannot be delayed')
+      }
+    }
 
     const jobId = job.getJobId(runId)
     const locksKey = this.getLocksKey()
@@ -991,6 +1110,7 @@ export class RedisJM extends Hookable<RedisJMHooks> {
     const added = await this.redis.sadd(locksKey, jobId)
     if (added === 0) return false
 
+    const isDelayed = delay !== undefined && delay > 0
     try {
       const record: JobLogRecord<TInputs> = {
         jobId,
@@ -1001,19 +1121,29 @@ export class RedisJM extends Hookable<RedisJMHooks> {
         // `undefined` for the default lane; JSON.stringify omits it, so a default-lane record
         // serializes byte-for-byte as in 0.0.3 (no `lane` key).
         lane: job.getLane(),
-        status: 'queued',
+        // A delayed record holds the lock (dedupe still applies while waiting), like `queued`.
+        status: isDelayed ? 'delayed' : 'queued',
         progress: 0,
       }
-      // Write the log record BEFORE the queue entry: the queue entry is what makes the
-      // job poppable, so if it landed first a concurrent poller could pop it before the
-      // record exists and drop it as "no log record". (A crash between these writes
-      // instead leaves a `queued` record absent from the queue — reclaimed by maintenance.)
+      if (isDelayed) {
+        record.readyAt = Date.now() + delay!
+      }
+      // Write the log record BEFORE the queue/delayed entry: that entry is what makes the job
+      // promotable/poppable, so if it landed first a concurrent poller could act on it before the
+      // record exists. (A crash between these writes instead leaves a `queued`/`delayed` record
+      // absent from its structure — reclaimed by maintenance.)
       await this.redis.hset(this.getLogKey(), jobId, JSON.stringify(record))
-      await this.redis[pushCmd](this.getQueueKey(job.getLane()), jobId)
+      if (isDelayed) {
+        await this.redis.zadd(this.getDelayedKey(), record.readyAt!, jobId)
+      } else {
+        await this.redis[pushCmd](this.getQueueKey(job.getLane()), jobId)
+      }
       return true
     } catch (err) {
       await this.redis.srem(locksKey, jobId).catch(() => {})
       await this.redis.hdel(this.getLogKey(), jobId).catch(() => {})
+      // Roll back a possibly-written delayed entry too (mirrors the queue-list rollback).
+      if (isDelayed) await this.redis.zrem(this.getDelayedKey(), jobId).catch(() => {})
       throw err
     }
   }
@@ -1080,5 +1210,13 @@ export class RedisJM extends Hookable<RedisJMHooks> {
 
   private getLogKey(): string {
     return `redisjm:${this.targetGroup}:log`
+  }
+
+  /**
+   * Sorted-set key holding delayed/scheduled runs: member = jobId, score = epoch-ms when the run
+   * becomes ready. Group-wide (not per-lane); the record's persisted `lane` routes it when promoted.
+   */
+  private getDelayedKey(): string {
+    return `redisjm:${this.targetGroup}:delayed`
   }
 }

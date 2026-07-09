@@ -24,6 +24,26 @@ describe('Job', () => {
       expect(job.getJobId('run1')).toBe('testJob#run1')
       expect(job.getJobId('2024-01-01')).toBe('testJob#2024-01-01')
     })
+
+    // WHY: getAttempts defaults to 1 (no retries) and floors/clamps sub-1 or non-integer values so a
+    // bad `attempts` config can never yield zero or partial attempts.
+    it('getAttempts defaults to 1 and floors/clamps invalid values', () => {
+      expect(new Job(metadata, vi.fn()).getAttempts()).toBe(1)
+      expect(new Job({ jobName: 'a', attempts: 3 }, vi.fn()).getAttempts()).toBe(3)
+      expect(new Job({ jobName: 'a', attempts: 2.9 }, vi.fn()).getAttempts()).toBe(2)
+      expect(new Job({ jobName: 'a', attempts: 0 }, vi.fn()).getAttempts()).toBe(1)
+      expect(new Job({ jobName: 'a', attempts: -5 }, vi.fn()).getAttempts()).toBe(1)
+    })
+
+    // WHY: getBackoffMs resolves a number or a function of the failed attempt and clamps
+    // negative/non-finite results to 0 (immediate re-queue). Default (unset) is 0.
+    it('getBackoffMs resolves fixed/functional backoff and clamps to 0', () => {
+      expect(new Job(metadata, vi.fn()).getBackoffMs(1)).toBe(0)
+      expect(new Job({ jobName: 'a', backoff: 1000 }, vi.fn()).getBackoffMs(1)).toBe(1000)
+      expect(new Job({ jobName: 'a', backoff: (n) => n * 100 }, vi.fn()).getBackoffMs(3)).toBe(300)
+      expect(new Job({ jobName: 'a', backoff: -500 }, vi.fn()).getBackoffMs(1)).toBe(0)
+      expect(new Job({ jobName: 'a', backoff: () => Number.NaN }, vi.fn()).getBackoffMs(1)).toBe(0)
+    })
   })
 
   describe('execute', () => {
@@ -308,7 +328,18 @@ describe('Job', () => {
       const job = new Job<string>(metadata, vi.fn(), mockManager)
       const result = await job.queue('run1', 'input1')
       expect(result).toBe(true)
-      expect(mockManager.queue).toHaveBeenCalledWith(job, 'run1', 'input1')
+      // `options` is passed through (undefined here); the manager forwards it to enqueue.
+      expect(mockManager.queue).toHaveBeenCalledWith(job, 'run1', 'input1', undefined)
+    })
+
+    it('should pass queue options (delay) through to the manager', async () => {
+      const mockManager = {
+        queue: vi.fn().mockResolvedValue(true),
+        getTargetGroup: () => 'group1',
+      } as unknown as RedisJM
+      const job = new Job<string>(metadata, vi.fn(), mockManager)
+      await job.queue('run1', 'input1', undefined, { delay: 5000 })
+      expect(mockManager.queue).toHaveBeenCalledWith(job, 'run1', 'input1', { delay: 5000 })
     })
 
     it('should use provided manager over default', async () => {
