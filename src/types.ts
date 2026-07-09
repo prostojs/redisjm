@@ -17,12 +17,20 @@ export type RedisJMLogger = (message: string, error?: Error) => void
 /** Possible statuses of a job in the lifecycle. */
 export type JobStatus = 'queued' | 'running' | 'finished' | 'error' | 'stale'
 
+/** Strategy for ordering subscribed lanes when polling with `LMPOP`. */
+export type LaneStrategy = 'roundRobin' | 'priority'
+
 /** Metadata associated with a job definition. */
 export interface JobMetadata {
   /** Unique job name used as the key prefix in job IDs (`"jobName#runId"`) */
   jobName: string
   /** Optional human-readable description */
   description?: string
+  /**
+   * Optional lane (named sub-queue within the group). Omitted → default lane (legacy queue key);
+   * a worker services only the lanes of its registered jobs.
+   */
+  lane?: string
 }
 
 /** Optional configuration for `RedisJM`. All fields have defaults. */
@@ -49,6 +57,17 @@ export interface RedisJMOptions {
    */
   unknownJobRequeueLimit?: number
   /**
+   * How `LMPOP` orders subscribed lanes: `roundRobin` (default) rotates the work-lane order each
+   * poll to avoid starvation; `priority` uses the `lanePriority` order.
+   */
+  laneStrategy?: LaneStrategy
+  /**
+   * Explicit high→low lane order used when `laneStrategy: 'priority'`; lanes absent from the list
+   * follow in registration order. The reserved `__maintenance` lane is always polled first
+   * regardless.
+   */
+  lanePriority?: string[]
+  /**
    * Sink for operational errors that are otherwise invisible — handler throws,
    * unknown/dropped jobs, and poll-loop failures. Defaults to a `console.error`
    * logger that includes the error stack. Pass `false` to silence default logging
@@ -65,6 +84,8 @@ export interface ResolvedRedisJMOptions {
   keepFinishedInterval: number
   maintenanceInterval: number
   unknownJobRequeueLimit: number
+  laneStrategy: LaneStrategy
+  lanePriority: string[]
 }
 
 /** A full job state record stored in the Redis log hash. */
@@ -76,6 +97,11 @@ export interface JobLogRecord<TInputs = unknown, TAttrs extends { [K in keyof TA
   /** The inputs that were passed when the job was queued */
   inputs: TInputs
   targetGroup: string
+  /**
+   * The lane the run was enqueued on; persisted so off-registry ops (maintenance, unqueue) resolve
+   * the correct lane queue from the record.
+   */
+  lane?: string
   status: JobStatus
   /** Epoch ms when execution started */
   startedAt?: number

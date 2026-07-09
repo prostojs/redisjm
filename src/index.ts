@@ -14,6 +14,7 @@ export type {
   JobMetadata,
   JobStatus,
   JobUpdateEventPayload,
+  LaneStrategy,
   MaintenanceResult,
   RedisJMHooks,
   RedisJMLogger,

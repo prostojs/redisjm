@@ -138,6 +138,11 @@ export class Job<TInputs = unknown, TAttrs extends { [K in keyof TAttrs]: JobAtt
     return this.metadata.jobName
   }
 
+  /** Returns the job's lane, or `undefined` for the default lane. */
+  getLane(): string | undefined {
+    return this.metadata.lane
+  }
+
   /** Sets the default RedisJM instance used by `queue()` when no manager is explicitly provided. */
   setDefaultManager(manager: RedisJM): void {
     this.defaultManager = manager

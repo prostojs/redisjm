@@ -28,6 +28,8 @@ describe('RedisJM', () => {
         keepFinishedInterval: 0,
         maintenanceInterval: 10000, // heartbeatInterval * roundsToStale
         unknownJobRequeueLimit: 5,
+        laneStrategy: 'roundRobin',
+        lanePriority: [],
       })
     })
 
@@ -39,12 +41,20 @@ describe('RedisJM', () => {
         keepFinishedInterval: 60000,
         maintenanceInterval: 2000, // derived from custom heartbeatInterval
         unknownJobRequeueLimit: 5,
+        laneStrategy: 'roundRobin',
+        lanePriority: [],
       })
     })
 
     it('should accept explicit maintenanceInterval', () => {
       const m = new RedisJM(redis, 'g', { maintenanceInterval: 0 })
       expect(m.getOptions().maintenanceInterval).toBe(0)
+    })
+
+    it('should resolve custom lane options', () => {
+      const m = new RedisJM(redis, 'g', { laneStrategy: 'priority', lanePriority: ['a', 'b'] })
+      expect(m.getOptions().laneStrategy).toBe('priority')
+      expect(m.getOptions().lanePriority).toEqual(['a', 'b'])
     })
   })
 
@@ -166,6 +176,16 @@ describe('RedisJM', () => {
       const fn = vi.fn((_inputs: { count: number }, _ctx: JobContext) => {})
       const job = manager.createJob({ jobName: 'typed' }, fn)
       expect(job.getName()).toBe('typed')
+    })
+  })
+
+  describe('Job.getLane', () => {
+    it('should return the declared lane', () => {
+      expect(new Job({ jobName: 'x', lane: 'images' }, vi.fn()).getLane()).toBe('images')
+    })
+
+    it('should return undefined for a no-lane job', () => {
+      expect(new Job({ jobName: 'x' }, vi.fn()).getLane()).toBeUndefined()
     })
   })
 

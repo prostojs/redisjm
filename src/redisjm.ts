@@ -23,6 +23,8 @@ const DEFAULT_OPTIONS: Omit<ResolvedRedisJMOptions, 'maintenanceInterval'> = {
   roundsToStale: 2,
   keepFinishedInterval: 0,
   unknownJobRequeueLimit: 5,
+  laneStrategy: 'roundRobin',
+  lanePriority: [],
 }
 
 /** Default logger: writes to `console.error`, prefers the error stack when present. */
@@ -88,6 +90,8 @@ export class RedisJM extends Hookable<RedisJMHooks> {
       keepFinishedInterval: options?.keepFinishedInterval ?? DEFAULT_OPTIONS.keepFinishedInterval,
       maintenanceInterval: options?.maintenanceInterval ?? heartbeatInterval * roundsToStale,
       unknownJobRequeueLimit: options?.unknownJobRequeueLimit ?? DEFAULT_OPTIONS.unknownJobRequeueLimit,
+      laneStrategy: options?.laneStrategy ?? DEFAULT_OPTIONS.laneStrategy,
+      lanePriority: options?.lanePriority ?? DEFAULT_OPTIONS.lanePriority,
     }
     this.logger = options?.logger === false ? NOOP_LOGGER : (options?.logger ?? DEFAULT_LOGGER)
   }
