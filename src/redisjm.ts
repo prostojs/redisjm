@@ -177,9 +177,11 @@ export class RedisJM extends Hookable<RedisJMHooks> {
    * ```
    */
   async list(): Promise<JobLogRecord[]> {
-    const entries = await this.redis.hgetall(this.getLogKey())
+    // Incremental HSCAN (not a single blocking HGETALL) so a large log hash is read in bounded
+    // slices — matters once retention (`keepFinishedInterval > 0`) lets the hash grow.
+    const entries = await this.scanHash(this.getLogKey())
     const records: JobLogRecord[] = []
-    for (const [jobId, val] of Object.entries(entries)) {
+    for (const [jobId, val] of entries) {
       // A single corrupt/foreign record must not take down the whole listing.
       const record = this.parseRecord(val, jobId)
       if (record) records.push(record)
@@ -219,6 +221,9 @@ export class RedisJM extends Hookable<RedisJMHooks> {
     await this.redis.lrem(this.getQueueKey(record?.lane), 1, jobId)
     await this.redis.srem(this.getLocksKey(), jobId)
     await this.redis.hdel(this.getLogKey(), jobId)
+    // Also clear any pending orphan-suspicion for this jobId: a manually removed run must not leave
+    // a suspects entry that a later maintenance pass would act on (e.g. re-SREM a re-added lock).
+    await this.redis.hdel(this.getSuspectsKey(), jobId)
   }
 
   /**
@@ -456,9 +461,10 @@ export class RedisJM extends Hookable<RedisJMHooks> {
 
     const logRecord = this.parseRecord(logJson, jobId)
     if (!logRecord) {
-      // Corrupt/foreign record: release the lock and clean it up rather than throwing out of
-      // the poll loop (which would leave the lock orphaned).
-      await this.releaseLockAndMaybeDropLog(jobId)
+      // Corrupt/foreign record: drop the record and its lock unconditionally (garbage — retention
+      // doesn't apply) rather than routing through the retention-aware release, which is what keeps
+      // `keepFinishedInterval > 0` from hoarding it forever.
+      await this.dropGarbageRecordAndLock(jobId)
       return true
     }
     try {
@@ -749,9 +755,13 @@ export class RedisJM extends Hookable<RedisJMHooks> {
    *    list was popped by an instance that died before the `start` event fired. Detection is
    *    two-pass to avoid racing the normal pop→start window: the first scan stamps `suspectedAt`,
    *    a later scan reclaims the lock if the record is still orphaned past the stale threshold.
-   * 3. Removes finished/error/stale records older than `keepFinishedInterval`
+   * 3. Removes finished/error/stale records older than `keepFinishedInterval`, and deletes
+   *    unparseable/foreign records (garbage that retention would otherwise hoard forever).
+   * 4. Reclaims orphaned locks — a locks-set member with NO backing log record, which the
+   *    record-driven loop above can never see. Same two-pass suspicion as stage 2 (via a
+   *    `suspects` hash) so an in-flight enqueue isn't mistaken for a permanent orphan.
    *
-   * @returns Counts of stale and cleaned records
+   * @returns Counts of stale and cleaned records (orphaned locks count toward `staleCount`)
    *
    * @example
    * ```ts
@@ -761,18 +771,30 @@ export class RedisJM extends Hookable<RedisJMHooks> {
   async performMaintenance(): Promise<MaintenanceResult> {
     const logKey = this.getLogKey()
     const locksKey = this.getLocksKey()
-    const entries = await this.redis.hgetall(logKey)
+    const suspectsKey = this.getSuspectsKey()
+    // Incremental HSCAN over the log hash (bounded slices) rather than one blocking O(N) HGETALL.
+    const entries = await this.scanHash(logKey)
     const now = Date.now()
     let staleCount = 0
     let cleanedCount = 0
 
     const staleThreshold = this.getStaleThreshold()
 
-    for (const [jobId, json] of Object.entries(entries)) {
+    // `entries` (a Map keyed by jobId) doubles as the "has a backing log record this scan" lookup
+    // that stage 4 (below) uses to tell a lock that owns a record apart from a record-less orphan.
+    for (const [jobId, json] of entries) {
       // Defense-in-depth: one corrupt/foreign record must not abort the whole sweep and
       // stall stale-reclaim + cleanup for every other job in the group.
       const record = this.parseRecord(json, jobId)
-      if (!record) continue
+      if (!record) {
+        // Unparseable/foreign record. Previously this branch `continue`d, so under
+        // `keepFinishedInterval > 0` these accumulated in the hash forever. Drop it and its lock
+        // unconditionally (garbage — retention doesn't apply); the jobId came straight from the hash
+        // field, so releasing the matching lock is safe.
+        await this.dropGarbageRecordAndLock(jobId)
+        cleanedCount++
+        continue
+      }
 
       if (record.status === 'running') {
         const lastHeartbeat = record.heartbeat ?? record.startedAt ?? 0
@@ -809,6 +831,41 @@ export class RedisJM extends Hookable<RedisJMHooks> {
       }
     }
 
+    // Stage 4: orphaned-lock reclaim. A locks-set member with NO backing log record is invisible to
+    // the record-driven loop above — it's created when `enqueue` crashes between its SADD and HSET
+    // (or the rollback `.catch()` also fails): the runId stays locked forever (`queue()` returns
+    // false, `isQueued()` true) with no record and no queue entry. Detect it two-pass, because an
+    // enqueue mid-flight (SADD done, HSET a few ms later) is momentarily indistinguishable from a
+    // permanent orphan. NOTE ON STAGE TIMING: a record enqueued *between* the log scan above and the
+    // lock scan here would look orphaned — that transient false positive is exactly why detection is
+    // two-pass (pass 1 suspects, pass 2 exonerates once the record lands), never single-pass.
+    const lockedIds = await this.scanSet(locksKey)
+    const suspects = await this.scanHash(suspectsKey)
+    for (const member of lockedIds) {
+      if (entries.has(member)) continue // has a record — reachable above, not an orphan
+      const suspectedAt = suspects.get(member)
+      if (suspectedAt === undefined) {
+        // First sighting of a record-less lock: stamp when we first saw it and wait for a later pass.
+        await this.redis.hset(suspectsKey, member, String(now))
+      } else if (now - Number(suspectedAt) > staleThreshold) {
+        // Still record-less past the stale threshold — a real queued-side loss, not an in-flight
+        // enqueue. Release the lock and clear the suspicion. Counted as stale (same bucket as the
+        // orphaned-queued reclaim in stage 2).
+        await this.redis.srem(locksKey, member)
+        await this.redis.hdel(suspectsKey, member)
+        staleCount++
+      }
+    }
+
+    // Exonerate suspects that no longer apply: the enqueue completed (a log record now exists) or the
+    // lock was released elsewhere (unqueue / a concurrent reclaim). This is the second pass that makes
+    // the false-positive window safe — an enqueue caught mid-flight on pass 1 is cleared here on pass 2.
+    for (const [member] of suspects) {
+      if (entries.has(member) || !lockedIds.has(member)) {
+        await this.redis.hdel(suspectsKey, member)
+      }
+    }
+
     return { staleCount, cleanedCount }
   }
 
@@ -838,6 +895,18 @@ export class RedisJM extends Hookable<RedisJMHooks> {
     }
   }
 
+  /**
+   * Unconditionally drops a garbage record and its lock (SREM lock + HDEL record). Unlike
+   * `releaseLockAndMaybeDropLog`, retention never applies here: the record is unparseable/foreign
+   * garbage, so keeping it under `keepFinishedInterval > 0` would only hoard it forever. Shared by
+   * the corrupt-record branches in `popAndExecute` and `performMaintenance` so that decision lives
+   * in one spot.
+   */
+  private async dropGarbageRecordAndLock(jobId: string): Promise<void> {
+    await this.redis.srem(this.getLocksKey(), jobId)
+    await this.redis.hdel(this.getLogKey(), jobId)
+  }
+
   /** Milliseconds a `running` heartbeat may lapse before the job is considered stale. */
   private getStaleThreshold(): number {
     return this.options.heartbeatInterval * this.options.roundsToStale
@@ -848,12 +917,56 @@ export class RedisJM extends Hookable<RedisJMHooks> {
    * single bad entry can never throw out of a scan, a hook, or the poll loop.
    */
   private parseRecord(json: string, jobId: string): JobLogRecord | null {
+    let value: unknown
     try {
-      return JSON.parse(json) as JobLogRecord
+      value = JSON.parse(json)
     } catch {
       this.logger(`skipping unparseable log record "${jobId}"`)
       return null
     }
+    // Shape guard: valid JSON that isn't a record object — a foreign field holding `"42"`,
+    // `"true"`, `null`, or an array — would otherwise flow through `as JobLogRecord` as a record
+    // with every property `undefined`. Require a non-null object with a string `status` before
+    // trusting it; anything else is malformed and treated as garbage by the callers.
+    if (typeof value !== 'object' || value === null || typeof (value as JobLogRecord).status !== 'string') {
+      this.logger(`skipping malformed log record "${jobId}"`)
+      return null
+    }
+    return value as JobLogRecord
+  }
+
+  /**
+   * Incrementally reads a hash via `HSCAN` (COUNT 100) instead of one blocking O(N) `HGETALL`, so a
+   * large log hash is loaded in bounded slices. HSCAN can return the same field across iterations
+   * under concurrent writes, so results are deduped by field (last value wins).
+   */
+  private async scanHash(key: string): Promise<Map<string, string>> {
+    const byField = new Map<string, string>()
+    let cursor = '0'
+    do {
+      const [next, flat] = await this.redis.hscan(key, cursor, 'COUNT', 100)
+      // HSCAN replies as a flat array alternating field, value, field, value, …
+      for (let i = 0; i < flat.length; i += 2) {
+        byField.set(flat[i], flat[i + 1])
+      }
+      cursor = next
+    } while (cursor !== '0')
+    return byField
+  }
+
+  /**
+   * Incrementally reads a set via `SSCAN` (COUNT 100) instead of a single `SMEMBERS`. SSCAN may
+   * repeat a member across iterations under concurrent writes, so members are deduped.
+   */
+  private async scanSet(key: string): Promise<Set<string>> {
+    const members = new Set<string>()
+    let cursor = '0'
+    do {
+      const [next, batch] = await this.redis.sscan(key, cursor, 'COUNT', 100)
+      for (const m of batch) members.add(m)
+      cursor = next
+    } while (cursor !== '0')
+    return members
   }
 
   /** Fetches and parses a single log record by `jobId`; `null` if absent or unparseable. */
@@ -954,6 +1067,15 @@ export class RedisJM extends Hookable<RedisJMHooks> {
 
   private getLocksKey(): string {
     return `redisjm:${this.targetGroup}:locks`
+  }
+
+  /**
+   * Hash mapping jobId → epoch-ms when maintenance first saw its lock held with no backing log
+   * record. Backs the two-pass orphaned-lock reclaim in `performMaintenance` (stage 4), the same
+   * way `suspectedAt` on a record backs the orphaned-queued reclaim.
+   */
+  private getSuspectsKey(): string {
+    return `redisjm:${this.targetGroup}:suspects`
   }
 
   private getLogKey(): string {

@@ -217,8 +217,12 @@ export interface RedisJMHooks {
 
 /** Result returned by `RedisJM.performMaintenance()`. */
 export interface MaintenanceResult {
-  /** Number of running jobs marked as stale */
+  /**
+   * Number of jobs reclaimed as stale: running jobs whose heartbeat lapsed, orphaned `queued`
+   * records missing from the queue list, and orphaned locks with no backing log record (a lock
+   * left behind by an `enqueue` that crashed between its SADD and HSET) — all counted here.
+   */
   staleCount: number
-  /** Number of expired log records removed */
+  /** Number of log records removed: expired finished/error/stale records and unparseable garbage */
   cleanedCount: number
 }

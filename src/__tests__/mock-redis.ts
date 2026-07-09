@@ -41,6 +41,20 @@ export function createMockRedis(): Redis & { _dump: () => { store: Map<string, s
       const s = sets.get(key)
       return s?.has(member) ? 1 : 0
     }),
+    smembers: vi.fn(async (key: string) => {
+      const s = sets.get(key)
+      return s ? [...s] : []
+    }),
+    scard: vi.fn(async (key: string) => {
+      const s = sets.get(key)
+      return s ? s.size : 0
+    }),
+    // ioredis SSCAN reply shape: [cursor, members[]]. Emit everything in one iteration (cursor '0');
+    // the cursor-loop in scanSet still exercises its loop-exit path.
+    sscan: vi.fn(async (key: string, ..._args: any[]) => {
+      const s = sets.get(key)
+      return ['0', s ? [...s] : []]
+    }),
 
     // List commands
     rpush: vi.fn(async (key: string, value: string) => {
@@ -116,6 +130,16 @@ export function createMockRedis(): Redis & { _dump: () => { store: Map<string, s
     hexists: vi.fn(async (key: string, field: string) => {
       const hash = hashes.get(key)
       return hash?.has(field) ? 1 : 0
+    }),
+    // ioredis HSCAN reply shape: [cursor, flatArray] where flatArray alternates field, value.
+    // Emit everything in one iteration (cursor '0'); scanHash's cursor loop still exercises its exit.
+    hscan: vi.fn(async (key: string, ..._args: any[]) => {
+      const hash = hashes.get(key)
+      const flat: string[] = []
+      if (hash) {
+        for (const [f, v] of hash) flat.push(f, v)
+      }
+      return ['0', flat]
     }),
 
     _dump: () => ({ store, sets, hashes, lists }),

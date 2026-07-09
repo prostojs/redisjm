@@ -733,6 +733,126 @@ describe('RedisJM', () => {
     })
   })
 
+  describe('orphaned-lock reclaim & corrupt-record hygiene', () => {
+    // WHY: a lock left by an enqueue that crashed between SADD and HSET has no record and no queue
+    // entry, so record-driven maintenance never sees it — the runId is blocked forever. Two-pass
+    // reclaim must free it, and the user-visible proof is that queue() works again afterwards.
+    it('reclaims an orphaned lock in two passes and frees the runId', async () => {
+      const m = new RedisJM(redis, 'test-group', {
+        heartbeatInterval: 1000, roundsToStale: 2, keepFinishedInterval: 60000, logger: false,
+      })
+      const jobId = 'ghost#run1'
+      await redis.sadd('redisjm:test-group:locks', jobId) // lock with no record, no queue entry
+
+      // A fresh Job for this runId can't be queued while the orphan lock is held.
+      const job = new Job({ jobName: 'ghost' }, vi.fn())
+      expect(await m.queue(job, 'run1', null)).toBe(false)
+
+      // Pass 1: stamps a suspect, keeps the lock.
+      let result = await m.performMaintenance()
+      expect(result.staleCount).toBe(0)
+      expect(await redis.sismember('redisjm:test-group:locks', jobId)).toBe(1)
+      expect(Number(await redis.hget('redisjm:test-group:suspects', jobId))).toBeGreaterThan(0)
+
+      // Age the suspicion past the stale threshold (heartbeatInterval * roundsToStale = 2000ms).
+      await redis.hset('redisjm:test-group:suspects', jobId, String(Date.now() - 3000))
+
+      // Pass 2: releases the lock and clears the suspect, counted as stale.
+      result = await m.performMaintenance()
+      expect(result.staleCount).toBe(1)
+      expect(await redis.sismember('redisjm:test-group:locks', jobId)).toBe(0)
+      expect(await redis.hget('redisjm:test-group:suspects', jobId)).toBeNull()
+
+      // The actual fix: the runId is queueable again.
+      expect(await m.queue(job, 'run1', null)).toBe(true)
+    })
+
+    // WHY: an enqueue in flight (SADD done, HSET landing a few ms later) is momentarily
+    // indistinguishable from a permanent orphan. Once its record lands, pass 2 must exonerate the
+    // suspect and keep the lock — never reclaim a live run.
+    it('does not reclaim a lock once its log record lands (in-flight enqueue)', async () => {
+      const m = new RedisJM(redis, 'test-group', {
+        heartbeatInterval: 1000, roundsToStale: 2, keepFinishedInterval: 60000, logger: false,
+      })
+      const jobId = 'slow#run1'
+      await redis.sadd('redisjm:test-group:locks', jobId)
+      // A suspect already stamped and aged past the threshold on an earlier pass...
+      await redis.hset('redisjm:test-group:suspects', jobId, String(Date.now() - 3000))
+      // ...but the enqueue's HSET has since landed (record exists and is queued).
+      await redis.hset('redisjm:test-group:log', jobId, JSON.stringify({
+        jobId, jobName: 'slow', runId: 'run1', inputs: null,
+        targetGroup: 'test-group', status: 'queued', progress: 0,
+      }))
+      await redis.rpush('redisjm:test-group:queue', jobId)
+
+      const result = await m.performMaintenance()
+      expect(result.staleCount).toBe(0)
+      expect(await redis.sismember('redisjm:test-group:locks', jobId)).toBe(1) // lock kept
+      expect(await redis.hget('redisjm:test-group:suspects', jobId)).toBeNull() // suspicion cleared
+    })
+
+    // WHY: previously the unparseable-record branch only HDEL'd under keepFinishedInterval 0, and
+    // performMaintenance skipped it with `continue` — so under retention garbage accumulated forever.
+    it('cleans an unparseable record and its lock under retention', async () => {
+      const m = new RedisJM(redis, 'test-group', {
+        heartbeatInterval: 1000, roundsToStale: 2, keepFinishedInterval: 60000, logger: false,
+      })
+      const jobId = 'corrupt#run1'
+      await redis.hset('redisjm:test-group:log', jobId, 'not json{')
+      await redis.sadd('redisjm:test-group:locks', jobId)
+
+      const result = await m.performMaintenance()
+      expect(result.cleanedCount).toBe(1)
+      expect(await redis.hget('redisjm:test-group:log', jobId)).toBeNull()
+      expect(await redis.sismember('redisjm:test-group:locks', jobId)).toBe(0)
+    })
+
+    // WHY: valid JSON of the wrong shape (a bare `42`, `"true"`) parses fine but yields a record with
+    // every field undefined. The shape guard must reject it everywhere it's read — list(), pop, sweep.
+    it('treats valid-JSON-but-wrong-shape records as garbage across list, pop, and maintenance', async () => {
+      const m = new RedisJM(redis, 'test-group', { keepFinishedInterval: 60000, logger: false })
+
+      // list() skips a bare-number record.
+      await redis.hset('redisjm:test-group:log', 'foreign#run1', '42')
+      expect(await m.list()).toHaveLength(0)
+
+      // popAndExecute drops it without throwing.
+      const job = m.createJob({ jobName: 'foreign' }, vi.fn())
+      await redis.sadd('redisjm:test-group:locks', 'foreign#run1')
+      await redis.rpush('redisjm:test-group:queue', 'foreign#run1')
+      await expect(m.popAndExecute()).resolves.toBe(true)
+      expect(job).toBeDefined()
+      expect(await redis.hget('redisjm:test-group:log', 'foreign#run1')).toBeNull()
+      expect(await redis.sismember('redisjm:test-group:locks', 'foreign#run1')).toBe(0)
+
+      // maintenance cleans a fresh malformed record + lock.
+      await redis.hset('redisjm:test-group:log', 'foreign#run2', '"true"')
+      await redis.sadd('redisjm:test-group:locks', 'foreign#run2')
+      const result = await m.performMaintenance()
+      expect(result.cleanedCount).toBe(1)
+      expect(await redis.hget('redisjm:test-group:log', 'foreign#run2')).toBeNull()
+      expect(await redis.sismember('redisjm:test-group:locks', 'foreign#run2')).toBe(0)
+    })
+
+    // WHY: a manually removed run must not leave a pending suspects entry that a later maintenance
+    // pass would act on (e.g. re-SREM a lock re-added under the same runId).
+    it('unqueue clears a pending suspicion so maintenance reclaims nothing', async () => {
+      const m = new RedisJM(redis, 'test-group', {
+        heartbeatInterval: 1000, roundsToStale: 2, keepFinishedInterval: 60000, logger: false,
+      })
+      const jobId = 'manual#run1'
+      await redis.sadd('redisjm:test-group:locks', jobId)
+      await redis.hset('redisjm:test-group:suspects', jobId, String(Date.now() - 3000))
+
+      await m.unqueue(jobId)
+      expect(await redis.sismember('redisjm:test-group:locks', jobId)).toBe(0)
+      expect(await redis.hget('redisjm:test-group:suspects', jobId)).toBeNull()
+
+      const result = await m.performMaintenance()
+      expect(result.staleCount).toBe(0)
+    })
+  })
+
   describe('auto-maintenance via start()', () => {
     afterEach(() => {
       manager.stop()
