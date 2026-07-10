@@ -1966,6 +1966,130 @@ describe('RedisJM', () => {
       expect(record.status).toBe('finished')
       vi.useRealTimers()
     })
+
+    it('a pinned-then-recovered run resurrects: final progress/attrs land, lock re-established, finish is truthful', async () => {
+      // WHY (stale-then-recovered asymmetry): a handler pinned past the stale threshold gets
+      // staled by maintenance (lock released), then recovers and calls setProgress/setAttrs before
+      // returning. The updates used to be rejected (status 'stale') while the finish — fenced on
+      // executionId only — still landed, freezing progress at its last pre-stale value and dropping the
+      // final attrs. Fix A resurrects the run on its next write: it self-heals to 'running', its final
+      // progress/attrs land, its lock is re-established, and the record stops lying.
+      const m = new RedisJM(redis, 'test-group', { keepFinishedInterval: 60000, logger: false, maintenanceInterval: 0 })
+      let release!: () => void
+      const gate = new Promise<void>((r) => { release = r })
+      const job = m.createJob<string, { done?: boolean }>({ jobName: 'pin' }, vi.fn(async (_i, ctx) => {
+        await ctx.setProgress(0.5)
+        await gate                        // pinned here while maintenance stales the record
+        await ctx.setProgress(1)          // was rejected (status 'stale'); now resurrects + lands
+        await ctx.setAttrs({ done: true }) // was rejected; now lands
+      }))
+      const managerFinish = vi.fn()
+      m.hook('finish', managerFinish)
+
+      await m.queue(job, 'r1', 'x')
+      const run = m.popAndExecute() // claims (running + executionId), progresses to 0.5, blocks on gate
+      await new Promise((r) => setTimeout(r, 0))
+
+      const jobId = 'pin#r1'
+      // Maintenance stales the still-running (pinned) record and releases its lock, exactly as
+      // performMaintenance's running-stale branch would.
+      const staled = JSON.parse((await redis.hget('redisjm:test-group:log', jobId))!) as JobLogRecord
+      expect(staled.status).toBe('running')
+      expect(staled.progress).toBe(0.5)
+      staled.status = 'stale'
+      staled.finishedAt = Date.now()
+      await redis.hset('redisjm:test-group:log', jobId, JSON.stringify(staled))
+      await redis.srem('redisjm:test-group:locks', jobId)
+      expect(await m.isLocked(jobId)).toBe(false) // lock released by the stale
+
+      release()
+      await run
+
+      const record = JSON.parse((await redis.hget('redisjm:test-group:log', jobId))!) as JobLogRecord
+      expect(record.status).toBe('finished')       // the finish landed
+      expect(record.progress).toBe(1)              // resurrected update landed (was frozen at 0.5)
+      expect(record.attrs).toEqual({ done: true }) // final attrs landed (were dropped before)
+      expect(record.finishedAt).toBeDefined()
+      expect(managerFinish).toHaveBeenCalledTimes(1)
+      expect(await m.isLocked(jobId)).toBe(false)   // finish releases the (re-established) lock
+    })
+
+    it('a heartbeat from the owning execution resurrects a staled record and re-establishes its lock', async () => {
+      // WHY (stale-then-recovered asymmetry): a pinned-but-alive run staled by maintenance self-heals on its next heartbeat —
+      // flips 'stale' → 'running', clears finishedAt, refreshes the heartbeat, re-SADDs the released
+      // lock, and does NOT abort. (A mismatched executionId — a true successor — still aborts; covered
+      // by the heartbeat-guard test above.)
+      const m = new RedisJM(redis, 'test-group', { keepFinishedInterval: 60000, logger: false, maintenanceInterval: 0 })
+      const job = m.createJob({ jobName: 'hbres' }, vi.fn())
+      const jobId = 'hbres#r1'
+      const oldHeartbeat = Date.now() - 50000
+      // A staled record still owned by execution 'exec-1', lock released by maintenance.
+      await redis.hset('redisjm:test-group:log', jobId, JSON.stringify({
+        jobId, jobName: 'hbres', runId: 'r1', inputs: null,
+        targetGroup: 'test-group', status: 'stale', progress: 0.5,
+        executionId: 'exec-1', finishedAt: Date.now() - 50000, heartbeat: oldHeartbeat,
+      }))
+      const abort = vi.fn()
+
+      await job.callHook('heartbeat', {
+        job, targetGroup: 'test-group', runId: 'r1', inputs: null, executionId: 'exec-1', manager: m, abort,
+      })
+
+      const record = JSON.parse((await redis.hget('redisjm:test-group:log', jobId))!) as JobLogRecord
+      expect(record.status).toBe('running')          // resurrected
+      expect(record.finishedAt).toBeUndefined()       // maintenance's finishedAt cleared
+      expect(record.heartbeat).toBeGreaterThan(oldHeartbeat) // heartbeat refreshed
+      expect(await m.isLocked(jobId)).toBe(true)       // lock re-established
+      expect(abort).not.toHaveBeenCalled()             // alive → not aborted
+    })
+
+    it('a retry off a staled record re-establishes the lock and clears finishedAt (delayed invariant holds)', async () => {
+      // WHY (stale-then-recovered asymmetry, retry branch): a run staled by maintenance (lock released)
+      // that then throws a RETRYABLE error without first writing an update lands in the retry branch,
+      // which assumes the lock is still held ("KEEP the lock"). Without the self-heal the delayed
+      // record would sit UNLOCKED for the whole backoff window — a producer could re-enqueue and
+      // clobber it, swallowing the retry — and carry a stale finishedAt. The retry must re-SADD the
+      // lock and clear finishedAt, mirroring heartbeat/update.
+      const m = new RedisJM(redis, 'test-group', { keepFinishedInterval: 60000, logger: false, maintenanceInterval: 0 })
+      let release!: () => void
+      const gate = new Promise<void>((r) => { release = r })
+      // attempts: 2 so the first failure retries; a long backoff keeps it delayed for the assertions.
+      const job = m.createJob({ jobName: 'rs', attempts: 2, backoff: 10_000 }, vi.fn(async () => {
+        await gate                                // pinned; maintenance stales it here
+        throw new Error('boom after stale')       // throws with NO intervening update → retry branch
+      }))
+      const managerRetry = vi.fn()
+      const managerError = vi.fn()
+      m.hook('retry', managerRetry)
+      m.hook('error', managerError)
+
+      await m.queue(job, 'r1', 'x')
+      const run = m.popAndExecute() // claims (running + executionId), blocks on gate
+      await new Promise((r) => setTimeout(r, 0))
+
+      const jobId = 'rs#r1'
+      // Maintenance stales the still-running (pinned) record and releases its lock.
+      const staled = JSON.parse((await redis.hget('redisjm:test-group:log', jobId))!) as JobLogRecord
+      expect(staled.status).toBe('running')
+      staled.status = 'stale'
+      staled.finishedAt = Date.now()
+      await redis.hset('redisjm:test-group:log', jobId, JSON.stringify(staled))
+      await redis.srem('redisjm:test-group:locks', jobId)
+      expect(await m.isLocked(jobId)).toBe(false) // lock released by the stale
+
+      release()
+      await run // popAndExecute swallows the thrown handler error internally
+
+      const record = JSON.parse((await redis.hget('redisjm:test-group:log', jobId))!) as JobLogRecord
+      expect(record.status).toBe('delayed')        // scheduled for retry, not terminal
+      expect(record.finishedAt).toBeUndefined()     // stale finishedAt cleared (run isn't terminal)
+      expect(record.readyAt).toBeDefined()
+      expect(await m.isLocked(jobId)).toBe(true)     // lock re-established → delayed invariant restored
+      expect(await m.queue(job, 'r1', 'x2')).toBe(false) // dup enqueue blocked during backoff
+      expect(await redis.zscore('redisjm:test-group:delayed', jobId)).not.toBeNull()
+      expect(managerRetry).toHaveBeenCalledTimes(1)
+      expect(managerError).not.toHaveBeenCalled()    // a retry is not a final failure
+    })
   })
 
   describe('delayed enqueue & promotion', () => {

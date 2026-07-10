@@ -338,4 +338,118 @@ describe.skipIf(!REDIS_URL)('integration (real Redis)', () => {
     releaseGate()
     await running
   })
+
+  it('9. stale-then-recovered run self-heals: resurrects to running, re-locks, and finishes truthfully', async () => {
+    // WHY (stale-then-recovered asymmetry): a pinned handler is staled by a peer's maintenance
+    // (lock released), then recovers and writes again. Its updates used to be rejected (status 'stale')
+    // while its finish (fenced on executionId only) still landed — a record reading `finished` with
+    // frozen progress and dropped attrs. The fix resurrects the run on its next write.
+    const group = newGroup()
+    // Runner: heartbeatInterval large enough that its OWN heartbeat never fires in the test window, so
+    // recovery here is driven purely by the handler's post-stale setProgress/setAttrs (the onUpdate path).
+    const runner = newManager({ heartbeatInterval: 60_000, roundsToStale: 2, maintenanceInterval: 0 }, group)
+    // Maintainer on the same group: tiny intervals → staleThreshold = 100 * 2 = 200ms.
+    const maintainer = newManager({ heartbeatInterval: 100, roundsToStale: 2, maintenanceInterval: 0 }, group)
+
+    let releaseGate1!: () => void
+    let releaseGate2!: () => void
+    const gate1 = new Promise<void>((r) => { releaseGate1 = r })
+    const gate2 = new Promise<void>((r) => { releaseGate2 = r })
+    const job = runner.createJob({ jobName: 'recover' }, async (_i: Record<string, unknown>, ctx) => {
+      await ctx.setProgress(0.5)
+      await gate1                        // pinned here while the maintainer stales the record + frees the lock
+      await ctx.setProgress(1)           // was rejected under the bug; now resurrects the run + re-locks it
+      await ctx.setAttrs({ done: true }) // was dropped under the bug; now lands
+      await gate2                        // pause again so the test can observe the re-established lock
+    })
+    let finishExecutionId: string | undefined
+    runner.hook('finish', (p) => { finishExecutionId = p.executionId })
+    const jobId = job.getJobId('r1')
+
+    // Runner claims + starts, reaches progress 0.5, then blocks on gate1 (do NOT await — it isn't done).
+    expect(await job.queue('r1', {})).toBe(true)
+    const runnerRun = runner.popAndExecute()
+    await until(async () => (await runner.get(jobId))?.progress === 0.5)
+    expect((await runner.get(jobId))?.status).toBe('running')
+
+    // Let the runner's heartbeat lapse, then the maintainer stales it and releases its lock.
+    await sleep(400)
+    const maint = await maintainer.performMaintenance()
+    expect(maint.staleCount).toBeGreaterThanOrEqual(1)
+    expect((await maintainer.get(jobId))?.status).toBe('stale')
+    expect(await maintainer.isLocked(jobId)).toBe(false)
+
+    // Recovery: the handler resumes and writes again. The stale record self-heals back to running with
+    // its final progress/attrs, observed from the independent maintainer connection.
+    releaseGate1()
+    await until(async () => {
+      const r = await maintainer.get(jobId)
+      return r?.status === 'running' && r?.progress === 1 && (r?.attrs as { done?: boolean })?.done === true
+    })
+    const resurrected = await maintainer.get(jobId)
+    expect(resurrected?.finishedAt).toBeUndefined()     // maintenance's finishedAt cleared
+    expect(await maintainer.isLocked(jobId)).toBe(true)  // lock re-established → dup enqueue blocked
+    expect(await job.queue('r1', {})).toBe(false)
+
+    // Finish: releasing gate2 lets the handler return; the record ends truthful and the lock is released.
+    releaseGate2()
+    await runnerRun
+    await until(async () => (await maintainer.get(jobId))?.status === 'finished')
+    const finalRecord = await maintainer.get(jobId)
+    expect(finalRecord?.status).toBe('finished')
+    expect(finalRecord?.progress).toBe(1)
+    expect(finalRecord?.attrs).toEqual({ done: true })
+    expect(finalRecord?.executionId).toBe(finishExecutionId)
+    expect(await maintainer.isLocked(jobId)).toBe(false)
+  })
+
+  it('10. retry off a staled run re-locks the delayed record so the backoff window stays dedupe-protected', async () => {
+    // WHY (stale-then-recovered asymmetry, retry branch): a pinned run is staled by a peer's
+    // maintenance (lock released) and then throws a RETRYABLE error without writing an update first.
+    // The retry branch stages a `delayed` record but assumes the lock is still held — so without the
+    // self-heal the delayed record would sit UNLOCKED all through backoff (a producer could re-enqueue
+    // and swallow the retry) and keep the maintenance-stamped finishedAt.
+    const group = newGroup()
+    // Runner: heartbeatInterval large so its own heartbeat never fires; a long backoff keeps the retry
+    // delayed for the assertions. attempts:2 → the first failure retries rather than finalizing.
+    const runner = newManager({ heartbeatInterval: 60_000, roundsToStale: 2, maintenanceInterval: 0 }, group)
+    const maintainer = newManager({ heartbeatInterval: 100, roundsToStale: 2, maintenanceInterval: 0 }, group)
+
+    let releaseGate!: () => void
+    const gate = new Promise<void>((r) => { releaseGate = r })
+    const job = runner.createJob({ jobName: 'retry-stale', attempts: 2, backoff: 60_000 }, async () => {
+      await gate                          // pinned here while the maintainer stales the record + frees the lock
+      throw new Error('boom after stale') // throws with NO intervening update → onError retry branch
+    })
+    let retries = 0
+    let finalErrors = 0
+    runner.hook('retry', () => { retries++ })
+    runner.hook('error', () => { finalErrors++ })
+    const jobId = job.getJobId('r1')
+
+    // Runner claims + starts, then blocks on the gate (do NOT await — it isn't done).
+    expect(await job.queue('r1', {})).toBe(true)
+    const runnerRun = runner.popAndExecute()
+    await until(async () => (await runner.get(jobId))?.status === 'running')
+
+    // Let the runner's heartbeat lapse, then the maintainer stales it and releases its lock.
+    await sleep(400)
+    const maint = await maintainer.performMaintenance()
+    expect(maint.staleCount).toBeGreaterThanOrEqual(1)
+    expect((await maintainer.get(jobId))?.status).toBe('stale')
+    expect(await maintainer.isLocked(jobId)).toBe(false)
+
+    // Recovery via the error path: the handler throws, the retry stages a delayed record and RE-LOCKS
+    // it — observed from the independent maintainer connection.
+    releaseGate()
+    await runnerRun
+    await until(async () => (await maintainer.get(jobId))?.status === 'delayed')
+    const delayed = await maintainer.get(jobId)
+    expect(delayed?.finishedAt).toBeUndefined()          // stale finishedAt cleared (run isn't terminal)
+    expect(delayed?.readyAt).toBeDefined()
+    expect(await maintainer.isLocked(jobId)).toBe(true)   // lock re-established → delayed invariant restored
+    expect(await job.queue('r1', {})).toBe(false)          // dup enqueue blocked during backoff
+    expect(retries).toBe(1)
+    expect(finalErrors).toBe(0)                            // a retry is not a final failure
+  })
 })

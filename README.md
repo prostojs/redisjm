@@ -10,7 +10,7 @@ When running multiple instances of the same application, `@prostojs/redisjm` ens
 - Ensures only one job `runId` is scheduled — running, delayed, and stale jobs also block the queue
 - Priority queue support (`queueFirst` for urgent jobs)
 - Delayed runs and automatic retries with configurable backoff
-- Execution fencing — a run staled by maintenance can't clobber a re-enqueued successor's record
+- Execution fencing & self-heal — a staled-but-alive run resurrects on its next write (keeping its progress/attrs and lock); a genuinely superseded one can't clobber its successor's record
 - Cooperative cancellation via `ctx.signal` (ownership loss or `stop({ abort: true })`)
 - Per-instance concurrency (`concurrency` — N runs in flight per instance)
 - Automatic heartbeat monitoring to detect stale/abandoned jobs
@@ -392,9 +392,11 @@ manager.hook('error', (payload) => {
 
 ### Long-running handlers & heartbeats
 
-Heartbeats are emitted from a timer on the single-threaded event loop. A long, tightly synchronous handler that never `await`s starves that timer, so heartbeats stop landing and maintenance may mark the run `stale` and release its lock — which can let another instance pick up the **same** `runId` while the original handler is still running.
+Heartbeats are emitted from a timer on the single-threaded event loop. A long, tightly synchronous handler that never `await`s starves that timer, so heartbeats stop landing and maintenance may mark the run `stale` and release its lock — opening a window in which another instance can pick up the **same** `runId` while the original handler is still running.
 
-The blast radius of that overlap is now **bounded**: the original ("zombie") run's writes are **fenced** — its `executionId` no longer matches the record the successor claimed, so its finish/error/heartbeat/update writes are all rejected (it can't clobber, clean, or resurrect the successor's record). Its `ctx.signal` also **aborts** within one `heartbeatInterval` (the heartbeat hook's guarded write detects the ownership loss). But cancellation is cooperative — the zombie only stops if the handler observes `signal`. A handler that ignores the signal keeps burning CPU and, worse, keeps performing its own **external side effects** (writes to other systems) concurrently with the successor. Chunk long work, `await` between chunks so heartbeats fire, and check `ctx.signal` at each checkpoint:
+**Self-heal (the common case).** Staleness detection can't tell a dead handler from one that merely pinned its event loop, so recovery is symmetric: the moment the handler breathes again — its next heartbeat, `setProgress`, or `setAttrs` — the run **resurrects** its own record (`stale` → `running`), clears the maintenance-stamped `finishedAt`, and **re-acquires its lock**. It keeps its progress/attrs stream and re-establishes dedupe, so its eventual `finish`/`error` records the truth instead of a frozen mid-run snapshot. To an observer the `stale` badge was transient, not a point of no return.
+
+**Zombie fencing (a successor already took over).** If, during the released-lock window, a producer re-enqueued the `runId` and a successor claimed it, the original ("zombie") run is genuinely superseded: its `executionId` no longer matches the record, so its finish/error/heartbeat/update writes are all **rejected** (it can't clobber, clean, or resurrect the successor's record), and its `ctx.signal` **aborts** within one `heartbeatInterval` (the heartbeat hook's guarded write detects the ownership loss). But cancellation is cooperative — the zombie only stops if the handler observes `signal`. A handler that ignores the signal keeps burning CPU and, worse, keeps performing its own **external side effects** (writes to other systems) concurrently with the successor. Chunk long work, `await` between chunks so heartbeats fire, and check `ctx.signal` at each checkpoint:
 
 ```typescript
 manager.createJob({ jobName: 'backfill' }, async (inputs: { ids: string[] }, ctx) => {
@@ -451,7 +453,7 @@ The poll loop then dispatches a popped run **without awaiting it** and immediate
 
 Every execution's `ctx.signal` is an `AbortSignal` that aborts when the run should stop wasting work:
 
-- **Ownership loss** — the run was staled by maintenance, superseded by a re-enqueue of the same `runId`, or unqueued. Detected via the heartbeat hook's guarded write, so it fires within one `heartbeatInterval`.
+- **Ownership loss** — the run was superseded by a re-enqueue of the same `runId`, reached a terminal state, or was unqueued. Detected via the heartbeat hook's guarded write, so it fires within one `heartbeatInterval`. (A run merely staled by maintenance but still owned by this execution **self-heals** instead of aborting — see [Long-running handlers](#long-running-handlers--heartbeats).)
 - **Shutdown** — `stop({ abort: true })` aborts every in-flight run (reason `'manager stopped'`).
 
 Cancellation is **cooperative** — nothing forcibly kills a handler. Check `signal.aborted` (or listen for `'abort'`) at natural checkpoints; `signal.reason` carries a short string cause. A handler that never checks the signal runs to completion, but its record writes are fenced out (see [Long-running handlers](#long-running-handlers--heartbeats)) — the danger is only its **external side effects**.
@@ -474,7 +476,7 @@ User hooks can also trigger this signal via `payload.abort(reason?)` as a custom
 | `queued` | Waiting on a lane queue | Yes | Yes |
 | `delayed` | Staged on the delayed set (scheduled run or pending retry), lock held | Yes | Yes |
 | `running` | Currently executing with active heartbeat | Yes | Yes |
-| `stale` | Heartbeat expired, detected by maintenance | Yes (until maintenance cleans it) | Yes |
+| `stale` | Heartbeat expired, detected by maintenance (a still-alive run self-heals back to `running` on its next heartbeat/`setProgress`/`setAttrs`) | Yes (until maintenance cleans it) | Yes |
 | `finished` | Completed successfully | No | Kept for `keepFinishedInterval` |
 | `error` | Failed with an error (final failure) | No | Kept for `keepFinishedInterval` |
 

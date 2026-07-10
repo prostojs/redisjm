@@ -469,6 +469,10 @@ export class RedisJM extends Hookable<RedisJMHooks> {
       // record fields accordingly) and capture the outcome in this closure; then act on it after the
       // write. `scheduledRetry` set ⇒ we chose to retry.
       let scheduledRetry: { readyAt: number; attempt: number } | undefined
+      // A retry off a `stale`-but-ours record must re-establish the lock maintenance released (the
+      // same self-heal heartbeat/update do): the retry branch's whole premise is that a delayed record
+      // HOLDS the lock so a producer can't double-enqueue the runId during backoff.
+      let retryResurrectedLock = false
       const result = await this.updateLog(jobId, (record) => {
         // Same fencing as `onFinish`: a superseded execution's error must not clobber the successor's
         // record, schedule a phantom retry, or release its lock.
@@ -480,12 +484,19 @@ export class RedisJM extends Hookable<RedisJMHooks> {
         if (attempt < maxAttempts) {
           // RETRY: stage the run back on the delayed set and KEEP the lock (do not srem) — the held
           // lock is what prevents a duplicate enqueue of the same runId while the backoff elapses.
-          // `finishedAt` stays unset (the run isn't terminal). Backoff 0 still routes through the
-          // delayed set (readyAt = now) so promotion has a single code path; the next sweep picks it
-          // up within ~1s.
+          // Backoff 0 still routes through the delayed set (readyAt = now) so promotion has a single
+          // code path; the next sweep picks it up within ~1s.
+          //
+          // Self-heal: if this execution was staled mid-run (maintenance flipped it to `stale`, stamped
+          // `finishedAt`, and RELEASED the lock) and it then threw a retryable error before writing any
+          // update, restore the delayed invariants — clear the stale `finishedAt` (the run isn't
+          // terminal) and re-SADD the lock after the write (below), so the backoff window is dedupe-
+          // protected exactly like a retry off a healthy `running` record.
+          if (record.status === 'stale') retryResurrectedLock = true
           const readyAt = now + job.getBackoffMs(attempt)
           record.status = 'delayed'
           record.readyAt = readyAt
+          delete record.finishedAt
           scheduledRetry = { readyAt, attempt }
         } else {
           // FINAL failure: terminal error (lock released + `error` hook fired below).
@@ -496,6 +507,9 @@ export class RedisJM extends Hookable<RedisJMHooks> {
       // Zombie fencing: the record's owner changed under us — touch nothing, fire nothing.
       if (result === 'rejected') return
       if (result === 'written' && scheduledRetry) {
+        // Re-establish the lock BEFORE making the run promotable (below), so the delayed record holds
+        // its lock the moment it can be discovered/re-enqueued.
+        if (retryResurrectedLock) await this.reacquireLock(jobId)
         // Write the zset entry BEFORE the retry hook (mirrors enqueue: the zset entry is what makes
         // the run promotable). Do NOT release the lock and do NOT fire the manager-level `error` hook
         // — the run isn't finally failed, so `retry` fires instead.
@@ -515,21 +529,27 @@ export class RedisJM extends Hookable<RedisJMHooks> {
     const onHeartbeat = async (payload: JobEventPayload<TInputs>) => {
       if (!this.shouldHandle(payload)) return
       const jobId = getJobId(payload.runId)
+      let resurrected = false
       const result = await this.updateLog(jobId, (record) => {
-        // Never refresh the heartbeat of a record that has left `running` or belongs to a different
-        // execution: a late/straggling heartbeat from a finished or superseded run must not resurrect
-        // (or keep alive) a record now owned by someone else.
-        if (record.status !== 'running' || record.executionId !== payload.executionId) return false
+        // A pinned-but-alive run self-heals: `acceptRunningOrStale` accepts a `stale` record that is
+        // still ours (matching executionId), flipping it back to `running`. It rejects a record whose
+        // owner changed (executionId mismatch) or that reached a terminal state — a straggling
+        // heartbeat from a finished or superseded run must never keep such a record alive.
+        const decision = this.acceptRunningOrStale(record, payload.executionId)
+        if (!decision) return false
+        resurrected = decision === 'resurrected'
         record.heartbeat = Date.now()
       })
+      // A resurrected run proved itself alive after maintenance staled it and released its lock.
+      if (result === 'written' && resurrected) await this.reacquireLock(jobId)
       // Heartbeat-driven ownership-loss detection: the heartbeat is the ONLY periodic read the executor
       // already performs, so when its guarded write is not 'written' — 'rejected' (record now owned by a
-      // successor / no longer `running`) or 'missing' (unqueued mid-run) — this execution has lost
-      // ownership of its record. Abort the run's cooperative signal (detected within one
-      // heartbeatInterval, zero extra Redis traffic) and SKIP the manager-level heartbeat event: it
-      // doesn't describe a live, owned run. Abort is cooperative — the handler must observe the signal.
+      // successor, or terminal) or 'missing' (unqueued mid-run) — this execution has lost ownership of
+      // its record. Abort the run's cooperative signal (detected within one heartbeatInterval, zero
+      // extra Redis traffic) and SKIP the manager-level heartbeat event: it doesn't describe a live,
+      // owned run. Abort is cooperative — the handler must observe the signal.
       if (result !== 'written') {
-        payload.abort('run lost ownership of its record (stale, superseded, or unqueued)')
+        payload.abort('run lost ownership of its record (superseded, terminal, or unqueued)')
         return
       }
       await this.callHook('heartbeat', payload as unknown as JobEventPayload)
@@ -538,14 +558,21 @@ export class RedisJM extends Hookable<RedisJMHooks> {
     const onUpdate = async (payload: JobUpdateEventPayload<TInputs, TAttrs>) => {
       if (!this.shouldHandle(payload)) return
       const jobId = getJobId(payload.runId)
-      await this.updateLog(jobId, (record) => {
-        // Same fencing as heartbeat: only the running execution that owns the record may write its
-        // progress/attrs, so a superseded run's late update can't leak into the successor's record.
-        if (record.status !== 'running' || record.executionId !== payload.executionId) return false
+      let resurrected = false
+      const result = await this.updateLog(jobId, (record) => {
+        // Same self-heal + fencing as heartbeat: the running execution that owns the record may write
+        // its progress/attrs, and a `stale`-but-ours record is resurrected so a pinned-then-recovered
+        // handler's final setProgress/setAttrs land instead of being silently dropped. A superseded
+        // run's late update still can't leak into the successor's record (executionId mismatch).
+        const decision = this.acceptRunningOrStale(record, payload.executionId)
+        if (!decision) return false
+        resurrected = decision === 'resurrected'
         if (payload.progress !== undefined) record.progress = payload.progress
         // Merge, not replace: successive setAttrs calls accumulate keys instead of clobbering.
         if (payload.attrs !== undefined) record.attrs = { ...record.attrs, ...payload.attrs }
       })
+      // A resurrected run re-establishes the lock maintenance released (mirror of onHeartbeat).
+      if (result === 'written' && resurrected) await this.reacquireLock(jobId)
       await this.callHook('update', payload as unknown as JobUpdateEventPayload)
     }
 
@@ -1219,6 +1246,37 @@ export class RedisJM extends Hookable<RedisJMHooks> {
   }
 
   /**
+   * Fencing + self-heal decision shared by the heartbeat and update hooks — the recovery side of the
+   * stale-then-recovered execution-fencing asymmetry.
+   *
+   * A live handler whose heartbeat lapsed — maintenance staled its record and released its lock while
+   * the event loop was pinned — still OWNS that record as long as its `executionId` matches. The
+   * moment it writes again (a heartbeat, `setProgress`, or `setAttrs`) it proves it's alive, so we
+   * resurrect: flip `stale` → `running` and clear the maintenance-stamped `finishedAt` here; the
+   * caller then re-SADDs the lock so a producer can't double-enqueue the runId now that the run is
+   * demonstrably still going. This closes the old asymmetry where such a run's updates were rejected
+   * yet its finish (fenced on executionId only) still landed, freezing progress and dropping attrs.
+   *
+   * Returns:
+   *  - `'running'`     — record is healthy and ours; apply the write.
+   *  - `'resurrected'` — record was `stale` but ours; flipped back to `running` (caller re-locks).
+   *  - `false`         — reject: the owner changed (executionId mismatch) or the record reached a
+   *                      terminal/non-running state a live run can't own (finished/error/queued/delayed).
+   *                      The zombie stays fenced — once a successor re-enqueues the runId (fresh record,
+   *                      no/other executionId), the old execution's writes keep rejecting exactly as before.
+   */
+  private acceptRunningOrStale(record: JobLogRecord, executionId: string): 'running' | 'resurrected' | false {
+    if (record.executionId !== executionId) return false
+    if (record.status === 'running') return 'running'
+    if (record.status === 'stale') {
+      record.status = 'running'
+      delete record.finishedAt
+      return 'resurrected'
+    }
+    return false
+  }
+
+  /**
    * Releases a jobId's lock and, unless finished records are being retained
    * (`keepFinishedInterval > 0`), drops its log entry too. Shared by every terminal path
    * (finish, error, unknown-job drop, corrupt-record cleanup) so the retention policy lives in one spot.
@@ -1228,6 +1286,16 @@ export class RedisJM extends Hookable<RedisJMHooks> {
     if (this.options.keepFinishedInterval === 0) {
       await this.redis.hdel(this.getLogKey(), jobId)
     }
+  }
+
+  /**
+   * Re-establishes a jobId's lock — the self-heal counterpart to {@link releaseLockAndMaybeDropLog}.
+   * Called by the heartbeat/update/error-retry hooks when a run resurrects a record maintenance had
+   * staled (and SREM'd its lock): re-acquiring the lock restores dedupe so a producer can't
+   * double-enqueue the runId now that the execution has proven itself alive.
+   */
+  private async reacquireLock(jobId: string): Promise<void> {
+    await this.redis.sadd(this.getLocksKey(), jobId)
   }
 
   /**
