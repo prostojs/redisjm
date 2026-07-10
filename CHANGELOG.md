@@ -1,3 +1,12 @@
+## [0.1.1](https://github.com/prostojs/redisjm/compare/v0.1.0...v0.1.1) (2026-07-10)
+
+
+### Bug Fixes
+
+* self-heal staled-but-alive runs instead of freezing progress and losing attrs ([f4ea339](https://github.com/prostojs/redisjm/commit/f4ea3394cc3f378e32c1891f34563cb4d2cf83d2))
+
+
+
 # [0.1.0](https://github.com/prostojs/redisjm/compare/v0.0.4...v0.1.0) (2026-07-09)
 
 
