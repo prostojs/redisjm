@@ -1,8 +1,11 @@
 import { randomUUID } from 'node:crypto'
 import { Hookable } from 'hookable'
+import { JobTimeoutError } from './errors'
 import type { RedisJM } from './redisjm'
-import { toError } from './utils'
+import { positiveOrZero, toError, toTaggable } from './utils'
 import type {
+  EnqueueOptions,
+  EnqueueResult,
   JobAttrs,
   JobAttrValue,
   JobContext,
@@ -12,6 +15,24 @@ import type {
   JobMetadata,
   QueueOptions,
 } from './types'
+
+/**
+ * Errors thrown out of the START phase of an execution (the `start` hook chain, which contains the
+ * manager's claim), mapped to that execution's fencing token. Internal (not re-exported): the manager
+ * uses it to tell a start-phase failure — which needs requeue/drop/fail recovery because the popped
+ * entry is gone — apart from a handler or `finish`-hook failure, and to fence that recovery on the
+ * right executionId. A WeakMap so the mapping lives exactly as long as the error object.
+ */
+const startPhaseFailures = new WeakMap<object, string>()
+
+/**
+ * Returns the executionId of the execution whose START phase threw `err`, or `undefined` when `err`
+ * did not come out of a start phase. Internal helper for the manager's start-failure recovery.
+ */
+export function getStartPhaseExecutionId(err: unknown): string | undefined {
+  // A primitive is never a key (WeakMap.get answers `undefined` for it).
+  return startPhaseFailures.get(err as object)
+}
 
 /**
  * Represents a named job with a function and event hooks.
@@ -51,8 +72,14 @@ export class Job<TInputs = unknown, TAttrs extends { [K in keyof TAttrs]: JobAtt
    * Runs the job function with heartbeat timer and context callbacks.
    * Dispatches `start`, `finish`/`error`, `heartbeat`, and `update` events.
    *
+   * With `options.timeoutMs > 0` the handler is raced against a timer: on expiry `ctx.signal` aborts
+   * (reason `'timeout'`), the `error` hook fires with a `JobTimeoutError`, and `execute()` rejects with
+   * it — WITHOUT waiting for the handler, so a hung handler cannot hold the caller (or a concurrency
+   * slot) forever. If the abandoned handler later settles, that is reported once via `options.logger`
+   * (never an unhandled rejection).
+   *
    * @param inputs - The job inputs passed to the job function
-   * @param options - Target group, heartbeat interval, and explicit runId
+   * @param options - Target group, heartbeat interval, explicit runId, timeout, abort signal
    *
    * @example
    * ```ts
@@ -63,6 +90,7 @@ export class Job<TInputs = unknown, TAttrs extends { [K in keyof TAttrs]: JobAtt
     const targetGroup = options?.targetGroup ?? this.defaultManager?.getTargetGroup() ?? ''
     const runId = options?.runId ?? (typeof inputs === 'string' ? inputs : JSON.stringify(inputs))
     const heartbeatInterval = options?.heartbeatInterval
+    const timeoutMs = options?.timeoutMs
     // A fresh fencing token per execution: the record's owner is whoever's `start` stamped it.
     const executionId = randomUUID()
 
@@ -112,25 +140,48 @@ export class Job<TInputs = unknown, TAttrs extends { [K in keyof TAttrs]: JobAtt
     // a `finally`, so a throwing/rejecting `start` (or `finish`) hook can never leak a
     // timer that keeps firing phantom heartbeats and defeats stale-reclaim.
     let heartbeatTimer: ReturnType<typeof setInterval> | undefined
+    // The heartbeat dispatch currently in flight (never rejects). A heartbeat is a read-modify-write of
+    // the record: if one is still in flight when the run settles, its write can land AFTER the terminal
+    // `finish`/`error` write and flip the record back to `running` (stuck until maintenance stales it).
+    // `stopHeartbeat` therefore clears the timer AND awaits the in-flight beat before any terminal hook.
+    let heartbeatInFlight: Promise<void> | undefined
+    const stopHeartbeat = async () => {
+      if (heartbeatTimer) clearInterval(heartbeatTimer)
+      heartbeatTimer = undefined
+      await heartbeatInFlight
+    }
     try {
       // `start` is the claim: a failed claim or Redis outage here is NOT a job failure, so it
-      // propagates directly (via the `finally`) without ever dispatching the `error` hook.
-      await this.callHook('start', payload)
+      // propagates directly (via the `finally`) without ever dispatching the `error` hook. It is
+      // tagged with this execution's fencing token so a manager can tell a start-phase failure (the
+      // popped entry needs requeue/drop/fail recovery) from a handler failure.
+      try {
+        await this.callHook('start', payload)
+      } catch (err) {
+        const tagged = toTaggable(err)
+        startPhaseFailures.set(tagged, executionId)
+        throw tagged
+      }
       if (heartbeatInterval && heartbeatInterval > 0) {
         heartbeatTimer = setInterval(() => {
-          // A failed heartbeat write is infra, not job outcome: report it instead of swallowing it.
-          this.callHook('heartbeat', payload).catch((err) =>
-            options?.logger?.('heartbeat update failed', toError(err)),
-          )
+          // One beat at a time: a slow write skips beats instead of piling up overlapping writes.
+          if (heartbeatInFlight) return
+          heartbeatInFlight = this.callHook('heartbeat', payload)
+            // A failed heartbeat write is infra, not job outcome: report it instead of swallowing it.
+            .catch((err) => options?.logger?.('heartbeat update failed', toError(err)))
+            .finally(() => {
+              heartbeatInFlight = undefined
+            })
         }, heartbeatInterval)
       }
       try {
-        await this.fn(inputs, ctx)
+        await this.runHandler(inputs, ctx, controller, timeoutMs, runId, options?.logger)
       } catch (err) {
         // Only a job-function failure is a real job error. Dispatch the `error` hook, then rethrow
         // the ORIGINAL error. A throwing `error` hook is itself infra: report it and still rethrow
         // the job's own error so the true cause is never masked.
         const error = toError(err)
+        await stopHeartbeat()
         try {
           await this.callHook('error', { ...payload, error })
         } catch (hookErr) {
@@ -138,6 +189,7 @@ export class Job<TInputs = unknown, TAttrs extends { [K in keyof TAttrs]: JobAtt
         }
         throw error
       }
+      await stopHeartbeat()
       // A throwing `finish` hook must never flip a successful run to `error`; let it propagate as-is.
       await this.callHook('finish', payload)
     } finally {
@@ -151,6 +203,99 @@ export class Job<TInputs = unknown, TAttrs extends { [K in keyof TAttrs]: JobAtt
   }
 
   /**
+   * Invokes the job function, racing it against `timeoutMs` when set. On expiry: abort the run's
+   * signal with reason `'timeout'` and reject with a `JobTimeoutError` — the handler promise is
+   * abandoned (JS cannot kill it), so the caller's `finally` clears the heartbeat and frees the slot
+   * right away. The abandoned promise gets a handler that logs ONCE if it later settles or rejects, so a
+   * late rejection never becomes an unhandled rejection and a late completion is still visible.
+   */
+  private async runHandler(
+    inputs: TInputs,
+    ctx: JobContext<TAttrs>,
+    controller: AbortController,
+    timeout: number | undefined,
+    runId: string,
+    logger: JobExecuteOptions['logger'],
+  ): Promise<void> {
+    // Invoke synchronously (a sync throw still becomes a rejection, exactly like `await this.fn(...)`).
+    let handler: Promise<void>
+    try {
+      handler = Promise.resolve(this.fn(inputs, ctx))
+    } catch (err) {
+      handler = Promise.reject(err)
+    }
+    const timeoutMs = positiveOrZero(timeout)
+    if (timeoutMs === 0) {
+      await handler
+      return
+    }
+
+    const jobId = this.getJobId(runId)
+    let timer: ReturnType<typeof setTimeout> | undefined
+    // Set when the timer fires; doubles as the "timed out" flag checked after the race.
+    let timeoutError: JobTimeoutError | undefined
+    const expiry = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        timeoutError = new JobTimeoutError(timeoutMs, jobId)
+        // Reject BEFORE aborting: an abort listener in the handler may reject the handler promise
+        // synchronously; the `timeoutError` check below makes the timeout win regardless of order.
+        reject(timeoutError)
+        controller.abort('timeout')
+      }, timeoutMs)
+    })
+    try {
+      await Promise.race([handler, expiry])
+    } catch (err) {
+      if (!timeoutError) throw err
+      // Abandoned handler: observe its eventual outcome once, so it is never an unhandled rejection.
+      handler.then(
+        () => logger?.(`job "${jobId}" handler settled after its ${timeoutMs}ms timeout (result discarded)`),
+        (lateErr) => logger?.(`job "${jobId}" handler rejected after its ${timeoutMs}ms timeout`, toError(lateErr)),
+      )
+      throw timeoutError
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  /**
+   * Enqueues this job via a RedisJM instance and reports what happened (see `RedisJM.enqueue`).
+   * Uses the provided manager or falls back to the default manager set in the constructor.
+   *
+   * @param runId - Unique identifier for this run (duplicates are deduped)
+   * @param inputs - The job inputs to store and pass at execution time
+   * @param manager - Optional RedisJM instance (overrides the default)
+   * @param options - `delay`, `first` (priority insert)
+   * @returns `{ status: 'queued' | 'deduped' | 'busy' | 'full', jobId }`; Redis failures throw `RedisJMEnqueueError`
+   *
+   * @example
+   * ```ts
+   * const { status } = await job.enqueue('order-123', { orderId: '123' })
+   * if (status === 'deduped') console.log('already in flight')
+   * ```
+   */
+  async enqueue(runId: string, inputs: TInputs, manager?: RedisJM, options?: EnqueueOptions): Promise<EnqueueResult> {
+    return this.resolveManager(manager).enqueue(this as Job<any, any>, runId, inputs, options)
+  }
+
+  /**
+   * Enqueues many runs of this job in one atomic call and returns a result per entry (see
+   * `RedisJM.enqueueMany`). Uses the provided manager or the default manager set in the constructor.
+   *
+   * @example
+   * ```ts
+   * const results = await job.enqueueMany(orders.map((o) => ({ runId: o.id, inputs: o })))
+   * ```
+   */
+  async enqueueMany(
+    entries: Array<{ runId: string; inputs: TInputs }>,
+    manager?: RedisJM,
+    options?: EnqueueOptions,
+  ): Promise<EnqueueResult[]> {
+    return this.resolveManager(manager).enqueueMany(this as Job<any, any>, entries, options)
+  }
+
+  /**
    * Convenience method to queue this job via a RedisJM instance.
    * Uses the provided manager or falls back to the default manager set in the constructor.
    *
@@ -158,7 +303,8 @@ export class Job<TInputs = unknown, TAttrs extends { [K in keyof TAttrs]: JobAtt
    * @param inputs - The job inputs to store and pass at execution time
    * @param manager - Optional RedisJM instance (overrides the default)
    * @param options - Optional queue options (e.g. `delay` to stage the run on the delayed set)
-   * @returns `true` if queued, `false` if already locked
+   * @returns `true` if queued; `false` if not queued (deduped by a held lock, or a full lane) — use
+   *   {@link enqueue} to tell those apart. Redis failures throw `RedisJMEnqueueError`.
    *
    * @example
    * ```ts
@@ -179,7 +325,8 @@ export class Job<TInputs = unknown, TAttrs extends { [K in keyof TAttrs]: JobAtt
    * @param inputs - The job inputs to store and pass at execution time
    * @param manager - Optional RedisJM instance (overrides the default)
    * @param options - Optional queue options; a priority insert cannot be delayed (`delay > 0` throws)
-   * @returns `true` if queued, `false` if already locked
+   * @returns `true` if queued; `false` if not queued (deduped or full — see {@link enqueue}).
+   *   Redis failures throw `RedisJMEnqueueError`.
    *
    * @example
    * ```ts
@@ -221,6 +368,16 @@ export class Job<TInputs = unknown, TAttrs extends { [K in keyof TAttrs]: JobAtt
     const raw = typeof this.metadata.backoff === 'function' ? this.metadata.backoff(attempt) : this.metadata.backoff
     if (raw === undefined || !Number.isFinite(raw) || raw < 0) return 0
     return raw
+  }
+
+  /**
+   * Resolves this job's own execution timeout: `JobMetadata.timeoutMs` when set (`0` = explicitly no
+   * timeout, overriding a manager default), else `undefined` (defer to the manager's `jobTimeout`).
+   * Negative / non-finite values are treated as `0` (no timeout).
+   */
+  getTimeoutMs(): number | undefined {
+    const raw = this.metadata.timeoutMs
+    return raw === undefined ? undefined : positiveOrZero(raw)
   }
 
   /**

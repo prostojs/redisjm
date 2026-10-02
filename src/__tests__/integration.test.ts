@@ -1,9 +1,9 @@
 /**
  * Opt-in integration suite exercising RedisJM against a REAL Redis server.
  *
- * Why this exists (a mock can't validate these): the real `LMPOP` reply shape through ioredis, the
- * Redis < 7 sequential-`LPOP` fallback trigger (which keys off the real "unknown command" error text),
- * the `HSCAN`/`SSCAN`/`ZRANGEBYSCORE` reply shapes, and genuine cross-connection visibility.
+ * Why this exists (a mock can't validate these): the real Lua scripts (atomic pop across lanes,
+ * compare-and-set transitions) and their reply shapes through ioredis, the `HSCAN`/`SSCAN`/
+ * `ZRANGEBYSCORE` reply shapes, and genuine cross-connection visibility.
  *
  * HOW TO RUN:
  *   REDIS_URL=redis://localhost:6379 pnpm test
@@ -11,86 +11,24 @@
  *   pnpm run test:integration
  *
  * When `REDIS_URL` is unset the whole suite is skipped (via `describe.skipIf`), so CI / local dev
- * without a Redis server stays green.
+ * without a Redis server stays green. Requires Redis >= 7.0 (shebang scripts).
  *
- * ISOLATION: every test uses a unique target-group prefix (`itg-<ts>-<n>`, no ':' — the constructor
- * rejects that) so runs never collide. `afterEach` best-effort deletes only keys under `redisjm:itg-*`.
- *
- * REDIS VERSION: the `LMPOP` code path needs Redis >= 7. On 6.x the library falls back to sequential
- * `LPOP` automatically; the fallback-sensitive test (2) detects the server version and only logs which
- * path was taken rather than hard-asserting internals, so the suite passes on either.
+ * ISOLATION: every test uses a unique target-group prefix (`itg-<ts>-<n>`) so runs never collide; only
+ * keys under `redisjm:itg-*` are deleted after each test (see `integration-helpers.ts`).
  *
  * TIMERS: unlike the mock unit tests, this suite uses REAL timers (no `vi.useFakeTimers`). All
  * intervals are kept short (heartbeats 100–200ms, poll 50ms, delays 200–500ms) and every assertion of
  * an eventual state polls via `until()` with a generous timeout, so the suite is deterministic and runs
- * in a few seconds. Every manager is always `stop()`ped in `afterEach` so no timer leaks.
+ * in a few seconds. Every manager is always `stop()`ped after each test so no timer leaks.
  */
-import Redis from 'ioredis'
-import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest'
-import { RedisJM } from '../redisjm'
-import type { RedisJMOptions } from '../types'
-
-const REDIS_URL = process.env.REDIS_URL
-
-const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
-
-/**
- * Polls `fn` every `intervalMs` until it resolves truthy, or throws once `timeoutMs` elapses. Used for
- * every "eventually" assertion so the suite tolerates real-timer jitter without brittle exact sleeps.
- */
-async function until(fn: () => boolean | Promise<boolean>, timeoutMs = 3000, intervalMs = 50): Promise<void> {
-  const deadline = Date.now() + timeoutMs
-  for (;;) {
-    if (await fn()) return
-    if (Date.now() > deadline) throw new Error(`until(): condition not met within ${timeoutMs}ms`)
-    await sleep(intervalMs)
-  }
-}
+import { describe, expect, it } from 'vitest'
+import { REDIS_URL, sleep, until, useSharedRedis } from './integration-helpers'
 
 describe.skipIf(!REDIS_URL)('integration (real Redis)', () => {
-  let redis: Redis
-  let redisMajorVersion = 0
-  // Managers created within a test are tracked here so afterEach always stops them (no timer leak),
-  // even if the test throws mid-way.
-  const managers: RedisJM[] = []
-  let groupCounter = 0
+  const h = useSharedRedis('itg')
+  const { newGroup, newManager } = h
   /** Poll interval passed to every manager.start() in the suite. */
   const POLL_MS = 50
-
-  /** Fresh, unique, ':'-free target group per test so concurrent/leftover keys never collide. */
-  const newGroup = (): string => `itg-${Date.now()}-${++groupCounter}`
-
-  /**
-   * Creates a manager on a fresh target group (or a shared one, when passed) and registers it for
-   * guaranteed teardown in afterEach.
-   */
-  const newManager = (options: RedisJMOptions, group = newGroup()): RedisJM => {
-    const manager = new RedisJM(redis, group, options)
-    managers.push(manager)
-    return manager
-  }
-
-  beforeAll(async () => {
-    redis = new Redis(REDIS_URL!, { maxRetriesPerRequest: null })
-    // Wait for a live connection before any test runs.
-    await redis.ping()
-    const info = await redis.info('server')
-    const match = /redis_version:(\d+)\./.exec(info)
-    redisMajorVersion = match ? Number(match[1]) : 0
-  })
-
-  afterAll(async () => {
-    if (redis) await redis.quit()
-  })
-
-  afterEach(async () => {
-    // Stop every manager this test started (drains in-flight runs, clears poll/maintenance timers).
-    await Promise.all(managers.splice(0).map((m) => m.stop().catch(() => {})))
-    // Best-effort cleanup of only this suite's keys. KEYS is O(N) but fine in a test-only suite against
-    // an isolated `itg-*` keyspace.
-    const keys = await redis.keys('redisjm:itg-*')
-    if (keys.length) await redis.del(...keys)
-  })
 
   it('1. end-to-end lifecycle: queue → execute → finished, lock released, dup rejected', async () => {
     const manager = newManager({ heartbeatInterval: 200, maintenanceInterval: 0 })
@@ -116,7 +54,7 @@ describe.skipIf(!REDIS_URL)('integration (real Redis)', () => {
     expect(await manager.isLocked(jobId)).toBe(false)
   })
 
-  it('2. LMPOP path across two lanes (both execute); logs LMPOP vs LPOP-fallback path', async () => {
+  it('2. one pop script across two lanes: both lanes drain', async () => {
     const manager = newManager({ heartbeatInterval: 200, maintenanceInterval: 0 })
     const ran = new Set<string>()
     const jobA = manager.createJob({ jobName: 'lane-a', lane: 'alpha' }, async () => {
@@ -132,9 +70,6 @@ describe.skipIf(!REDIS_URL)('integration (real Redis)', () => {
     manager.start(POLL_MS)
     await until(() => ran.has('a') && ran.has('b'))
 
-    // Version-aware: assert behavior (both lanes drained), not internals. Log which pop path ran.
-    const popPath = redisMajorVersion >= 7 ? 'LMPOP' : 'sequential LPOP fallback'
-    console.log(`[integration] ${popPath} path exercised (redis major ${redisMajorVersion})`)
     expect(await manager.queueSize('alpha')).toBe(0)
     expect(await manager.queueSize('beta')).toBe(0)
   })
@@ -289,7 +224,7 @@ describe.skipIf(!REDIS_URL)('integration (real Redis)', () => {
     const locksKey = `redisjm:${group}:locks`
 
     // Manually seed a lock with NO backing log record (an enqueue that crashed between SADD and HSET).
-    await redis.sadd(locksKey, jobId)
+    await h.redis.sadd(locksKey, jobId)
     expect(await manager.isLocked(jobId)).toBe(true)
     // queue() must be blocked while the orphan lock is held (and, having returned false, writes nothing).
     expect(await job.queue('o1', {})).toBe(false)

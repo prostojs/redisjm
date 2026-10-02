@@ -3,7 +3,7 @@ import { RedisJM } from '../redisjm'
 import { Job } from '../job'
 import { createMaintenanceJob, MAINTENANCE_JOB_NAME } from '../maintenance'
 import type { JobContext, JobLogRecord } from '../types'
-import { createMockRedis } from './mock-redis'
+import { connectionError, createMockRedis, oomError } from './mock-redis'
 
 describe('RedisJM', () => {
   let redis: ReturnType<typeof createMockRedis>
@@ -31,6 +31,13 @@ describe('RedisJM', () => {
         laneStrategy: 'roundRobin',
         lanePriority: [],
         concurrency: 1,
+        jobTimeout: 0,
+        maxRunMs: 0,
+        laneConcurrency: {},
+        laneCaps: {},
+        maxInputsBytes: 0,
+        maxRecordsPerPass: 1000,
+        memoryWarnRatio: 0.8,
       })
     })
 
@@ -45,6 +52,13 @@ describe('RedisJM', () => {
         laneStrategy: 'roundRobin',
         lanePriority: [],
         concurrency: 1,
+        jobTimeout: 0,
+        maxRunMs: 0,
+        laneConcurrency: {},
+        laneCaps: {},
+        maxInputsBytes: 0,
+        maxRecordsPerPass: 1000,
+        memoryWarnRatio: 0.8,
       })
     })
 
@@ -860,9 +874,12 @@ describe('RedisJM', () => {
   describe('auto-maintenance via start()', () => {
     afterEach(() => {
       manager.stop()
+      vi.useRealTimers()
     })
 
-    it('should enqueue and run maintenance on start', async () => {
+    it('runs maintenance on its own timer immediately on start, without enqueueing anything', async () => {
+      // WHY: maintenance used to be ENQUEUED as a job, so it waited behind (and needed) a free
+      // concurrency slot. It now runs on the manager's own timer, outside the queue.
       vi.useFakeTimers()
       const m = new RedisJM(redis, 'test-group', {
         heartbeatInterval: 1000,
@@ -879,36 +896,118 @@ describe('RedisJM', () => {
       }))
 
       m.start(100)
-      // The async reclaim→enqueue bootstrap plus the pop+execute take several poll cycles to
-      // settle; drain a few so the assertion is deterministic (no flake).
-      for (let i = 0; i < 4; i++) await vi.advanceTimersByTimeAsync(100)
+      await vi.advanceTimersByTimeAsync(0)
 
       const record = JSON.parse((await redis.hget('redisjm:test-group:log', jobId))!) as JobLogRecord
       expect(record.status).toBe('stale')
       expect(await redis.sismember('redisjm:test-group:locks', jobId)).toBe(0)
+      // Nothing was enqueued: no maintenance entry, lock, or record.
+      expect(await redis.llen('redisjm:test-group:lane:__maintenance:queue')).toBe(0)
+      expect(await redis.sismember('redisjm:test-group:locks', `${MAINTENANCE_JOB_NAME}#`)).toBe(0)
+      expect(await redis.hget('redisjm:test-group:log', `${MAINTENANCE_JOB_NAME}#`)).toBeNull()
+      expect(redis.rpush).not.toHaveBeenCalled()
 
-      m.stop()
-      vi.useRealTimers()
+      await m.stop()
     })
 
-    it('should re-enqueue maintenance every maintenanceInterval', async () => {
+    it('runs a pass every maintenanceInterval on a single instance', async () => {
       vi.useFakeTimers()
       const m = new RedisJM(redis, 'test-group', { maintenanceInterval: 500 })
       const spy = vi.spyOn(m, 'performMaintenance')
 
       m.start(100)
-      // Drain the immediate enqueue (still well before the 500ms interval tick).
-      for (let i = 0; i < 3; i++) await vi.advanceTimersByTimeAsync(100)
-      expect(spy).toHaveBeenCalledTimes(1)
+      await vi.advanceTimersByTimeAsync(100)
+      expect(spy).toHaveBeenCalledTimes(1) // the immediate tick
 
-      await vi.advanceTimersByTimeAsync(700) // interval tick at 500 + a poll to execute it
-      expect(spy.mock.calls.length).toBeGreaterThanOrEqual(2)
+      // The lock TTL is slightly shorter than the interval, so a lone instance's own previous lock
+      // never blocks its next tick: exactly one pass per interval.
+      await vi.advanceTimersByTimeAsync(400) // t = 500 → second tick
+      expect(spy).toHaveBeenCalledTimes(2)
+      await vi.advanceTimersByTimeAsync(1000) // t = 1500 → ticks at 1000 and 1500
+      expect(spy).toHaveBeenCalledTimes(4)
 
-      m.stop()
-      vi.useRealTimers()
+      await m.stop()
     })
 
-    it('should not enqueue maintenance when maintenanceInterval is 0', async () => {
+    it('the maintenance lock spaces passes across instances (~one pass per interval fleet-wide)', async () => {
+      vi.useFakeTimers()
+      const a = new RedisJM(redis, 'test-group', { maintenanceInterval: 500, logger: false })
+      const b = new RedisJM(redis, 'test-group', { maintenanceInterval: 500, logger: false })
+      const spyA = vi.spyOn(a, 'performMaintenance')
+      const spyB = vi.spyOn(b, 'performMaintenance')
+
+      a.start(100)
+      b.start(100)
+      await vi.advanceTimersByTimeAsync(100)
+      // Both ticked immediately; only the lock winner ran a pass.
+      expect(spyA.mock.calls.length + spyB.mock.calls.length).toBe(1)
+      expect(await redis.get('redisjm:test-group:maintenance-lock')).not.toBeNull()
+
+      await vi.advanceTimersByTimeAsync(900) // t = 1000: ticks at 500 and 1000 on both instances
+      expect(spyA.mock.calls.length + spyB.mock.calls.length).toBe(3)
+
+      await Promise.all([a.stop(), b.stop()])
+    })
+
+    it('runMaintenance returns null while another instance holds the lock, and does not release it', async () => {
+      const m = new RedisJM(redis, 'test-group', { maintenanceInterval: 500 })
+      const first = await m.runMaintenance()
+      expect(first).toEqual({ staleCount: 0, cleanedCount: 0, requeuedCount: 0, mode: 'full' })
+      // Lock deliberately kept (its expiry spaces passes) → an immediate second call is refused.
+      expect(await redis.get('redisjm:test-group:maintenance-lock')).not.toBeNull()
+      expect(await m.runMaintenance()).toBeNull()
+    })
+
+    it('a non-OOM lock failure is logged and skips the pass', async () => {
+      const logger = vi.fn()
+      const m = new RedisJM(redis, 'test-group', { maintenanceInterval: 500, logger })
+      const spy = vi.spyOn(m, 'performMaintenance')
+      ;(redis.set as any).mockRejectedValueOnce(connectionError())
+
+      expect(await m.runMaintenance()).toBeNull()
+      expect(spy).not.toHaveBeenCalled()
+      expect(logger.mock.calls.some(([msg]) => /maintenance lock.*\(connection\)/.test(msg as string))).toBe(true)
+    })
+
+    it('passes never overlap on one instance (a slow pass makes the next tick a no-op)', async () => {
+      vi.useFakeTimers()
+      const m = new RedisJM(redis, 'test-group', { maintenanceInterval: 100, logger: false })
+      let release!: () => void
+      const slow = new Promise<void>((r) => { release = r })
+      const runSpy = vi.spyOn(m, 'runMaintenance').mockImplementation(async () => {
+        await slow
+        return null
+      })
+
+      m.start(1000)
+      await vi.advanceTimersByTimeAsync(350) // ticks at 100/200/300 land while the first pass is stuck
+      expect(runSpy).toHaveBeenCalledTimes(1)
+
+      release()
+      await vi.advanceTimersByTimeAsync(100) // next tick after the pass settled starts a new one
+      expect(runSpy).toHaveBeenCalledTimes(2)
+      await m.stop()
+    })
+
+    it('stop() awaits an in-flight maintenance pass', async () => {
+      const m = new RedisJM(redis, 'test-group', { maintenanceInterval: 1000, logger: false })
+      let release!: () => void
+      const slow = new Promise<void>((r) => { release = r })
+      vi.spyOn(m, 'runMaintenance').mockImplementation(async () => {
+        await slow
+        return null
+      })
+      m.start(1000)
+      let stopped = false
+      const stopping = m.stop().then(() => { stopped = true })
+      await new Promise((r) => setTimeout(r, 10))
+      expect(stopped).toBe(false)
+      release()
+      await stopping
+      expect(stopped).toBe(true)
+    })
+
+    it('should not run maintenance when maintenanceInterval is 0', async () => {
       vi.useFakeTimers()
       const m = new RedisJM(redis, 'test-group', { maintenanceInterval: 0 })
       const spy = vi.spyOn(m, 'performMaintenance')
@@ -917,8 +1016,7 @@ describe('RedisJM', () => {
       await vi.advanceTimersByTimeAsync(1000)
       expect(spy).not.toHaveBeenCalled()
 
-      m.stop()
-      vi.useRealTimers()
+      await m.stop()
     })
 
     it('should reuse a consumer-registered maintenance job', async () => {
@@ -931,11 +1029,10 @@ describe('RedisJM', () => {
       expect(() => m.start(100)).not.toThrow()
       await vi.advanceTimersByTimeAsync(0)
 
-      m.stop()
-      vi.useRealTimers()
+      await m.stop()
     })
 
-    it('should stop enqueuing maintenance after stop()', async () => {
+    it('should stop running maintenance after stop()', async () => {
       vi.useFakeTimers()
       const m = new RedisJM(redis, 'test-group', { maintenanceInterval: 500 })
       const spy = vi.spyOn(m, 'performMaintenance')
@@ -943,12 +1040,26 @@ describe('RedisJM', () => {
       m.start(100)
       await vi.advanceTimersByTimeAsync(0)
       const callsAtStop = spy.mock.calls.length
-      m.stop()
+      expect(callsAtStop).toBe(1)
+      await m.stop()
 
       await vi.advanceTimersByTimeAsync(2000)
       expect(spy.mock.calls.length).toBe(callsAtStop)
+    })
 
-      vi.useRealTimers()
+    it('rolling deploy: start() still registers the maintenance handler, which consumes a legacy-enqueued entry', async () => {
+      // An older instance enqueued the maintenance job on the reserved lane. A new instance must still
+      // consume it (lock-guarded) so it does not linger with its lock held.
+      const m = new RedisJM(redis, 'test-group', { maintenanceInterval: 60_000, keepFinishedInterval: 60000, logger: false })
+      const legacy = new Job({ jobName: MAINTENANCE_JOB_NAME, lane: '__maintenance' }, vi.fn())
+      await m.queue(legacy, '', null)
+      const runSpy = vi.spyOn(m, 'runMaintenance')
+      m.start(10)
+      // The immediate timer tick (1) plus the consumed legacy entry (2), which ran the lock-guarded pass.
+      await vi.waitFor(() => expect(runSpy).toHaveBeenCalledTimes(2))
+      await vi.waitFor(async () => expect(await redis.sismember('redisjm:test-group:locks', `${MAINTENANCE_JOB_NAME}#`)).toBe(0))
+      expect(await redis.llen('redisjm:test-group:lane:__maintenance:queue')).toBe(0)
+      await m.stop()
     })
   })
 
@@ -1103,12 +1214,12 @@ describe('RedisJM', () => {
       }))
       await m.queue(job, 'r1', 'x')
 
-      // Defer the poll's pop: the first lmpop hangs until we release it with the queued jobId.
+      // Defer the poll's pop: the pop script's LPOP hangs until we release it with the queued jobId.
       let releasePop!: (v: unknown) => void
-      ;(redis.lmpop as any).mockImplementationOnce(() => new Promise((resolve) => { releasePop = resolve }))
+      ;(redis.lpop as any).mockImplementationOnce(() => new Promise((resolve) => { releasePop = resolve }))
 
       m.start(50)
-      await new Promise((r) => setTimeout(r, 0)) // let the poll reach the pending lmpop
+      for (let i = 0; i < 5; i++) await new Promise((r) => setTimeout(r, 0)) // let the poll reach the pending pop
 
       let stopped = false
       const stopPromise = m.stop({ abort: true }).then(() => { stopped = true })
@@ -1116,7 +1227,7 @@ describe('RedisJM', () => {
       expect(stopped).toBe(false) // stop is awaiting the mid-pop poll, not resolving early
 
       // The pop now resolves with the entry it already removed — the final poll dispatches the run.
-      releasePop(['redisjm:test-group:queue', ['midpop#r1']])
+      releasePop('midpop#r1')
       await stopPromise
       expect(stopped).toBe(true)
       expect(handlerDone).toBe(true) // stop() resolved only after the popped run settled
@@ -1307,8 +1418,13 @@ describe('RedisJM', () => {
     })
   })
 
-  describe('stale maintenance lock recovery', () => {
-    it('should reclaim a maintenance lock orphaned by a hard kill mid-run', async () => {
+  describe('stale maintenance record recovery', () => {
+    afterEach(() => { vi.useRealTimers() })
+
+    it('a maintenance record left running by a hard kill is reclaimed by the normal stale logic', async () => {
+      // WHY: the old queue-based maintenance needed a dedicated bootstrap reclaim of its own lock (a
+      // killed maintenance run held it forever). Timer-driven maintenance does not depend on that lock,
+      // so the stranded record is just another stale `running` record.
       vi.useFakeTimers()
       const m = new RedisJM(redis, 'test-group', {
         heartbeatInterval: 1000,
@@ -1316,92 +1432,21 @@ describe('RedisJM', () => {
         keepFinishedInterval: 60000,
         maintenanceInterval: 500,
       })
-      const spy = vi.spyOn(m, 'performMaintenance')
-
-      // Maintenance was killed mid-run: lock held, status 'running', stale heartbeat, NOT in queue.
-      // Without proactive reclaim this deadlocks — maintenance can't reclaim its own lock.
-      const maintId = '__redisjm_maintenance#'
+      const maintId = `${MAINTENANCE_JOB_NAME}#`
       await redis.sadd('redisjm:test-group:locks', maintId)
       await redis.hset('redisjm:test-group:log', maintId, JSON.stringify({
-        jobId: maintId, jobName: '__redisjm_maintenance', runId: '', inputs: null,
+        jobId: maintId, jobName: MAINTENANCE_JOB_NAME, runId: '', inputs: null,
         targetGroup: 'test-group', status: 'running', progress: 0,
         startedAt: Date.now() - 10000, heartbeat: Date.now() - 10000,
       }))
 
       m.start(100)
-      // Drain the async reclaim→enqueue→pop→execute chain over a few poll cycles (deterministic).
-      for (let i = 0; i < 4; i++) await vi.advanceTimersByTimeAsync(100)
-
-      // The deadlock is broken: maintenance runs again and the orphaned lock is gone.
-      expect(spy).toHaveBeenCalled()
-      expect(await redis.sismember('redisjm:test-group:locks', maintId)).toBe(0)
-
-      m.stop()
-      vi.useRealTimers()
-    })
-
-    it('should reclaim a maintenance lock held with no backing record', async () => {
-      // A lock with no log record is unambiguously orphaned (e.g. crash between sadd and hset).
-      const m = new RedisJM(redis, 'test-group', { maintenanceInterval: 500 })
-      const maintId = '__redisjm_maintenance#'
-      await redis.sadd('redisjm:test-group:locks', maintId)
-      expect(await redis.sismember('redisjm:test-group:locks', maintId)).toBe(1)
-
-      vi.useFakeTimers()
-      m.start(100)
-      for (let i = 0; i < 3; i++) await vi.advanceTimersByTimeAsync(100)
-
-      // Lock reclaimed so maintenance can be enqueued and run again.
-      expect(await redis.sismember('redisjm:test-group:locks', maintId)).toBe(0)
-
-      m.stop()
-      vi.useRealTimers()
-    })
-
-    it('should relocate a maintenance job stranded on the legacy queue by a pre-lanes instance', async () => {
-      // A 0.0.3 instance enqueued maintenance to the LEGACY default queue and holds the group-wide
-      // lock, then the group cut over to lanes. A pure lane worker (below) never polls the legacy
-      // key, so without relocation the entry strands there with the lock held and group-wide
-      // maintenance deadlocks. reclaimStaleMaintenanceLock must move it onto the __maintenance lane.
-      const maintId = '__redisjm_maintenance#'
-      await redis.sadd('redisjm:test-group:locks', maintId)
-      // 0.0.3-style record: status 'queued', NO `lane` field.
-      await redis.hset('redisjm:test-group:log', maintId, JSON.stringify({
-        jobId: maintId, jobName: '__redisjm_maintenance', runId: '', inputs: null,
-        targetGroup: 'test-group', status: 'queued', progress: 0,
-      }))
-      await redis.rpush('redisjm:test-group:queue', maintId)
-
-      // Pure lane worker: only a lane:'images' job → never subscribes to the legacy default lane.
-      const m = new RedisJM(redis, 'test-group', {
-        maintenanceInterval: 500,
-        keepFinishedInterval: 60000,
-        logger: false,
-      })
-      m.createJob({ jobName: 'store', lane: 'images' }, vi.fn())
-      const spy = vi.spyOn(m, 'performMaintenance')
-
-      vi.useFakeTimers()
-      m.start(100)
-
-      // First tick runs the bootstrap reclaim → relocate; assert the mid-state before the entry is
-      // popped: it left the legacy queue and now sits on the __maintenance lane (relocated, not dropped).
       await vi.advanceTimersByTimeAsync(0)
-      expect(await redis.lpos('redisjm:test-group:queue', maintId)).toBeNull()
-      expect(await redis.lpos('redisjm:test-group:lane:__maintenance:queue', maintId)).not.toBeNull()
 
-      // Drain the relocate→pop→execute chain over a few more poll cycles (deterministic). Stay
-      // below the 500ms maintenanceInterval so the end-state lock reflects the reclaimed run, not a
-      // fresh periodic re-enqueue.
-      for (let i = 0; i < 3; i++) await vi.advanceTimersByTimeAsync(100)
-
-      // The deadlock is broken: maintenance ran and released the lock (the entry already left the
-      // legacy queue at the mid-state assert above, and nothing re-pushes it there).
-      expect(spy).toHaveBeenCalled()
       expect(await redis.sismember('redisjm:test-group:locks', maintId)).toBe(0)
-
-      m.stop()
-      vi.useRealTimers()
+      const record = JSON.parse((await redis.hget('redisjm:test-group:log', maintId))!) as JobLogRecord
+      expect(record.status).toBe('stale')
+      await m.stop()
     })
   })
 
@@ -1436,10 +1481,10 @@ describe('RedisJM', () => {
     })
   })
 
-  describe('enqueue failure rollback', () => {
-    it('should roll back both lock and log when the queue push fails', async () => {
+  describe('enqueue failure', () => {
+    it('a failed enqueue (one atomic script) leaves neither lock nor log behind', async () => {
       const job = new Job({ jobName: 'rollback' }, vi.fn())
-      ;(redis.rpush as any).mockImplementationOnce(async () => { throw new Error('redis down') })
+      ;(redis.evalsha as any).mockRejectedValueOnce(new Error('redis down'))
 
       await expect(manager.queue(job, 'r1', 'x')).rejects.toThrow('redis down')
 
@@ -1742,27 +1787,19 @@ describe('RedisJM', () => {
       expect(await redis.sismember('redisjm:test-group:locks', jobId)).toBe(0)
     })
 
-    it('sequential-LPOP fallback: same routing + roundRobin behavior when LMPOP is unavailable', async () => {
-      // Simulate Redis < 7: LMPOP is an unknown command, forcing the sequential-LPOP fallback. The
-      // manager probes once, catches the unknown-command error, and switches to LPOP permanently.
-      ;(redis.lmpop as any).mockRejectedValue(new Error("ERR unknown command 'LMPOP'"))
-
+    it('scripts survive a flushed script cache (EVALSHA NOSCRIPT → EVAL fallback)', async () => {
       const m = new RedisJM(redis, 'test-group', { keepFinishedInterval: 60000, logger: false })
-      const order: string[] = []
-      const aJob = m.createJob({ jobName: 'a-job', lane: 'A' }, vi.fn(async () => { order.push('A') }))
-      const bJob = m.createJob({ jobName: 'b-job', lane: 'B' }, vi.fn(async () => { order.push('B') }))
-      // Routing isolation: a lane-C job (unsubscribed) must never be popped via the fallback either.
-      await m.queue(new Job({ jobName: 'c-job', lane: 'C' }, vi.fn()), 'r1', 'x')
-      for (const r of ['r1', 'r2', 'r3']) await m.queue(aJob, r, 'x')
-      for (const r of ['r1', 'r2', 'r3']) await m.queue(bJob, r, 'x')
-
-      for (let i = 0; i < 6; i++) expect(await m.popAndExecute()).toBe(true)
-
-      // Identical fairness (interleaved) and routing (C untouched) via the fallback path.
-      expect(order).toEqual(['A', 'B', 'A', 'B', 'A', 'B'])
-      expect(await redis.lpos('redisjm:test-group:lane:C:queue', 'c-job#r1')).not.toBeNull()
-      // LMPOP was probed exactly once, then abandoned for LPOP.
-      expect((redis.lmpop as any).mock.calls.length).toBe(1)
+      const fn = vi.fn()
+      const job = m.createJob({ jobName: 'ns' }, fn)
+      await m.queue(job, 'r1', 'x')
+      redis._flushScripts() // e.g. a Redis restart / failover
+      await m.queue(job, 'r2', 'x')
+      redis._flushScripts()
+      expect(await m.popAndExecute()).toBe(true)
+      redis._flushScripts()
+      expect(await m.popAndExecute()).toBe(true)
+      expect(fn).toHaveBeenCalledTimes(2)
+      expect(vi.mocked(redis.eval).mock.calls.length).toBeGreaterThan(0)
     })
   })
 

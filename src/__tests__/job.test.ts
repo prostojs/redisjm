@@ -1,5 +1,6 @@
-import { describe, it, expect, vi } from 'vitest'
-import { Job } from '../job'
+import { afterEach, describe, it, expect, vi } from 'vitest'
+import { JobTimeoutError } from '../errors'
+import { getStartPhaseExecutionId, Job } from '../job'
 import { RedisJM } from '../redisjm'
 import type { JobContext } from '../types'
 import { createMockRedis } from './mock-redis'
@@ -273,6 +274,34 @@ describe('Job', () => {
     })
   })
 
+  describe('heartbeat vs. terminal hooks', () => {
+    afterEach(() => { vi.useRealTimers() })
+
+    // WHY: a heartbeat is a read-modify-write of the record. One still in flight when the run settled
+    // could land AFTER the terminal finish/error write and flip the record back to `running`.
+    it.each(['finish', 'error'] as const)('waits for an in-flight heartbeat before dispatching %s', async (terminal) => {
+      vi.useFakeTimers()
+      const order: string[] = []
+      let releaseBeat!: () => void
+      const job = new Job<string>(metadata, async () => {
+        await new Promise((r) => setTimeout(r, 150)) // one beat fires at 100 and stays in flight
+        if (terminal === 'error') throw new Error('boom')
+      })
+      job.hook('heartbeat', () => new Promise<void>((r) => {
+        order.push('beat-start')
+        releaseBeat = () => { order.push('beat-end'); r() }
+      }))
+      job.hook(terminal, () => { order.push(terminal) })
+
+      const exec = job.execute('x', { targetGroup: 'g', heartbeatInterval: 100 }).catch(() => {})
+      await vi.advanceTimersByTimeAsync(400) // handler settled at 150; beats at 200/300 were skipped/stopped
+      expect(order).toEqual(['beat-start'])
+      releaseBeat()
+      await exec
+      expect(order).toEqual(['beat-start', 'beat-end', terminal])
+    })
+  })
+
   describe('context callbacks', () => {
     it('should dispatch update event with progress via setProgress', async () => {
       const fn = vi.fn(async (_input: string, ctx: JobContext) => {
@@ -378,6 +407,158 @@ describe('Job', () => {
       expect(removeSpy).toHaveBeenCalledWith('abort', expect.any(Function))
       // A later abort of the external signal must not reach this settled run's detached listener.
       expect(() => external.abort('too late')).not.toThrow()
+    })
+  })
+
+  describe('execution timeout', () => {
+    afterEach(() => { vi.useRealTimers() })
+
+    const hung = () => new Promise<void>(() => {})
+
+    // WHY: a hung handler used to hold execute() (and the manager's concurrency slot) forever. With a
+    // timeout, execute() must settle on its own: abort ctx.signal('timeout'), fire the error hook with
+    // a JobTimeoutError, and reject — without waiting for the handler.
+    it('rejects with JobTimeoutError, aborts ctx.signal and fires the error hook when a handler hangs', async () => {
+      vi.useFakeTimers()
+      let ctxRef!: JobContext
+      const job = new Job<string>(metadata, (_i, ctx) => { ctxRef = ctx; return hung() })
+      const onError = vi.fn()
+      const onFinish = vi.fn()
+      const onHeartbeat = vi.fn()
+      job.hook('error', onError)
+      job.hook('finish', onFinish)
+      job.hook('heartbeat', onHeartbeat)
+
+      const exec = job.execute('x', { targetGroup: 'g', timeoutMs: 100, heartbeatInterval: 30 })
+      const settled = expect(exec).rejects.toBeInstanceOf(JobTimeoutError)
+      await vi.advanceTimersByTimeAsync(100)
+      await settled
+
+      expect(ctxRef.signal.aborted).toBe(true)
+      expect(ctxRef.signal.reason).toBe('timeout')
+      expect(onError).toHaveBeenCalledTimes(1)
+      const err = onError.mock.calls[0][0].error as JobTimeoutError
+      expect(err).toBeInstanceOf(JobTimeoutError)
+      expect(err.timeoutMs).toBe(100)
+      expect(onFinish).not.toHaveBeenCalled()
+      // The heartbeat timer was cleared when execute settled, although the handler never did.
+      const beats = onHeartbeat.mock.calls.length
+      await vi.advanceTimersByTimeAsync(500)
+      expect(onHeartbeat.mock.calls.length).toBe(beats)
+    })
+
+    it('does not interfere with a handler that finishes in time', async () => {
+      vi.useFakeTimers()
+      let ctxRef!: JobContext
+      const job = new Job<string>(metadata, async (_i, ctx) => {
+        ctxRef = ctx
+        await new Promise((r) => setTimeout(r, 50))
+      })
+      const onFinish = vi.fn()
+      job.hook('finish', onFinish)
+      const exec = job.execute('x', { targetGroup: 'g', timeoutMs: 100 })
+      await vi.advanceTimersByTimeAsync(50)
+      await exec
+      await vi.advanceTimersByTimeAsync(200) // the cleared timer must never fire
+      expect(onFinish).toHaveBeenCalledTimes(1)
+      expect(ctxRef.signal.aborted).toBe(false)
+    })
+
+    it('still reports the timeout when the handler rejects synchronously on abort', async () => {
+      vi.useFakeTimers()
+      const job = new Job<string>(metadata, (_i, ctx) => new Promise<void>((_, reject) => {
+        ctx.signal.addEventListener('abort', () => reject(new Error('aborted by signal')))
+      }))
+      const exec = job.execute('x', { targetGroup: 'g', timeoutMs: 100 })
+      const settled = expect(exec).rejects.toBeInstanceOf(JobTimeoutError)
+      await vi.advanceTimersByTimeAsync(100)
+      await settled
+    })
+
+    // WHY: the abandoned handler promise must never become an unhandled rejection (vitest fails the run
+    // on one), and its late outcome is logged exactly once.
+    it('logs an abandoned handler that later rejects or resolves exactly once', async () => {
+      vi.useFakeTimers()
+      const logger = vi.fn()
+      let rejectLate!: (e: Error) => void
+      let resolveLate!: () => void
+      const rejecting = new Job<string>({ jobName: 'rej' }, () => new Promise<void>((_, rej) => { rejectLate = rej }))
+      const resolving = new Job<string>({ jobName: 'res' }, () => new Promise<void>((res) => { resolveLate = res }))
+
+      const a = rejecting.execute('x', { targetGroup: 'g', timeoutMs: 10, logger })
+      const b = resolving.execute('x', { targetGroup: 'g', timeoutMs: 10, logger })
+      const settled = Promise.all([expect(a).rejects.toBeInstanceOf(JobTimeoutError), expect(b).rejects.toBeInstanceOf(JobTimeoutError)])
+      await vi.advanceTimersByTimeAsync(10)
+      await settled
+      expect(logger).not.toHaveBeenCalled()
+
+      rejectLate(new Error('late failure'))
+      resolveLate()
+      await vi.advanceTimersByTimeAsync(0)
+      expect(logger).toHaveBeenCalledTimes(2)
+      const messages = logger.mock.calls.map(([m]) => m as string)
+      expect(messages.some((m) => /rej#x.*rejected after its 10ms timeout/.test(m))).toBe(true)
+      expect(messages.some((m) => /res#x.*settled after its 10ms timeout/.test(m))).toBe(true)
+      expect(logger.mock.calls.find(([m]) => /rejected/.test(m as string))![1]).toBeInstanceOf(Error)
+    })
+
+    it('treats 0 / unset / invalid timeoutMs as no timeout', async () => {
+      vi.useFakeTimers()
+      for (const timeoutMs of [0, undefined, -5, Number.NaN]) {
+        const job = new Job<string>(metadata, async () => { await new Promise((r) => setTimeout(r, 1000)) })
+        const exec = job.execute('x', { targetGroup: 'g', timeoutMs })
+        await vi.advanceTimersByTimeAsync(1000)
+        await expect(exec).resolves.toBeUndefined()
+      }
+    })
+
+    it('getTimeoutMs: job value wins (0 = explicit opt-out), unset defers to the manager', () => {
+      expect(new Job({ jobName: 'a' }, vi.fn()).getTimeoutMs()).toBeUndefined()
+      expect(new Job({ jobName: 'a', timeoutMs: 250 }, vi.fn()).getTimeoutMs()).toBe(250)
+      expect(new Job({ jobName: 'a', timeoutMs: 0 }, vi.fn()).getTimeoutMs()).toBe(0)
+      expect(new Job({ jobName: 'a', timeoutMs: -1 }, vi.fn()).getTimeoutMs()).toBe(0)
+    })
+  })
+
+  describe('start-phase failure tagging', () => {
+    it('tags a start-hook failure with the execution id, preserving the thrown object', async () => {
+      const job = new Job<string>(metadata, vi.fn())
+      const thrown = new Error('claim failed')
+      let executionId: string | undefined
+      job.hook('start', (p) => { executionId = p.executionId; throw thrown })
+      const err = await job.execute('x', { targetGroup: 'g' }).catch((e) => e)
+      expect(err).toBe(thrown)
+      expect(getStartPhaseExecutionId(err)).toBe(executionId)
+    })
+
+    it('normalizes a thrown primitive so it can be tagged, and leaves handler errors untagged', async () => {
+      const job = new Job<string>(metadata, vi.fn())
+      job.hook('start', () => { throw 'nope' })
+      const err = await job.execute('x', { targetGroup: 'g' }).catch((e) => e)
+      expect(err).toBeInstanceOf(Error)
+      expect(getStartPhaseExecutionId(err)).toBeDefined()
+
+      const failing = new Job<string>(metadata, () => { throw new Error('handler') })
+      const handlerErr = await failing.execute('x', { targetGroup: 'g' }).catch((e) => e)
+      expect(getStartPhaseExecutionId(handlerErr)).toBeUndefined()
+    })
+  })
+
+  describe('enqueue', () => {
+    it('delegates to manager.enqueue with options and returns its result', async () => {
+      const mockManager = {
+        enqueue: vi.fn().mockResolvedValue({ status: 'deduped', jobId: 'testJob#run1' }),
+        getTargetGroup: () => 'group1',
+      } as unknown as RedisJM
+      const job = new Job<string>(metadata, vi.fn(), mockManager)
+      const result = await job.enqueue('run1', 'input1', undefined, { first: true })
+      expect(result).toEqual({ status: 'deduped', jobId: 'testJob#run1' })
+      expect(mockManager.enqueue).toHaveBeenCalledWith(job, 'run1', 'input1', { first: true })
+    })
+
+    it('should throw when no manager is available', async () => {
+      const job = new Job<string>(metadata, vi.fn())
+      await expect(job.enqueue('run1', 'input1')).rejects.toThrow('No RedisJM instance provided')
     })
   })
 

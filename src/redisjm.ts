@@ -1,9 +1,29 @@
+import { randomUUID } from 'node:crypto'
 import { Hookable } from 'hookable'
 import type Redis from 'ioredis'
-import { Job } from './job'
+import { classifyRedisError, JobTimeoutError, RedisJMEnqueueError } from './errors'
+import type { EnqueueErrorReason, RedisErrorReason } from './errors'
+import { getStartPhaseExecutionId, Job } from './job'
 import { createMaintenanceJob, MAINTENANCE_JOB_NAME, MAINTENANCE_LANE } from './maintenance'
-import { toError } from './utils'
+import {
+  DELETE_IF_UNCHANGED_SCRIPT,
+  ENQUEUE_SCRIPT,
+  POP_SCRIPT,
+  PRUNE_JOB_SCRIPT,
+  PURGE_SCRIPT,
+  runScript,
+  sha1Hex,
+  TRANSITION_SCRIPT,
+} from './scripts'
+import { nonNegativeInt, positiveOrZero, toError, toTaggable } from './utils'
 import type {
+  EnqueueOptions,
+  EnqueueResult,
+  EveryOptions,
+  InFlightCounts,
+  ListPage,
+  ListPageOptions,
+  RedisJMHealth,
   JobAttrs,
   JobAttrValue,
   JobErrorEventPayload,
@@ -21,6 +41,7 @@ import type {
   RedisJMOptions,
   RedisJMStats,
   ResolvedRedisJMOptions,
+  StartFailedEventPayload,
   StopOptions,
 } from './types'
 
@@ -34,7 +55,179 @@ const DEFAULT_OPTIONS: Omit<ResolvedRedisJMOptions, 'maintenanceInterval'> = {
   laneStrategy: 'roundRobin',
   lanePriority: [],
   concurrency: 1,
+  jobTimeout: 0,
+  maxRunMs: 0,
+  laneConcurrency: {},
+  laneCaps: {},
+  maxInputsBytes: 0,
+  maxRecordsPerPass: 1000,
+  memoryWarnRatio: 0.8,
 }
+
+/** One lane of a pop: its list key and spec (`'*'` = own lane, or an allow-list `#jobA#jobB#`). */
+type PollPlan = Array<{ key: string; spec: string }>
+
+/** How often consumers re-read their jobs' lane sets to discover old lanes to drain. */
+const OLD_LANE_REFRESH_MS = 5000
+
+/** How many entries from the head of an OLD lane the pop script inspects for an allow-listed job. */
+const OLD_LANE_SCAN_LIMIT = 100
+
+/** Max jobs whose bookkeeping sets one maintenance pass prunes (one small script call each). */
+const JOB_PRUNE_BATCH = 100
+
+/** Job-lock-set members sampled per prune call (drift self-heals over passes). */
+const JOB_LOCK_PRUNE_SAMPLE = 200
+
+/**
+ * How long one sighting of a pre-0.2 instance (see `noteLegacyInstance`) keeps maintenance's legacy
+ * orphan check on for NEW-format `queued` records — floored at 10 stale thresholds. Long enough to cover
+ * the two passes past the threshold the check needs after the last old instance is gone.
+ */
+const LEGACY_WINDOW_MS = 10 * 60_000
+
+/** How many times `updateLog` re-reads and retries when its compare-and-set loses a race. */
+const CAS_ATTEMPTS = 5
+
+/**
+ * What an `updateLog` mutator returns. `false` or a reason string REJECTS the write (nothing is touched;
+ * the string comes back as `LogUpdate.reason`). Otherwise the record is written, and the queue-structure
+ * side effects are DERIVED from the status change (see `RedisJM.transition`) — a mutator only states
+ * what the status change can't: a queued → queued requeue's push side, and whether it must take the
+ * run's `claiming` entry as a precondition (so two overlapping requeues can't both push it back).
+ */
+type Mutation = void | false | string | { push: 'L' | 'R'; takeFromClaiming?: boolean }
+
+/** Result of `updateLog`. */
+interface LogUpdate {
+  outcome: 'written' | 'rejected' | 'missing'
+  /** The record as written (`'written'`), or as read when the mutator rejected it. */
+  record?: JobLogRecord
+  /** The mutator's rejection reason, or `'precondition'` when a take-from-set precondition failed. */
+  reason?: string
+}
+
+/** Per-pass failure tally of maintenance (see `RedisJM.createOpGuard`). */
+interface OpGuard {
+  /** Runs one guarded Redis operation; resolves whether it succeeded. */
+  run: (op: () => Promise<unknown>) => Promise<boolean>
+  /** Records a failure caught elsewhere. */
+  fail: (err: unknown) => void
+  /** Logs ONCE per pass: the failure count and the classified reason of the first failure. */
+  report: (label: string) => void
+}
+
+/** One scanned log batch of a maintenance pass, split by `RedisJM.planLogCleanup`. */
+interface LogBatch {
+  /** Scanned jobId → raw JSON. */
+  entries: Map<string, string>
+  /** Cursor to resume the scan from (`'0'` = completed). */
+  cursor: string
+  garbage: string[]
+  expired: string[]
+  live: Array<[string, JobLogRecord]>
+}
+
+/** The `INFO memory` part of a health snapshot. */
+type MemoryInfo = Pick<RedisJMHealth, 'usedMemory' | 'maxMemory' | 'usedRatio' | 'maxmemoryPolicy'>
+
+/** Parses `field:value` lines of an `INFO` reply. */
+function parseInfo(info: string): Map<string, string> {
+  const map = new Map<string, string>()
+  for (const line of info.split(/\r?\n/)) {
+    const i = line.indexOf(':')
+    if (i > 0 && !line.startsWith('#')) map.set(line.slice(0, i), line.slice(i + 1).trim())
+  }
+  return map
+}
+
+/** A persisted scan cursor as read back (`'0'` — start over — when absent, unreadable or malformed). */
+function toCursor(value: unknown): string {
+  return typeof value === 'string' && /^\d+$/.test(value) ? value : '0'
+}
+
+/** Normalizes a `Record<lane, number>` option: drops non-finite / negative values, floors the rest. */
+function normalizeLaneLimits(limits: Record<string, number> | undefined): Record<string, number> {
+  const out: Record<string, number> = {}
+  for (const [lane, value] of Object.entries(limits ?? {})) {
+    const limit = nonNegativeInt(value)
+    if (limit !== undefined) out[lane] = limit
+  }
+  return out
+}
+
+/**
+ * Max fields/members per batched HDEL/SREM in maintenance. Big enough that cleaning a backlog of
+ * expired records is a handful of round trips, small enough that one command never blocks Redis
+ * for long (each removal is O(1)).
+ */
+const DELETE_BATCH_SIZE = 500
+
+/** Splits `"jobName#runId"` on its FIRST '#'; a separator-less id yields `{ jobName: id, runId: '' }`. */
+function splitJobId(jobId: string): { jobName: string; runId: string } {
+  const i = jobId.indexOf('#')
+  return i === -1 ? { jobName: jobId, runId: '' } : { jobName: jobId.slice(0, i), runId: jobId.slice(i + 1) }
+}
+
+/** Whether a status is terminal (the run is over: its lock is released, its record only kept as history). */
+function isTerminal(status: JobStatus): boolean {
+  return status === 'finished' || status === 'error' || status === 'stale'
+}
+
+/**
+ * Whether a parsed value is a log record: a non-null object with a string `status`. Valid JSON that
+ * isn't one — a foreign field holding `"42"`, `"true"`, `null`, or an array — would otherwise flow
+ * through `as JobLogRecord` as a record with every property `undefined`.
+ */
+function isRecordShape(value: unknown): value is JobLogRecord {
+  return typeof value === 'object' && value !== null && typeof (value as JobLogRecord).status === 'string'
+}
+
+/** `RedisJM.parseRecord`'s verdict, without its logging: whether stored `json` is a log record. */
+function isRecordJson(json: string): boolean {
+  try {
+    return isRecordShape(JSON.parse(json))
+  } catch {
+    return false
+  }
+}
+
+/** Pairs a `ZRANGEBYSCORE … WITHSCORES` reply (`[member, score, member, score, …]`) up. */
+function scorePairs(flat: string[]): Array<[string, string]> {
+  const pairs: Array<[string, string]> = []
+  for (let i = 0; i + 1 < flat.length; i += 2) pairs.push([flat[i], flat[i + 1]])
+  return pairs
+}
+
+/**
+ * The mutator that fails a run which never started — still `queued` (popped, never claimed) — with a
+ * terminal `error`; the lock release and history TTL ride on the transition. Rejects any other status.
+ */
+function failQueuedRun(message: string, now: number): (record: JobLogRecord) => Mutation {
+  return (record) => {
+    if (record.status !== 'queued') return false
+    record.status = 'error'
+    record.error = message
+    record.finishedAt = now
+  }
+}
+
+/**
+ * Serializes a record whose inputs are already serialized (`inputsJson`; `undefined` = no inputs key, as
+ * `JSON.stringify` omits it), appending them last — so an enqueue stringifies the inputs exactly once,
+ * whether or not it also measured them against `maxInputsBytes`.
+ */
+function serializeRecord(record: Omit<JobLogRecord, 'inputs'>, inputsJson: string | undefined): string {
+  const json = JSON.stringify(record)
+  return inputsJson === undefined ? json : `${json.slice(0, -1)},"inputs":${inputsJson}}`
+}
+
+/**
+ * Errors thrown by the manager's CLAIM write (the `start` hook's read-modify-write of the record).
+ * Tagged so start-failure recovery knows the claim never landed (record still `queued`, popped entry
+ * gone) and can push the entry back instead of routing it through the run's failure path.
+ */
+const claimWriteFailures = new WeakSet<object>()
 
 /**
  * Shared pre-resolved execution thunk for the pop branches that already did their Redis cleanup
@@ -73,8 +266,13 @@ export class RunSupersededError extends Error {
 /**
  * Redis Job Manager for distributed job queues.
  *
- * Manages job scheduling, execution, and lifecycle using three Redis structures per target group:
- * a List (queue), a Set (locks), and a Hash (log).
+ * Manages job scheduling, execution, and lifecycle with a few Redis structures per target group: a
+ * List per lane (queue), a Set (locks), a Hash (log), a sorted set of delayed runs, and a sorted set of
+ * popped-but-not-yet-claimed runs (`claiming`).
+ *
+ * REQUIRES Redis >= 7.0: pops and record transitions are `#!lua` shebang scripts (so that a Redis at
+ * `maxmemory` refuses a pop up front instead of losing the popped run). Field-level history expiry
+ * (`HPEXPIRE`) is used when the server has it (>= 7.4) and skipped otherwise.
  *
  * @example
  * ```ts
@@ -101,6 +299,25 @@ export class RedisJM extends Hookable<RedisJMHooks> {
   private polling = false
   private maintenanceTimer: ReturnType<typeof setInterval> | undefined
   /**
+   * The maintenance pass currently running from this instance's timer, if any. The timer skips a tick
+   * while it is set (passes never overlap on one instance), and `stop()` awaits it. Never rejects.
+   */
+  private maintenancePass: Promise<void> | undefined
+  /**
+   * Running count of enqueues Redis refused with an OOM error (`RedisJMEnqueueError` reason `'oom'`)
+   * since this manager was created — a cheap pressure signal for operational health reporting.
+   */
+  private oomRefusals = 0
+  /**
+   * Epoch ms until which the poll loop does not pop, set by start-failure recovery (see
+   * `recoverUnclaimed`). After a requeue it is a short back-off (≤ 1s) so a persistent failure can't
+   * spin pop → fail → requeue at full speed. After an OOM / a deferral it is a whole stale-threshold
+   * window: every further pop would hit the same wall and park its run in `claiming` for maintenance to
+   * requeue later, so the loop backs off instead. Maintenance keeps running meanwhile (its emergency
+   * pass frees memory).
+   */
+  private popsPausedUntil = 0
+  /**
    * Promises of the runs currently executing in the poll loop (up to `concurrency`). The poll loop
    * dispatches into this set without awaiting so multiple runs can be in flight at once; `stop()`
    * awaits them all to drain. Each promise swallows its own errors, so members never reject.
@@ -120,12 +337,65 @@ export class RedisJM extends Hookable<RedisJMHooks> {
    * rejects (all of `poll`'s awaits are caught).
    */
   private currentPoll: Promise<void> | undefined
+  /**
+   * Incremented by every `start()`. A poll loop only keeps scheduling itself while its own generation is
+   * current: a poll still in flight from before a `stop()` must not resume scheduling when `start()` is
+   * called again before it settles — that would run TWO loops (exceeding `concurrency`, and leaving a
+   * timer the next `stop()` doesn't know about).
+   */
+  private pollGeneration = 0
   /** Round-robin cursor rotating the work-lane poll order once per poll to prevent starvation. */
   private pollCursor = 0
-  /** Lazy `LMPOP` capability flag: `undefined` = not yet probed, `false` = fall back to sequential `LPOP`. */
-  private lmpopSupported: boolean | undefined
+  /**
+   * Set by `stop()`, cleared by `start()`: once stopped, `popAndExecute()` refuses to pop (returns
+   * `false`), so nothing new starts while the caller is shutting down.
+   */
+  private stopped = false
+  /** In-flight `popAndExecute()` calls (pop + run), drained by `stop()` like poll-loop runs. Never reject. */
+  private readonly manualRuns = new Set<Promise<unknown>>()
+  /** Poll-loop runs in flight per lane queue key — enforces `laneConcurrency`. */
+  private readonly laneInFlight = new Map<string, number>()
+  /** `laneConcurrency` resolved to lane queue keys (the poll loop only ever sees keys). */
+  private readonly laneConcurrencyByKey = new Map<string, number>()
+  /**
+   * This instance's own lanes, rebuilt after a job is (un)registered (see `getSubscribedQueueKeys`):
+   * the distinct work-lane keys in base order (`lanePriority` first under `priority`) and the set of
+   * every own key (work lanes + the maintenance lane).
+   */
+  private ownLanes: { workKeys: string[]; keys: Set<string> } | undefined
+  /** True while the poll loop sleeps its idle `interval` (the only wait `wake()` may cut short). */
+  private idleWaiting = false
+  /** A `wake()` that arrived while a poll was in flight: the next scheduling re-polls immediately. */
+  private wakePending = false
+  /** Re-poll entry point of the running loop (set by `start()`), used by `wake()`. */
+  private schedulePoll: ((delay: number) => void) | undefined
+  /** Timers created by `every()`, cleared by `stop()`. */
+  private readonly everyTimers = new Set<ReturnType<typeof setInterval>>()
+  /** `memoryPressure` edge trigger: fires when crossing upward while armed; re-armed below the ratio. */
+  private memoryPressureArmed = true
+  /** Local log-scan cursor for EMERGENCY passes (the shared cursor can't be written under OOM). */
+  private emergencyCursor = '0'
+  /** Whether the current OOM pop-refusal episode was already logged (logged once per episode). */
+  private popOomLogged = false
+  /** Old lanes this instance's jobs still have entries on, with their allow-lists (see `getPollPlan`). */
+  private oldLanes: PollPlan = []
+  /** Epoch ms of the last `refreshOldLanes` read. */
+  private lastOldLaneRefresh = 0
   /** Epoch ms of the last delayed-set promotion sweep; rate-limits `promoteDueDelayed` (see there). */
   private lastPromotionCheck = 0
+  /**
+   * Tail of the per-record write queue (see `updateLog`): this instance's writes to one record run one
+   * after another, so they never race each other's compare-and-set. Entries are removed once idle.
+   */
+  private readonly recordWrites = new Map<string, Promise<unknown>>()
+  /**
+   * The JSON this instance last saw of a record it is about to write again — read on the pop (the
+   * claim's input) or written as the run's owner while `running` (the next heartbeat/update/finish's
+   * input). It seeds `updateLog`'s first compare-and-set, saving the re-read; a stale seed just costs
+   * one compare-and-set miss and a re-read. Dropped on any write that isn't an owner's `running` write,
+   * so it holds about one entry per run executing here.
+   */
+  private readonly recordJson = new Map<string, string>()
 
   /**
    * @param redis - An ioredis client instance
@@ -159,6 +429,18 @@ export class RedisJM extends Hookable<RedisJMHooks> {
       laneStrategy: options?.laneStrategy ?? DEFAULT_OPTIONS.laneStrategy,
       lanePriority: options?.lanePriority ?? DEFAULT_OPTIONS.lanePriority,
       concurrency: Math.floor(concurrency),
+      jobTimeout: positiveOrZero(options?.jobTimeout),
+      maxRunMs: positiveOrZero(options?.maxRunMs),
+      laneConcurrency: normalizeLaneLimits(options?.laneConcurrency),
+      laneCaps: normalizeLaneLimits(options?.laneCaps),
+      maxInputsBytes: positiveOrZero(options?.maxInputsBytes),
+      maxRecordsPerPass: Math.max(1, Math.floor(positiveOrZero(options?.maxRecordsPerPass) || DEFAULT_OPTIONS.maxRecordsPerPass)),
+      memoryWarnRatio: options?.memoryWarnRatio === undefined
+        ? DEFAULT_OPTIONS.memoryWarnRatio
+        : Math.max(0, Number.isFinite(options.memoryWarnRatio) ? options.memoryWarnRatio : 0),
+    }
+    for (const [lane, cap] of Object.entries(this.options.laneConcurrency)) {
+      this.laneConcurrencyByKey.set(this.getQueueKey(lane), cap)
     }
     this.logger = options?.logger === false ? NOOP_LOGGER : (options?.logger ?? DEFAULT_LOGGER)
   }
@@ -175,9 +457,10 @@ export class RedisJM extends Hookable<RedisJMHooks> {
 
   /**
    * Checks whether a jobId currently holds a lock. A lock is held for the WHOLE active lifecycle:
-   * `queued` (waiting on a lane list), `delayed` (staged on the delayed set), `running` (executing),
-   * and `stale` (running lapsed, awaiting maintenance) — NOT just "queued". Returns `false` once the
-   * run reaches a terminal state and its lock is released (finished/error, or a reclaimed stale).
+   * `queued` (waiting on a lane list), `delayed` (staged on the delayed set) and `running` (executing)
+   * — NOT just "queued". Returns `false` once the run reaches a terminal state, whose write releases the
+   * lock in the same atomic step: `finished`, `error`, and `stale` (maintenance releases the lock as it
+   * marks the run stale; a stale run that proves itself alive re-takes it).
    *
    * @example
    * ```ts
@@ -191,7 +474,7 @@ export class RedisJM extends Hookable<RedisJMHooks> {
 
   /**
    * @deprecated Use {@link isLocked}. The name is misleading: it returns `true` for a lock held in
-   * ANY active state (queued, delayed, running, or stale), not only `queued`. Thin delegating alias.
+   * ANY active state (queued, delayed or running), not only `queued`. Thin delegating alias.
    */
   async isQueued(jobId: string): Promise<boolean> {
     return this.isLocked(jobId)
@@ -224,14 +507,7 @@ export class RedisJM extends Hookable<RedisJMHooks> {
       stale: 0,
       delayed: 0,
     }
-    // Collect the DISTINCT lanes to report on, deduped by their reported label — which collapses a
-    // no-lane job and an explicit `lane: 'default'` job onto the single legacy queue (see laneLabel).
-    const laneLabels = new Set<string>()
-    const addLane = (lane?: string) => laneLabels.add(this.laneLabel(lane))
-    // Always report the default lane and the maintenance lane, plus every registered job's lane.
-    addLane(undefined)
-    addLane(MAINTENANCE_LANE)
-    for (const job of this.registeredJobs) addLane(job.getLane())
+    const labels = this.knownLaneLabels()
     // Count statuses (single log scan, reusing list()) and pick up any lane seen on a record (a
     // producer-only instance still observes a consumer lane's backlog once that lane has records —
     // see the SCOPE note above).
@@ -239,22 +515,237 @@ export class RedisJM extends Hookable<RedisJMHooks> {
       // A foreign-but-shape-valid record can carry a status string outside the known set; guard the
       // increment so it can't seed a NaN bucket in the histogram.
       if (record.status in statuses) statuses[record.status]++
-      addLane(record.lane)
+      labels.add(this.laneLabel(record.lane))
     }
-
-    // Fan out every count read in one batch: the delayed/locks cardinalities plus a per-lane LLEN
-    // (report under the resolved label). Independent, non-transactional reads — see the doc note above.
-    const labels = [...laneLabels]
-    const [delayed, locks, ...lens] = await Promise.all([
+    // Independent, non-transactional reads in one batch — see the doc note above.
+    const [delayed, locks, queues] = await Promise.all([
       this.redis.zcard(this.getDelayedKey()),
       this.redis.scard(this.getLocksKey()),
-      ...labels.map((label) => this.redis.llen(this.getQueueKey(label))),
+      this.laneDepths(labels),
     ])
-    const queues: Record<string, number> = {}
-    labels.forEach((label, i) => {
-      queues[label] = lens[i]
-    })
     return { queues, delayed, locks, statuses }
+  }
+
+  /**
+   * Operational health snapshot (see `RedisJMHealth`): Redis memory use and eviction policy from
+   * `INFO memory` (works on managed Redis services that block `CONFIG`, and while Redis is full), this
+   * instance's OOM-refused enqueue count, and cheap cardinalities — per-lane queue lengths, delayed,
+   * claiming, locks. `running` is an estimate and `stale` is `null` unless `{ scan: true }`, which adds
+   * one O(n) log scan to count them exactly — keep that for occasional/dashboard use.
+   *
+   * @example
+   * ```ts
+   * const h = await manager.health()
+   * if (h.usedRatio !== null && h.usedRatio > 0.9) alert(h)
+   * ```
+   */
+  async health(options?: { scan?: boolean }): Promise<RedisJMHealth> {
+    return this.collectHealth(await this.readMemoryInfo(), options?.scan ?? false)
+  }
+
+  /** {@link health} with the `INFO memory` part already read (the memory-pressure check has it). */
+  private async collectHealth(memory: MemoryInfo, scan: boolean): Promise<RedisJMHealth> {
+    const labels = this.knownLaneLabels()
+    for (const lane of Object.keys(this.options.laneCaps)) labels.add(lane)
+    for (const lane of Object.keys(this.options.laneConcurrency)) labels.add(lane)
+    const [delayed, claiming, locks, queues] = await Promise.all([
+      this.redis.zcard(this.getDelayedKey()),
+      this.redis.zcard(this.getClaimingKey()),
+      this.redis.scard(this.getLocksKey()),
+      this.laneDepths(labels),
+    ])
+    const queued = Object.values(queues).reduce((a, b) => a + b, 0)
+    let running = Math.max(0, locks - queued - delayed - claiming)
+    let stale: number | null = null
+    if (scan) {
+      running = 0
+      stale = 0
+      for (const { status } of await this.list()) {
+        if (status === 'running') running++
+        else if (status === 'stale') stale++
+      }
+    }
+    return { ...memory, oomRefusals: this.oomRefusals, queues, delayed, claiming, running, stale, locks }
+  }
+
+  /**
+   * The lane labels this instance can name on its own: the default lane, the reserved maintenance lane
+   * and every registered job's lane (deduped by label, which collapses a no-lane job and an explicit
+   * `lane: 'default'` job onto the single legacy queue — see `laneLabel`).
+   */
+  private knownLaneLabels(): Set<string> {
+    const labels = new Set<string>(['default', MAINTENANCE_LANE])
+    for (const job of this.registeredJobs) labels.add(this.laneLabel(job.getLane()))
+    return labels
+  }
+
+  /** Queue depth (LLEN) of each lane, keyed by label — independent reads issued together. */
+  private async laneDepths(labels: Iterable<string>): Promise<Record<string, number>> {
+    const list = [...labels]
+    const lens = await Promise.all(list.map((label) => this.redis.llen(this.getQueueKey(label))))
+    return Object.fromEntries(list.map((label, i) => [label, lens[i]]))
+  }
+
+  /**
+   * In-flight runs of one job name, without scanning the log: reads the job's lock set and exactly those
+   * records (one `HMGET`) — O(runs in flight of this job), independent of the log size and of every other
+   * job. Popped-not-yet-claimed runs count as `queued`. See `InFlightCounts` for how `total` relates to
+   * the lock-set size `maxInFlight` is enforced against.
+   *
+   * @example
+   * ```ts
+   * const { total, running } = await manager.inFlight('send-email')
+   * ```
+   */
+  async inFlight(jobName: string): Promise<InFlightCounts> {
+    const ids = await this.redis.smembers(this.getJobLocksKey(jobName))
+    const counts: InFlightCounts = { total: 0, queued: 0, delayed: 0, running: 0 }
+    if (ids.length === 0) return counts
+    const values = await this.redis.hmget(this.getLogKey(), ...ids)
+    values.forEach((json, i) => {
+      const status = json ? this.parseRecord(json, ids[i])?.status : undefined
+      if (status === 'queued' || status === 'delayed' || status === 'running') {
+        counts[status]++
+        counts.total++
+      }
+    })
+    return counts
+  }
+
+  /**
+   * One page of log records, HSCAN-based so a large log can be listed incrementally (unlike `list()`,
+   * which reads it all). Filters (`status`, `lane`, `jobName`) are applied to the scanned records, and
+   * one call keeps scanning until it has about `limit` matches or reaches the end of the log — so only
+   * the last page comes back short (it may slightly exceed `limit`: the last HSCAN slice is kept whole),
+   * and a very selective filter may scan most of the log in a single call. Keep calling with the
+   * returned `cursor` until it is `'0'`. HSCAN semantics apply: a record may appear on two pages if the
+   * log changes meanwhile.
+   *
+   * @example
+   * ```ts
+   * let cursor = '0'
+   * do {
+   *   const page = await manager.listPage({ status: 'error', cursor })
+   *   render(page.records)
+   *   cursor = page.cursor
+   * } while (cursor !== '0')
+   * ```
+   */
+  async listPage(options: ListPageOptions = {}): Promise<ListPage> {
+    const limit = Math.max(1, Math.floor(options.limit ?? 100))
+    const lane = options.lane === undefined ? undefined : this.laneLabel(options.lane)
+    const records: JobLogRecord[] = []
+    const cursor = await this.scan('hscan', this.getLogKey(), options.cursor ?? '0', limit, (flat) => {
+      for (let i = 0; i < flat.length; i += 2) {
+        const record = this.parseRecord(flat[i + 1], flat[i])
+        if (!record) continue
+        if (options.status !== undefined && record.status !== options.status) continue
+        if (options.jobName !== undefined && record.jobName !== options.jobName) continue
+        if (lane !== undefined && this.laneLabel(record.lane) !== lane) continue
+        records.push(record)
+      }
+      return records.length < limit
+    })
+    return { records, cursor }
+  }
+
+  /**
+   * Enqueues `job` every `intervalMs` from this instance's own timer (works with or without `start()`;
+   * cleared by `stop()`), and returns a function that stops it. With `skipIfInFlight` (default) every
+   * tick uses the same runId, so the run lock dedupes a tick while the previous run is still
+   * queued/delayed/running — across ALL instances running the same `every()`; with `false` each tick
+   * enqueues a distinct run. Enqueue failures are logged (and fire `enqueueFailed`), never thrown from
+   * the timer.
+   *
+   * @example
+   * ```ts
+   * const cancel = manager.every(cleanupJob, 60_000, { inputs: null, immediate: true })
+   * ```
+   */
+  every<TInputs>(job: Job<TInputs, any>, intervalMs: number, options: EveryOptions<TInputs>): () => void {
+    if (!Number.isFinite(intervalMs) || intervalMs <= 0) {
+      throw new TypeError(`every(intervalMs): interval must be a positive number, got ${intervalMs}`)
+    }
+    const base = options.runId ?? 'every'
+    const skipIfInFlight = options.skipIfInFlight ?? true
+    const tick = () => {
+      const runId = skipIfInFlight ? base : `${base}-${Date.now()}`
+      this.enqueue(job, runId, options.inputs).catch((err) => {
+        this.logger(`every(): enqueue of "${job.getJobId(runId)}" failed`, toError(err))
+      })
+    }
+    const timer = setInterval(tick, intervalMs)
+    this.everyTimers.add(timer)
+    if (options.immediate) tick()
+    return () => {
+      clearInterval(timer)
+      this.everyTimers.delete(timer)
+    }
+  }
+
+  /** Reads `used_memory` / `maxmemory` / `maxmemory_policy` from `INFO memory`. */
+  private async readMemoryInfo(): Promise<MemoryInfo> {
+    const info = parseInfo(await this.redis.info('memory'))
+    const usedMemory = Number(info.get('used_memory') ?? 0)
+    const maxMemory = Number(info.get('maxmemory') ?? 0)
+    return {
+      usedMemory,
+      maxMemory,
+      usedRatio: maxMemory > 0 ? usedMemory / maxMemory : null,
+      maxmemoryPolicy: info.get('maxmemory_policy') ?? '',
+    }
+  }
+
+  /**
+   * Run once by `start()`: warns when Redis' eviction policy can hurt a job queue. Read from
+   * `INFO memory` — never `CONFIG GET`, which managed Redis services commonly block.
+   * - `allkeys-*`: Redis may evict queue/lock/log keys under memory pressure → lost or duplicated work.
+   * - `volatile-*`: redisjm keys carry no key TTL, so the policy cannot free them — Redis behaves like
+   *   `noeviction` for them while other volatile keys get evicted.
+   * Recommended: `noeviction`, a memory alarm (see `memoryWarnRatio` / `health()`), and ideally a
+   * dedicated instance for the queue.
+   */
+  private async checkEvictionPolicy(): Promise<void> {
+    try {
+      const { maxmemoryPolicy } = await this.readMemoryInfo()
+      if (maxmemoryPolicy.startsWith('allkeys-')) {
+        this.logger(`Redis maxmemory-policy is "${maxmemoryPolicy}": under memory pressure Redis may evict queue, lock and log keys, losing or duplicating jobs. Use "noeviction" (ideally on a dedicated instance) with a memory alarm.`)
+      } else if (maxmemoryPolicy.startsWith('volatile-')) {
+        this.logger(`Redis maxmemory-policy is "${maxmemoryPolicy}": redisjm keys carry no TTL, so this policy cannot free them — Redis will refuse writes once full. Prefer "noeviction" with a memory alarm.`)
+      }
+    } catch (err) {
+      this.logger('could not read INFO memory to check the eviction policy', toError(err))
+    }
+  }
+
+  /**
+   * Run after each timer maintenance pass: fires `memoryPressure` (with a `health()` snapshot) and logs
+   * when `used_memory / maxmemory` crosses `memoryWarnRatio` upward; re-arms once it drops below. Never
+   * throws.
+   */
+  private async checkMemoryPressure(): Promise<void> {
+    const warnRatio = this.options.memoryWarnRatio
+    if (warnRatio <= 0) return
+    try {
+      const memory = await this.readMemoryInfo()
+      const { usedRatio } = memory
+      if (usedRatio === null) return
+      if (usedRatio < warnRatio) {
+        this.memoryPressureArmed = true
+        return
+      }
+      if (!this.memoryPressureArmed) return
+      // Snapshot BEFORE disarming: if `health()` fails, the crossing is retried on the next tick instead
+      // of being swallowed until memory drops below the ratio and climbs back.
+      const snapshot = await this.collectHealth(memory, false)
+      this.memoryPressureArmed = false
+      this.logger(
+        `Redis memory at ${(usedRatio * 100).toFixed(1)}% of maxmemory (warn ratio ${warnRatio}); writes will be refused at 100% under noeviction`,
+      )
+      await this.emit('memoryPressure', snapshot)
+    } catch (err) {
+      this.logger('memory pressure check failed', toError(err))
+    }
   }
 
   /**
@@ -273,8 +764,58 @@ export class RedisJM extends Hookable<RedisJMHooks> {
   }
 
   /**
-   * Adds a job run to the end of the queue. Returns `true` if queued, `false` if already locked.
-   * Pass `options.delay` (ms) to stage the run on the delayed set instead of the live queue.
+   * Enqueues a job run and reports what happened: `{ status, jobId }` with status
+   * `'queued'` (written), `'deduped'` (the runId already holds a lock — queued/delayed/running —
+   * nothing written), `'busy'` (the job already has `>= maxInFlight` runs locked) or `'full'` (its lane
+   * is at its cap). Atomic: one server-side script takes the lock, writes the record and pushes it. `options.first` inserts at the FRONT of the lane queue (like
+   * `queueFirst`); `options.delay` stages the run on the delayed set (the two cannot be combined).
+   *
+   * Every Redis failure throws `RedisJMEnqueueError` (with a classified `reason`, e.g. `'oom'` when
+   * Redis is at `maxmemory` — then nothing at all was written) and fires the manager-level
+   * `enqueueFailed` hook. Validation errors (bad lane / delay) throw a plain `TypeError`/`Error`.
+   *
+   * @example
+   * ```ts
+   * const { status } = await manager.enqueue(job, 'order-123', { orderId: '123' })
+   * await manager.enqueue(job, 'urgent', { orderId: '9' }, { first: true })
+   * ```
+   */
+  async enqueue<TInputs>(job: Job<TInputs, any>, runId: string, inputs: TInputs, options?: EnqueueOptions): Promise<EnqueueResult> {
+    const [result] = await this.enqueueRun(job, [{ runId, inputs }], options?.first ? 'lpush' : 'rpush', options)
+    return result
+  }
+
+  /**
+   * Enqueues many runs of one job in ONE atomic script call and returns a result per entry, in entry
+   * order — so batch producers don't serialize one round trip per run. Each entry is checked like a
+   * single `enqueue` (dedupe, `maxInFlight`, lane cap — counted as the batch fills the lane). With
+   * `first: true` the batch lands at the head of the lane in its given order.
+   *
+   * All-or-nothing on failure: a Redis failure (e.g. OOM — Redis refuses the whole script) throws one
+   * `RedisJMEnqueueError` (its `jobId` is the first entry's) and NOTHING was written; an entry with
+   * oversized inputs rejects the whole batch before any write. Keep batches to a sensible size
+   * (hundreds to a few thousand): one script call blocks Redis for its duration.
+   *
+   * @example
+   * ```ts
+   * const results = await manager.enqueueMany(job, orders.map((o) => ({ runId: o.id, inputs: o })))
+   * const skipped = results.filter((r) => r.status !== 'queued')
+   * ```
+   */
+  async enqueueMany<TInputs>(
+    job: Job<TInputs, any>,
+    entries: Array<{ runId: string; inputs: TInputs }>,
+    options?: EnqueueOptions,
+  ): Promise<EnqueueResult[]> {
+    return this.enqueueRun(job, entries, options?.first ? 'lpush' : 'rpush', options)
+  }
+
+  /**
+   * Adds a job run to the end of the queue. Returns `true` if queued, `false` if it was not queued —
+   * deduped by a held lock, `busy` (`maxInFlight`) or `full` (lane cap); use {@link enqueue} to tell
+   * those apart.
+   * Pass `options.delay` (ms) to stage the run on the delayed set instead of the live queue. Redis
+   * failures throw `RedisJMEnqueueError` (see {@link enqueue}).
    *
    * @example
    * ```ts
@@ -283,12 +824,13 @@ export class RedisJM extends Hookable<RedisJMHooks> {
    * ```
    */
   async queue<TInputs>(job: Job<TInputs, any>, runId: string, inputs: TInputs, options?: QueueOptions): Promise<boolean> {
-    return this.enqueue(job, runId, inputs, 'rpush', options)
+    return (await this.enqueueRun(job, [{ runId, inputs }], 'rpush', options))[0].status === 'queued'
   }
 
   /**
-   * Adds a job run to the front of the queue (priority insert). Returns `true` if queued, `false` if already locked.
-   * A priority insert cannot be delayed — passing `options.delay > 0` throws a TypeError.
+   * Adds a job run to the front of the queue (priority insert). Returns `true` if queued, `false` if
+   * not queued (deduped, busy or full — see {@link enqueue}). A priority insert cannot be delayed — passing
+   * `options.delay > 0` throws a TypeError. Redis failures throw `RedisJMEnqueueError`.
    *
    * @example
    * ```ts
@@ -296,7 +838,7 @@ export class RedisJM extends Hookable<RedisJMHooks> {
    * ```
    */
   async queueFirst<TInputs>(job: Job<TInputs, any>, runId: string, inputs: TInputs, options?: QueueOptions): Promise<boolean> {
-    return this.enqueue(job, runId, inputs, 'lpush', options)
+    return (await this.enqueueRun(job, [{ runId, inputs }], 'lpush', options))[0].status === 'queued'
   }
 
   /**
@@ -311,7 +853,7 @@ export class RedisJM extends Hookable<RedisJMHooks> {
   async list(): Promise<JobLogRecord[]> {
     // Incremental HSCAN (not a single blocking HGETALL) so a large log hash is read in bounded
     // slices — matters once retention (`keepFinishedInterval > 0`) lets the hash grow.
-    const entries = await this.scanHash(this.getLogKey())
+    const { entries } = await this.scanHashBatch(this.getLogKey(), '0', Infinity)
     const records: JobLogRecord[] = []
     for (const [jobId, val] of entries) {
       // A single corrupt/foreign record must not take down the whole listing.
@@ -349,17 +891,13 @@ export class RedisJM extends Hookable<RedisJMHooks> {
    */
   async unqueue(jobId: string): Promise<void> {
     // Resolve the lane from the persisted record so we LREM the correct lane queue; if the record
-    // is already gone, fall back to the default key (the locks/log removals below are group-wide).
+    // is already gone, fall back to the default key (the other removals are group-wide).
     const record = await this.readRecord(jobId)
-    await this.redis.lrem(this.getQueueKey(record?.lane), 1, jobId)
-    // Also drop any delayed-set entry for this jobId (a `delayed`/retry-scheduled run lives there,
-    // not on the queue list); harmless no-op for a non-delayed run.
-    await this.redis.zrem(this.getDelayedKey(), jobId)
-    await this.redis.srem(this.getLocksKey(), jobId)
-    await this.redis.hdel(this.getLogKey(), jobId)
-    // Also clear any pending orphan-suspicion for this jobId: a manually removed run must not leave
-    // a suspects entry that a later maintenance pass would act on (e.g. re-SREM a re-added lock).
-    await this.redis.hdel(this.getSuspectsKey(), jobId)
+    // One atomic purge: record + lock together, plus its lane entry, any delayed-set entry (a
+    // `delayed`/retry-scheduled run lives there), any `claiming` entry (popped, not yet claimed), and any
+    // pending orphan-suspicion — a manually removed run must not leave a suspects entry that a later
+    // maintenance pass would act on (e.g. re-SREM a re-added lock).
+    await this.purge(jobId, 'force', { lane: this.getQueueKey(record?.lane), claiming: true, delayed: true, suspects: true })
   }
 
   /**
@@ -412,169 +950,181 @@ export class RedisJM extends Hookable<RedisJMHooks> {
 
     this.registeredJobs.add(job)
     this.jobsByName.set(jobName, job)
+    this.ownLanes = undefined
+    // Discover the new job's old lanes on the next poll, not up to OLD_LANE_REFRESH_MS later.
+    this.lastOldLaneRefresh = 0
 
-    const getJobId = (runId: string) => job.getJobId(runId)
+    /**
+     * The prologue every job-level hook shares: act only on events of executions THIS manager drives
+     * (see `shouldHandle`), addressed by the run's jobId.
+     */
+    const own = <P extends JobEventPayload<TInputs>>(handler: (payload: P, jobId: string) => Promise<void>) =>
+      async (payload: P): Promise<void> => {
+        if (this.shouldHandle(payload)) await handler(payload, job.getJobId(payload.runId))
+      }
+    /**
+     * Writes the record of `payload`'s execution only while that execution OWNS it — its executionId
+     * still stamped on the record. That fences the zombie-run scenario: a stalled handler is staled by
+     * maintenance (lock released), a producer re-enqueues the same runId (fresh record, NO executionId),
+     * then the original handler finally reports. Its executionId no longer matches, so the write is
+     * rejected — the zombie can't overwrite the successor's record, release its lock, or (under
+     * keepFinishedInterval=0) delete it out from under a run that hasn't happened yet. With `resurrect`
+     * the record must also be `running`, or `stale` but self-healable (see `acceptRunningOrStale`).
+     */
+    const updateOwned = (
+      payload: JobEventPayload<TInputs>,
+      mutate: (record: JobLogRecord) => Mutation,
+      resurrect = false,
+    ): Promise<LogUpdate> => this.updateLog(job.getJobId(payload.runId), (record) => {
+      if (record.executionId !== payload.executionId) return false
+      if (resurrect && !this.acceptRunningOrStale(record)) return false
+      return mutate(record)
+    })
 
-    const onStart = async (payload: JobEventPayload<TInputs>) => {
-      if (!this.shouldHandle(payload)) return
-      const jobId = getJobId(payload.runId)
+    const onStart = own(async (payload: JobEventPayload<TInputs>, jobId) => {
       // `start` is the CLAIM: it only fires on a record that is still `queued`, flipping it to
-      // `running` and stamping this execution's fencing token. A rejected claim means the entry we
-      // popped no longer owns its record — a successor that re-enqueued the same runId (fresh
-      // `queued` record) or a concurrent claimant owns it now — so this execution is superseded.
-      const result = await this.updateLog(jobId, (record) => {
-        if (record.status !== 'queued') return false
-        record.status = 'running'
-        record.startedAt = Date.now()
-        record.heartbeat = Date.now()
-        record.executionId = payload.executionId
-        record.attempt = (record.attempt ?? 0) + 1
-        delete record.suspectedAt
-      })
-      if (result === 'rejected') {
+      // `running` and stamping this execution's fencing token (the transition also takes the run out
+      // of `claiming`, where the pop parked it). A rejected claim means the entry we popped no longer
+      // owns its record — a successor that re-enqueued the same runId (fresh `queued` record) or a
+      // concurrent claimant owns it now — so this execution is superseded.
+      let claim: LogUpdate
+      try {
+        claim = await this.updateLog(jobId, (record) => {
+          // Our OWN claim already landed: its reply was lost and the client re-sent it after a reconnect
+          // (ioredis `autoResendUnfulfilledCommands`), so the re-run lost its compare-and-set. The
+          // executionId is fresh per execution — nobody else can have stamped it. Not a supersession.
+          if (record.status === 'running' && record.executionId === payload.executionId) return 'claimed'
+          if (record.status !== 'queued') return false
+          const now = Date.now()
+          record.status = 'running'
+          record.startedAt = now
+          record.heartbeat = now
+          record.executionId = payload.executionId
+          record.attempt = (record.attempt ?? 0) + 1
+          delete record.suspectedAt
+        })
+      } catch (err) {
+        // The claim's read or write failed (Redis down / out of memory): the record is still `queued`
+        // but its queue entry was already popped. Tag the error so the pop's start-failure recovery
+        // pushes the entry back (or defers it) instead of failing a run that never started.
+        const tagged = toTaggable(err)
+        claimWriteFailures.add(tagged)
+        throw tagged
+      }
+      if (claim.outcome === 'rejected' && claim.reason !== 'claimed') {
         throw new RunSupersededError(`run "${jobId}" was superseded before it could claim its record`)
       }
       // 'missing' → no backing record (direct `job.execute()` pattern); proceed silently.
-      await this.callHook('start', payload as unknown as JobEventPayload)
-    }
+      await this.emit('start', payload as unknown as JobEventPayload)
+    })
 
-    const onFinish = async (payload: JobEventPayload<TInputs>) => {
-      if (!this.shouldHandle(payload)) return
-      const jobId = getJobId(payload.runId)
+    const onFinish = own(async (payload: JobEventPayload<TInputs>, jobId) => {
       const now = Date.now()
-      // Fences the zombie-run scenario: a stalled handler is staled by maintenance (lock released),
-      // a producer re-enqueues the same runId (fresh record, NO executionId), then the original
-      // handler finally finishes. Its executionId no longer matches, so the mutator rejects — the
-      // zombie can't overwrite the successor's record, srem its lock, or (under keepFinishedInterval=0)
-      // delete it out from under a run that hasn't happened yet.
-      const result = await this.updateLog(jobId, (record) => {
-        if (record.executionId !== payload.executionId) return false
+      // The terminal write releases the lock and retires the record (history TTL, or deletion under
+      // keepFinishedInterval=0) atomically — see `transition`. Trade-off: the fence is the executionId
+      // alone (a stale-but-ours record is finished), so a re-sent copy of this write whose reply was lost
+      // writes `finished` again — clearing its field TTL (maintenance still expires it by `finishedAt`).
+      const { outcome } = await updateOwned(payload, (record) => {
         record.status = 'finished'
         record.finishedAt = now
       })
       // 'rejected' → the record's owner changed under us: touch nothing, and skip the manager-level
       // event too (it doesn't describe the record's current owner).
-      if (result === 'rejected') return
-      // 'written' or 'missing' (record unqueued mid-run — the srem is a harmless no-op).
-      await this.releaseLockAndMaybeDropLog(jobId)
-      await this.callHook('finish', payload as unknown as JobEventPayload)
-    }
+      if (outcome === 'rejected') return
+      // 'missing' (record unqueued mid-run): release a lock nothing backs any more.
+      if (outcome === 'missing') await this.purge(jobId, 'orphan')
+      await this.emit('finish', payload as unknown as JobEventPayload)
+    })
 
-    const onError = async (payload: JobErrorEventPayload<TInputs>) => {
-      if (!this.shouldHandle(payload)) return
-      const jobId = getJobId(payload.runId)
+    const onError = own(async (payload: JobErrorEventPayload<TInputs>, jobId) => {
       const now = Date.now()
       const maxAttempts = job.getAttempts()
-      // The mutator is synchronous, so compute the retry-vs-final decision inside it (setting the
-      // record fields accordingly) and capture the outcome in this closure; then act on it after the
-      // write. `scheduledRetry` set ⇒ we chose to retry.
-      let scheduledRetry: { readyAt: number; attempt: number } | undefined
-      // A retry off a `stale`-but-ours record must re-establish the lock maintenance released (the
-      // same self-heal heartbeat/update do): the retry branch's whole premise is that a delayed record
-      // HOLDS the lock so a producer can't double-enqueue the runId during backoff.
-      let retryResurrectedLock = false
-      const result = await this.updateLog(jobId, (record) => {
-        // Same fencing as `onFinish`: a superseded execution's error must not clobber the successor's
-        // record, schedule a phantom retry, or release its lock.
-        if (record.executionId !== payload.executionId) return false
+      // Same fencing as `onFinish`: a superseded execution's error must not clobber the successor's
+      // record, schedule a phantom retry, or release its lock. A `stale`-but-ours record is accepted:
+      // a retry off it re-takes the lock maintenance released (derived by the transition from
+      // stale → delayed), so the backoff window is dedupe-protected like a retry off `running`.
+      // Trade-off (executionId is the only fence): a re-sent copy of this write whose reply was lost
+      // re-applies it — a second `retry` event, a `readyAt` past the delayed-set score, or (if the retry
+      // was promoted meanwhile) a `queued` record moved back to `delayed` while its lane entry stays,
+      // whose next pop is superseded (the record is not `queued`). Never a double execution.
+      const { outcome, record } = await updateOwned(payload, (r) => {
         // The 1-based attempt that just failed (stamped by onStart's claim).
-        const attempt = record.attempt ?? 1
+        const attempt = r.attempt ?? 1
         // Last error kept for observability in BOTH branches.
-        record.error = payload.error.message
+        r.error = payload.error.message
         if (attempt < maxAttempts) {
-          // RETRY: stage the run back on the delayed set and KEEP the lock (do not srem) — the held
-          // lock is what prevents a duplicate enqueue of the same runId while the backoff elapses.
-          // Backoff 0 still routes through the delayed set (readyAt = now) so promotion has a single
-          // code path; the next sweep picks it up within ~1s.
-          //
-          // Self-heal: if this execution was staled mid-run (maintenance flipped it to `stale`, stamped
-          // `finishedAt`, and RELEASED the lock) and it then threw a retryable error before writing any
-          // update, restore the delayed invariants — clear the stale `finishedAt` (the run isn't
-          // terminal) and re-SADD the lock after the write (below), so the backoff window is dedupe-
-          // protected exactly like a retry off a healthy `running` record.
-          if (record.status === 'stale') retryResurrectedLock = true
-          const readyAt = now + job.getBackoffMs(attempt)
-          record.status = 'delayed'
-          record.readyAt = readyAt
-          delete record.finishedAt
-          scheduledRetry = { readyAt, attempt }
+          // RETRY: stage the run back on the delayed set and KEEP the lock — the held lock is what
+          // prevents a duplicate enqueue of the same runId while the backoff elapses. Backoff 0 still
+          // routes through the delayed set (readyAt = now) so promotion has a single code path; the
+          // next sweep picks it up within ~1s. A retry off a staled run clears the stale `finishedAt`
+          // and `staleReason` (the run isn't terminal).
+          r.status = 'delayed'
+          r.readyAt = now + job.getBackoffMs(attempt)
+          delete r.finishedAt
+          delete r.staleReason
         } else {
-          // FINAL failure: terminal error (lock released + `error` hook fired below).
-          record.status = 'error'
-          record.finishedAt = now
+          // FINAL failure: terminal error (lock released with the write, `error` hook fired below).
+          r.status = 'error'
+          r.finishedAt = now
         }
       })
       // Zombie fencing: the record's owner changed under us — touch nothing, fire nothing.
-      if (result === 'rejected') return
-      if (result === 'written' && scheduledRetry) {
-        // Re-establish the lock BEFORE making the run promotable (below), so the delayed record holds
-        // its lock the moment it can be discovered/re-enqueued.
-        if (retryResurrectedLock) await this.reacquireLock(jobId)
-        // Write the zset entry BEFORE the retry hook (mirrors enqueue: the zset entry is what makes
-        // the run promotable). Do NOT release the lock and do NOT fire the manager-level `error` hook
-        // — the run isn't finally failed, so `retry` fires instead.
-        await this.redis.zadd(this.getDelayedKey(), scheduledRetry.readyAt, jobId)
-        await this.callHook('retry', {
+      if (outcome === 'rejected') return
+      // A timed-out attempt is an ordinary failure (retry-or-final below); observers hear about the
+      // timeout itself first.
+      if (payload.error instanceof JobTimeoutError) {
+        await this.emit('timeout', {
           ...(payload as unknown as JobErrorEventPayload),
-          attempt: scheduledRetry.attempt,
-          nextAttemptAt: scheduledRetry.readyAt,
+          timeoutMs: payload.error.timeoutMs,
+        })
+      }
+      if (outcome === 'written' && record?.status === 'delayed') {
+        // The delayed-set entry landed atomically with the record. The run isn't finally failed, so
+        // `retry` fires instead of the manager-level `error` hook.
+        await this.emit('retry', {
+          ...(payload as unknown as JobErrorEventPayload),
+          attempt: record.attempt ?? 1,
+          nextAttemptAt: record.readyAt!,
         } as JobRetryEventPayload)
         return
       }
-      // Final failure (or a 'missing' record — unqueued mid-run): existing behavior exactly.
-      await this.releaseLockAndMaybeDropLog(jobId)
-      await this.callHook('error', payload as unknown as JobErrorEventPayload)
-    }
+      // Final failure (or a 'missing' record — unqueued mid-run: release a lock nothing backs any more).
+      if (outcome === 'missing') await this.purge(jobId, 'orphan')
+      await this.emit('error', payload as unknown as JobErrorEventPayload)
+    })
 
-    const onHeartbeat = async (payload: JobEventPayload<TInputs>) => {
-      if (!this.shouldHandle(payload)) return
-      const jobId = getJobId(payload.runId)
-      let resurrected = false
-      const result = await this.updateLog(jobId, (record) => {
-        // A pinned-but-alive run self-heals: `acceptRunningOrStale` accepts a `stale` record that is
-        // still ours (matching executionId), flipping it back to `running`. It rejects a record whose
-        // owner changed (executionId mismatch) or that reached a terminal state — a straggling
-        // heartbeat from a finished or superseded run must never keep such a record alive.
-        const decision = this.acceptRunningOrStale(record, payload.executionId)
-        if (!decision) return false
-        resurrected = decision === 'resurrected'
+    const onHeartbeat = own(async (payload: JobEventPayload<TInputs>) => {
+      // A pinned-but-alive run self-heals: a `stale` record that is still ours flips back to `running`
+      // (and re-takes its lock). A record whose owner changed or that reached a terminal state is
+      // rejected — a straggling heartbeat from a finished or superseded run must never keep it alive.
+      const { outcome } = await updateOwned(payload, (record) => {
         record.heartbeat = Date.now()
-      })
-      // A resurrected run proved itself alive after maintenance staled it and released its lock.
-      if (result === 'written' && resurrected) await this.reacquireLock(jobId)
+      }, true)
       // Heartbeat-driven ownership-loss detection: the heartbeat is the ONLY periodic read the executor
       // already performs, so when its guarded write is not 'written' — 'rejected' (record now owned by a
       // successor, or terminal) or 'missing' (unqueued mid-run) — this execution has lost ownership of
       // its record. Abort the run's cooperative signal (detected within one heartbeatInterval, zero
       // extra Redis traffic) and SKIP the manager-level heartbeat event: it doesn't describe a live,
       // owned run. Abort is cooperative — the handler must observe the signal.
-      if (result !== 'written') {
+      if (outcome !== 'written') {
         payload.abort('run lost ownership of its record (superseded, terminal, or unqueued)')
         return
       }
-      await this.callHook('heartbeat', payload as unknown as JobEventPayload)
-    }
+      await this.emit('heartbeat', payload as unknown as JobEventPayload)
+    })
 
-    const onUpdate = async (payload: JobUpdateEventPayload<TInputs, TAttrs>) => {
-      if (!this.shouldHandle(payload)) return
-      const jobId = getJobId(payload.runId)
-      let resurrected = false
-      const result = await this.updateLog(jobId, (record) => {
-        // Same self-heal + fencing as heartbeat: the running execution that owns the record may write
-        // its progress/attrs, and a `stale`-but-ours record is resurrected so a pinned-then-recovered
-        // handler's final setProgress/setAttrs land instead of being silently dropped. A superseded
-        // run's late update still can't leak into the successor's record (executionId mismatch).
-        const decision = this.acceptRunningOrStale(record, payload.executionId)
-        if (!decision) return false
-        resurrected = decision === 'resurrected'
+    const onUpdate = own(async (payload: JobUpdateEventPayload<TInputs, TAttrs>) => {
+      // Same self-heal + fencing as heartbeat: the running execution that owns the record may write
+      // its progress/attrs, and a `stale`-but-ours record is resurrected so a pinned-then-recovered
+      // handler's final setProgress/setAttrs land instead of being silently dropped. A superseded
+      // run's late update still can't leak into the successor's record (executionId mismatch).
+      await updateOwned(payload, (record) => {
         if (payload.progress !== undefined) record.progress = payload.progress
         // Merge, not replace: successive setAttrs calls accumulate keys instead of clobbering.
         if (payload.attrs !== undefined) record.attrs = { ...record.attrs, ...payload.attrs }
-      })
-      // A resurrected run re-establishes the lock maintenance released (mirror of onHeartbeat).
-      if (result === 'written' && resurrected) await this.reacquireLock(jobId)
-      await this.callHook('update', payload as unknown as JobUpdateEventPayload)
-    }
+      }, true)
+      await this.emit('update', payload as unknown as JobUpdateEventPayload)
+    })
 
     job.hook('start', onStart)
     job.hook('finish', onFinish)
@@ -609,53 +1159,112 @@ export class RedisJM extends Hookable<RedisJMHooks> {
     }
     this.jobsByName.delete(job.getName())
     this.registeredJobs.delete(job)
+    this.ownLanes = undefined
+    // The old-lane allow-lists name the job too: drop them and re-read on the next poll, or for up to
+    // OLD_LANE_REFRESH_MS this instance would keep taking its entries off old lanes as unknown jobs
+    // (burning their requeue budget, or failing them).
+    this.oldLanes = []
+    this.lastOldLaneRefresh = 0
   }
 
   /**
-   * Pops the next job from the queue, matches it to a registered Job by name, and executes it.
-   * Returns `true` if a job was popped, `false` if the queue was empty.
+   * Pops the next job from this instance's subscribed lanes, matches it to a registered Job by name,
+   * and executes it, resolving once that run has settled. Returns `true` if a job was popped, `false`
+   * if the queues were empty — or if popping is briefly paused after a start failure (see the
+   * `startFailed` hook), or once `stop()` has been called (until the next `start()`).
+   *
+   * Independent of the poll loop's slots: it always executes one pop (for drain-until-empty workers),
+   * not counted against `concurrency` / `laneConcurrency`. It IS tracked: `stop()` waits for an
+   * in-flight `popAndExecute()` to settle. Rejects when the pop itself fails (e.g. Redis out of memory
+   * refuses the pop script — in which case nothing was popped).
    *
    * @example
    * ```ts
-   * const hadWork = await manager.popAndExecute()
+   * while (await manager.popAndExecute()) {}
    * ```
    */
   async popAndExecute(): Promise<boolean> {
-    const thunk = await this.popNext()
-    if (!thunk) return false
-    // Preserve the public contract: resolve only after the popped run completes.
-    await thunk()
-    return true
+    if (this.stopped) return false
+    const run = (async () => {
+      const popped = await this.popNext(await this.getPollPlan())
+      if (!popped) return false
+      // Preserve the public contract: resolve only after the popped run completes.
+      await popped.run()
+      return true
+    })()
+    const tracked = run.then(() => {}, () => {})
+    this.manualRuns.add(tracked)
+    void tracked.finally(() => this.manualRuns.delete(tracked))
+    return run
   }
 
   /**
-   * Promotes due delayed runs, pops ONE job, and resolves the pop into either `null` (nothing to do at
-   * idle pacing: empty queue, or an unknown job re-queued for a sibling) or a thunk that performs the
-   * work. The pop's Redis-touching cleanup (unknown-job drop, missing/corrupt-record drop, non-jobId
-   * cleanup) happens inline here; those branches return a pre-resolved no-op thunk so the caller still
-   * counts them as "work found" for pacing. Only a real execution defers into a thunk the poll loop can
-   * run concurrently without awaiting. `popAndExecute` awaits the thunk; the poll loop does not.
+   * Promotes due delayed runs, pops ONE job from the lanes of `plan` (in order), and resolves the pop
+   * into either `null` (nothing to do at idle pacing: empty queues, popping paused, or an unknown job
+   * re-queued for a sibling) or `{ run, queueKey }`. The pop's Redis-touching cleanup (unknown-job drop,
+   * missing/corrupt-record drop, non-jobId cleanup) happens inline here; those branches return the
+   * pre-resolved `NOOP_THUNK` so the caller still counts them as "work found" for pacing. Only a real
+   * execution defers into a thunk the poll loop can run concurrently without awaiting.
    */
-  private async popNext(): Promise<null | (() => Promise<void>)> {
+  private async popNext(plan: PollPlan): Promise<null | { run: () => Promise<void>; queueKey: string }> {
+    // Start-failure back-off (see `popsPausedUntil`).
+    if (Date.now() < this.popsPausedUntil) return null
+
     // Promote any due delayed runs onto their lane queues before popping, so a run whose delay just
-    // elapsed becomes poppable on this same pass.
-    await this.promoteDueDelayed()
+    // elapsed becomes poppable on this same pass. A failed promotion must not stop popping.
+    try {
+      await this.promoteDueDelayed()
+    } catch (err) {
+      this.logPopError('delayed-run promotion failed', err)
+    }
+    if (plan.length === 0) return null
 
-    // Poll the union of this instance's subscribed lanes (`__maintenance` first, then work lanes
-    // ordered by strategy) atomically via `LMPOP`, with a sequential-`LPOP` fallback for Redis < 7.
-    const keys = this.getSubscribedQueueKeys()
-    const jobId = await this.popFromLanes(keys)
-    if (!jobId) return null
+    // One atomic script: pop from the first lane with an eligible entry AND park the id in `claiming`.
+    // Under maxmemory Redis refuses the whole script, so a full Redis pops (and loses) nothing.
+    const popped = await this.popFromLanes(plan)
+    this.popOomLogged = false
+    if (!popped) return null
 
-    const separatorIndex = jobId.indexOf('#')
-    if (separatorIndex === -1) {
-      await this.redis.srem(this.getLocksKey(), jobId)
-      await this.redis.hdel(this.getLogKey(), jobId)
+    // From here on the entry is OFF its lane list (parked in `claiming`). Any Redis failure while
+    // resolving it must not strand it: push it back to the head of its lane (see `recoverUnclaimed`).
+    try {
+      const run = await this.resolvePopped(popped.jobId, popped.key)
+      return run ? { run, queueKey: popped.key } : null
+    } catch (err) {
+      await this.recoverUnclaimed(popped.jobId, err)
+      return { run: NOOP_THUNK, queueKey: popped.key }
+    }
+  }
+
+  /**
+   * Logs a pop-path Redis failure; an OOM refusal is logged once per episode (every poll would hit it).
+   */
+  private logPopError(message: string, err: unknown): void {
+    if (classifyRedisError(err) === 'oom') {
+      if (this.popOomLogged) return
+      this.popOomLogged = true
+      this.logger(`${message}: Redis is out of memory — nothing is popped until memory frees`, toError(err))
+      return
+    }
+    this.logger(message, toError(err))
+  }
+
+  /**
+   * Resolves a popped `jobId` (from queue list `queueKey`) into an execution thunk, `null` (unknown job
+   * re-queued for a sibling), or `NOOP_THUNK` (cleanup done inline). The drop branches purge the run's
+   * leftovers — `claiming` entry included — only while no valid record backs it (see `purge`); a stray
+   * duplicate entry leaves everything to the record's owner. See {@link popNext}.
+   */
+  private async resolvePopped(jobId: string, queueKey: string): Promise<null | (() => Promise<void>)> {
+    if (!jobId.includes('#')) {
+      // Not a jobId at all: nothing can ever own it.
+      await this.purge(jobId, 'force', { claiming: true })
       return NOOP_THUNK
     }
 
-    const jobName = jobId.slice(0, separatorIndex)
-    const runId = jobId.slice(separatorIndex + 1)
+    const { jobName, runId } = splitJobId(jobId)
+    // 0.2+ never enqueues the maintenance job; an entry of it means a pre-0.2 instance is alive here.
+    if (jobName === MAINTENANCE_JOB_NAME) this.noteLegacyInstance()
 
     const job = this.jobsByName.get(jobName)
     if (!job) {
@@ -665,36 +1274,39 @@ export class RedisJM extends Hookable<RedisJMHooks> {
       // re-queue returns `null` (treated as "no work executed") so the poll loop applies its
       // idle interval rather than immediately re-popping — spacing retries by `interval` gives
       // a sibling that *does* have the handler real wall-clock time to claim it.
-      if (await this.requeueUnknownJob(jobId)) return null
+      const requeue = await this.requeueUnknownJob(jobId)
+      if (requeue === 'requeued') return null
+      if (requeue === 'stray') {
+        // The record is not `queued`: this entry is a stray duplicate of a run that is already
+        // claimed (running), scheduled or finished elsewhere — its owner holds the record and lock.
+        // Touching the record here (re-queueing or failing it) would hand a RUNNING run to a second
+        // worker (double execution) or clobber it. Drop the entry only; its `claiming` mark is left
+        // for maintenance (removing it here could erase a concurrent legitimate pop's mark).
+        this.logger(`job "${jobId}" popped as a stray entry (its record is not queued); skipping`)
+        return NOOP_THUNK
+      }
 
-      const now = Date.now()
-      await this.updateLog(jobId, (record) => {
-        record.status = 'error'
-        record.error = 'Job name is unknown'
-        record.finishedAt = now
-      })
+      // Same guard as the requeue: only a still-`queued` record is this pop's to fail.
+      const { outcome } = await this.updateLog(jobId, failQueuedRun('Job name is unknown', Date.now()))
+      if (outcome === 'rejected') return NOOP_THUNK
       this.logger(`job "${jobId}" has no registered handler on this instance; dropping`)
-      await this.releaseLockAndMaybeDropLog(jobId)
+      if (outcome === 'missing') await this.purge(jobId, 'orphan', { claiming: true })
       return NOOP_THUNK
     }
 
     const logJson = await this.redis.hget(this.getLogKey(), jobId)
-    if (!logJson) {
-      // Popped a queue entry with no backing log record (desynced/cleaned state). Release
-      // the lock and surface it rather than dropping the run completely silently.
-      this.logger(`job "${jobId}" popped with no log record; dropping`)
-      await this.redis.srem(this.getLocksKey(), jobId)
+    const logRecord = logJson ? this.parseRecord(logJson, jobId) : null
+    if (!logJson || !logRecord) {
+      // Popped a queue entry with no (parseable) backing record — desynced/cleaned state, or a
+      // corrupt/foreign record. Drop it with its lock (garbage: retention doesn't apply, and keeping it
+      // under `keepFinishedInterval > 0` would only hoard it), surfacing a missing record rather than
+      // dropping the run completely silently.
+      if (!logJson) this.logger(`job "${jobId}" popped with no log record; dropping`)
+      await this.purge(jobId, 'orphan', { claiming: true })
       return NOOP_THUNK
     }
-
-    const logRecord = this.parseRecord(logJson, jobId)
-    if (!logRecord) {
-      // Corrupt/foreign record: drop the record and its lock unconditionally (garbage — retention
-      // doesn't apply) rather than routing through the retention-aware release, which is what keeps
-      // `keepFinishedInterval > 0` from hoarding it forever.
-      await this.dropGarbageRecordAndLock(jobId)
-      return NOOP_THUNK
-    }
+    // The claim's compare-and-set starts from this read (see `recordJson`).
+    this.recordJson.set(jobId, logJson)
 
     // Defer the execution into a thunk so the poll loop can run it WITHOUT awaiting (concurrency): the
     // thunk owns a per-execution AbortController (registered so `stop({ abort: true })` can signal it,
@@ -702,6 +1314,7 @@ export class RedisJM extends Hookable<RedisJMHooks> {
     // Capture only `inputs`, not the whole parsed record: the thunk lives in `inFlightRuns` for the
     // run's lifetime, so closing over just the payload lets the record wrapper be collected sooner.
     const { inputs } = logRecord
+    const timeoutMs = job.getTimeoutMs() ?? this.options.jobTimeout
     return async () => {
       const controller = new AbortController()
       this.abortControllers.add(controller)
@@ -710,6 +1323,9 @@ export class RedisJM extends Hookable<RedisJMHooks> {
           targetGroup: this.targetGroup,
           heartbeatInterval: this.options.heartbeatInterval,
           runId,
+          // Resolved execution timeout (job value wins; 0 = none). On expiry execute() settles with a
+          // JobTimeoutError even if the handler never does, so this slot frees.
+          timeoutMs,
           // Identify this manager as the driver (so only its hooks act) and route infra errors here.
           manager: this,
           logger: this.logger,
@@ -729,6 +1345,13 @@ export class RedisJM extends Hookable<RedisJMHooks> {
           this.logger(`job "${jobId}" superseded; skipping`)
           return
         }
+        // A failure in the START phase (claim write, or a job-level `start` hook) happened after the
+        // pop removed the entry and before the run was established — recover it explicitly.
+        const startExecutionId = getStartPhaseExecutionId(err)
+        if (startExecutionId !== undefined) {
+          await this.recoverStartPhaseFailure({ job, jobId, runId, inputs, executionId: startExecutionId, err, controller })
+          return
+        }
         // The job's `error` event already recorded the failure in Redis and re-broadcast it.
         // Surface it through the logger too, so a thrown handler is never fully silent when no
         // `error` hook is wired (and to catch infra/hook failures, which are NOT "already handled").
@@ -736,101 +1359,268 @@ export class RedisJM extends Hookable<RedisJMHooks> {
         this.logger(`job "${jobId}" failed: ${error.message}`, error)
       } finally {
         this.abortControllers.delete(controller)
+        // Normally gone with the terminal write already; this covers the paths that never write (a
+        // superseded or unrecoverable start), so the cache never outlives the run.
+        this.recordJson.delete(jobId)
       }
     }
   }
 
   /**
-   * Computes this instance's subscribed queue keys per poll (§5.6): the reserved `__maintenance`
-   * lane first, then the DISTINCT work-lane queue keys of the registered jobs, ordered by strategy.
+   * The ordered list of lanes one pop considers (see `POP_SCRIPT`): this instance's own lanes (spec
+   * `'*'`, see {@link getSubscribedQueueKeys}) followed by OLD lanes its jobs still have entries on —
+   * lanes a job was enqueued on before its lane changed across a deploy — each with the allow-list of
+   * this instance's job names that may be taken from it. The old-lane set comes from the per-job lane
+   * sets in Redis, refreshed at most every {@link OLD_LANE_REFRESH_MS}.
+   */
+  private async getPollPlan(): Promise<PollPlan> {
+    const own = this.getSubscribedQueueKeys()
+    const ownKeys = this.ownLanes!.keys
+    await this.refreshOldLanes(ownKeys)
+    return [
+      ...own.map((key) => ({ key, spec: '*' })),
+      ...this.oldLanes.filter(({ key }) => !ownKeys.has(key)),
+    ]
+  }
+
+  /**
+   * Refreshes `oldLanes`: for every registered job, the lane keys in its Redis lane set that are not one
+   * of this instance's own lanes, mapped to an allow-list of the registered job names found there. Rate
+   * limited; a failed read keeps the previous plan (and is logged).
+   */
+  private async refreshOldLanes(ownKeys: Set<string>): Promise<void> {
+    const now = Date.now()
+    if (now - this.lastOldLaneRefresh < OLD_LANE_REFRESH_MS) return
+    this.lastOldLaneRefresh = now
+    const jobs = [...this.jobsByName.keys()].filter((name) => name !== MAINTENANCE_JOB_NAME)
+    if (jobs.length === 0) {
+      this.oldLanes = []
+      return
+    }
+    try {
+      const pipeline = this.redis.pipeline()
+      for (const name of jobs) pipeline.smembers(this.getJobLanesKey(name))
+      const results = (await pipeline.exec()) ?? []
+      const allow = new Map<string, Set<string>>()
+      results.forEach(([err, keys], i) => {
+        if (err || !Array.isArray(keys)) return
+        for (const key of keys as string[]) {
+          if (ownKeys.has(key)) continue
+          if (!allow.has(key)) allow.set(key, new Set())
+          allow.get(key)!.add(jobs[i])
+        }
+      })
+      this.oldLanes = [...allow].map(([key, names]) => ({ key, spec: `#${[...names].join('#')}#` }))
+    } catch (err) {
+      this.logPopError('could not refresh old lanes', err)
+    }
+  }
+
+  /**
+   * This instance's subscribed queue keys for one poll (§5.6): the reserved `__maintenance` lane first,
+   * then the DISTINCT work-lane queue keys of the registered jobs, ordered by strategy.
    *
    * Deduplication is on the resolved queue key (not the lane name) so a no-lane job and an explicit
    * `lane: 'default'` job don't double-weight the legacy key. Under `roundRobin` (default) the work
    * keys rotate by a per-manager cursor advanced once per poll (anti-starvation); under `priority`
-   * the `lanePriority` order wins with unlisted work lanes trailing in registration order. The result
-   * is always length ≥ 1 (`__maintenance`), so `numkeys` is never 0.
+   * the `lanePriority` order wins with unlisted work lanes trailing in registration order. The base
+   * order is cached until a job is (un)registered (`ownLanes`); only the rotation is per poll.
    */
   private getSubscribedQueueKeys(): string[] {
     const maintenanceKey = this.getQueueKey(MAINTENANCE_LANE)
+    this.ownLanes ??= this.buildOwnLanes(maintenanceKey)
+    const { workKeys } = this.ownLanes
+    const n = workKeys.length
+    if (this.options.laneStrategy === 'priority' || n === 0) return [maintenanceKey, ...workKeys]
+    // roundRobin: rotate the work-key list by the cursor, then advance it once per poll so no lane is
+    // starved by a saturated higher-order lane.
+    const offset = this.pollCursor++ % n
+    return [maintenanceKey, ...workKeys.slice(offset), ...workKeys.slice(0, offset)]
+  }
 
+  /** Builds `ownLanes` (see there) from the registered jobs. */
+  private buildOwnLanes(maintenanceKey: string): { workKeys: string[]; keys: Set<string> } {
     // Distinct work-lane keys in registration order, excluding the reserved maintenance key.
+    const keys = new Set<string>([maintenanceKey])
     const workKeys: string[] = []
-    const seen = new Set<string>([maintenanceKey])
     for (const job of this.registeredJobs) {
       const key = this.getQueueKey(job.getLane())
-      if (seen.has(key)) continue
-      seen.add(key)
+      if (keys.has(key)) continue
+      keys.add(key)
       workKeys.push(key)
     }
-
-    let orderedWorkKeys: string[]
-    if (this.options.laneStrategy === 'priority') {
-      // Listed lanes first (in `lanePriority` order), then the remaining work keys in registration
-      // order. `workKeys` is already distinct, so a single set consumed via `Set.delete` handles
-      // both the "am I subscribed?" test and the "don't emit twice" guard in one step.
-      const remaining = new Set(workKeys)
-      const ordered: string[] = []
-      for (const lane of this.options.lanePriority) {
-        // `delete` returns true only when `key` is a still-unemitted work key.
-        const key = this.getQueueKey(lane)
-        if (remaining.delete(key)) ordered.push(key)
-      }
-      // `remaining` now holds only the non-priority work keys; emit them in registration order.
-      for (const key of workKeys) {
-        if (remaining.delete(key)) ordered.push(key)
-      }
-      orderedWorkKeys = ordered
-    } else {
-      // roundRobin: rotate the work-key list by the cursor, then advance it once per poll (only when
-      // there is work to rotate) so no lane is starved by a saturated higher-order lane.
-      const n = workKeys.length
-      if (n > 0) {
-        const offset = this.pollCursor % n
-        orderedWorkKeys = [...workKeys.slice(offset), ...workKeys.slice(0, offset)]
-        this.pollCursor++
-      } else {
-        orderedWorkKeys = workKeys
-      }
+    if (this.options.laneStrategy !== 'priority') return { workKeys, keys }
+    // Listed lanes first (in `lanePriority` order), then the remaining work keys in registration
+    // order. `workKeys` is already distinct, so a single set consumed via `Set.delete` handles both the
+    // "am I subscribed?" test and the "don't emit twice" guard in one step.
+    const remaining = new Set(workKeys)
+    const ordered: string[] = []
+    for (const lane of this.options.lanePriority) {
+      const key = this.getQueueKey(lane)
+      if (remaining.delete(key)) ordered.push(key)
     }
-
-    return [maintenanceKey, ...orderedWorkKeys]
+    for (const key of workKeys) {
+      if (remaining.delete(key)) ordered.push(key)
+    }
+    return { workKeys: ordered, keys }
   }
 
   /**
-   * Pops the next jobId from the first non-empty of `keys` (in order) via `LMPOP <n> <keys...> LEFT`,
-   * falling back to a sequential `LPOP` per key for Redis < 7. The `LMPOP` capability is probed
-   * lazily and cached: an "unknown command" error on the first attempt (raised BEFORE anything is
-   * popped, so no work is lost) flips the flag and switches to the fallback permanently.
+   * Runs the pop script (see `POP_SCRIPT`) over the plan in order: the popped `{ key, jobId }` (also
+   * parked in `claiming`), or `null` when no lane has an eligible entry.
    */
-  private async popFromLanes(keys: string[]): Promise<string | null> {
-    if (this.lmpopSupported !== false) {
-      try {
-        const res = await this.redis.lmpop(keys.length, ...keys, 'LEFT')
-        this.lmpopSupported = true
-        return res ? (res[1][0] ?? null) : null
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err)
-        if (this.lmpopSupported === undefined && message.toLowerCase().includes('unknown command')) {
-          this.lmpopSupported = false
-          // fall through to the sequential path
-        } else {
-          throw err
-        }
-      }
-    }
-
-    for (const key of keys) {
-      const v = await this.redis.lpop(key)
-      if (v) return v
-    }
-    return null
+  private async popFromLanes(plan: PollPlan): Promise<{ key: string; jobId: string } | null> {
+    const res = await runScript(
+      this.redis,
+      POP_SCRIPT,
+      [this.getClaimingKey(), ...plan.map((p) => p.key)],
+      [Date.now(), OLD_LANE_SCAN_LIMIT, ...plan.map((p) => p.spec)],
+    )
+    if (!Array.isArray(res) || res.length < 2) return null
+    return { key: String(res[0]), jobId: String(res[1]) }
   }
 
   /**
-   * Promotes delayed runs whose `readyAt` has elapsed onto their lane queues. For each due id: `ZREM`
-   * first — a reply of 1 is the atomic claim (a racing instance may sweep the same entry; the loser
-   * skips) — then flip the record `delayed`→`queued` (clearing `readyAt`) and `RPUSH` it onto its
-   * persisted lane. A won ZREM whose record is missing/rejected is garbage: log it and release the lock.
+   * Start-failure recovery for a popped entry whose claim never landed (record still `queued`, id
+   * parked in `claiming`): put it back at the HEAD of its lane (see `requeueUnclaimed`). If that fails
+   * too (e.g. Redis at maxmemory refuses the script), the run is NOT dropped: it stays parked in
+   * `claiming` (record `queued`, lock held) and maintenance puts it back on its lane once it has sat
+   * there past the stale threshold (action `'deferred'`). A record that is no longer `queued` (the claim
+   * did land despite the error, or the run moved on) is not this pop's to recover: nothing is touched
+   * and no `startFailed` fires. Trade-off: a claim that landed although its call threw leaves the record
+   * `running` under an execution that never started; it is not retried — maintenance stales it once its
+   * heartbeat lapses (a lost reply that the client RE-SENDS is handled: the claim is idempotent). Either way popping pauses briefly — for a whole stale-threshold window
+   * after an OOM or a deferral (see `popsPausedUntil`). Never throws.
+   */
+  private async recoverUnclaimed(jobId: string, err: unknown): Promise<void> {
+    const error = toError(err)
+    const reason = classifyRedisError(err)
+    let action: 'requeued' | 'deferred' | undefined
+    try {
+      if (await this.requeueUnclaimed(jobId)) action = 'requeued'
+    } catch (requeueErr) {
+      action = 'deferred'
+      this.logger(
+        `requeue of "${jobId}" failed (${classifyRedisError(requeueErr)}); it stays in the claiming set and maintenance will requeue it`,
+        toError(requeueErr),
+      )
+    }
+    // Back off before popping again. The entry may be right back at the head of the lane, and a
+    // persistent failure would otherwise spin pop → fail → requeue at full speed; under OOM every pop
+    // is refused anyway, so back off for a whole stale-threshold window.
+    const severe = reason === 'oom' || action === 'deferred'
+    this.pausePops(severe ? this.getStaleThreshold() : Math.min(1000, this.getStaleThreshold()))
+    if (!action) {
+      this.logger(`job "${jobId}" failed to start (${reason}) and no longer owns its record; skipping`, error)
+      return
+    }
+    this.logger(`job "${jobId}" failed to start (${reason}); ${action}`, error)
+    await this.emitStartFailed(jobId, reason, action, error)
+  }
+
+  /**
+   * Puts a popped-but-never-claimed run back at the HEAD of its lane (it was popped first), atomically
+   * with taking it out of `claiming` — only while its record is still `queued` and its `claiming` entry
+   * still parked, so an overlapping requeue (start-failure recovery here, maintenance on another
+   * instance) is a no-op instead of a duplicate entry. Shared by start-failure recovery and maintenance's
+   * claiming stage. Resolves whether it requeued; throws on a Redis error (e.g. OOM refuses the script).
+   */
+  private async requeueUnclaimed(jobId: string, seed?: string): Promise<boolean> {
+    const { outcome } = await this.updateLog(jobId, (record) => {
+      if (record.status !== 'queued') return false
+      record.enqueuedAt = Date.now()
+      return { push: 'L', takeFromClaiming: true }
+    }, seed)
+    return outcome === 'written'
+  }
+
+  /**
+   * Start-phase failure of a run that reached `job.execute()` (see the thunk in `resolvePopped`):
+   * - the claim write itself failed → the claim never landed → {@link recoverUnclaimed};
+   * - the claim landed (record `running` under this executionId) and a later start-phase step threw
+   *   (a job-level `start` hook) → route it through the run's NORMAL failure path: dispatch the job's
+   *   `error` hook, so the manager applies the fenced retry-or-final logic (`attempts`/`backoff`);
+   * - a job-level `start` hook registered BEFORE the manager's claim threw → the record is still
+   *   `queued` (never claimed): fail it terminally (`error`, lock released). Not requeued — a
+   *   deterministic hook failure would otherwise spin pop→requeue forever.
+   * Never throws.
+   */
+  private async recoverStartPhaseFailure(ctx: {
+    job: Job<any, any>
+    jobId: string
+    runId: string
+    inputs: unknown
+    executionId: string
+    err: unknown
+    controller: AbortController
+  }): Promise<void> {
+    const { job, jobId, runId, inputs, executionId, err } = ctx
+    // A primitive is never a key (WeakSet.has answers `false` for it).
+    if (claimWriteFailures.has(err as object)) {
+      await this.recoverUnclaimed(jobId, err)
+      return
+    }
+    const error = toError(err)
+    const reason = classifyRedisError(err)
+    try {
+      const record = await this.readRecord(jobId)
+      if (record?.executionId === executionId) {
+        // Claimed by this execution: the normal (fenced) failure path decides retry vs. final.
+        try {
+          await job.callHook('error', {
+            job,
+            targetGroup: this.targetGroup,
+            runId,
+            inputs,
+            executionId,
+            manager: this,
+            abort: (abortReason?: string) => ctx.controller.abort(abortReason ?? 'aborted'),
+            error,
+          })
+        } catch (hookErr) {
+          this.logger('error hook failed', toError(hookErr))
+        }
+      } else if (record?.status === 'queued') {
+        // Never claimed by this execution (a pre-claim job-level start hook threw): terminal error,
+        // lock released. NOTE `executionId` is not checked: a retry attempt's record is `queued` but
+        // still carries the PREVIOUS attempt's token, and treating that as "someone else's" left the
+        // run parked in `claiming` → requeued by maintenance → the hook threw again, forever.
+        await this.updateLog(jobId, failQueuedRun(error.message, Date.now()))
+      } else {
+        // Someone else owns the record now (or it is gone): nothing of ours to recover.
+        this.logger(`job "${jobId}" failed to start and no longer owns its record; skipping`, error)
+        return
+      }
+    } catch (recoverErr) {
+      this.logger(`job "${jobId}" failed to start; recovery failed (maintenance will reclaim it)`, toError(recoverErr))
+      return
+    }
+    this.logger(`job "${jobId}" failed to start (${reason}); failed`, error)
+    await this.emitStartFailed(jobId, reason, 'failed', error)
+  }
+
+  /** Fires the `startFailed` observers for `jobId`. */
+  private async emitStartFailed(
+    jobId: string,
+    reason: RedisErrorReason,
+    action: StartFailedEventPayload['action'],
+    error: Error,
+  ): Promise<void> {
+    const { jobName, runId } = splitJobId(jobId)
+    await this.emit('startFailed', { jobId, jobName, runId, reason, action, error })
+  }
+
+  /** Pauses popping for `ms` (see `popsPausedUntil`); never shortens an already longer pause. */
+  private pausePops(ms: number): void {
+    this.popsPausedUntil = Math.max(this.popsPausedUntil, Date.now() + ms)
+  }
+
+  /**
+   * Promotes delayed runs whose `readyAt` has elapsed onto their lane queues. Each promotion is ONE
+   * atomic transition (see `transition`): take the id off the delayed set (the claim — a racing
+   * instance that already took it makes this a no-op), flip the record `delayed` → `queued`, and RPUSH
+   * it onto its persisted lane. There is no crash window in which a promoted run is on neither
+   * structure. A due entry whose record is missing (or garbage) is purged with its lock.
    *
    * Rate-limited to at most once per 1000 ms via `lastPromotionCheck`: `popAndExecute` calls this on
    * every pop, and a busy queue re-polls immediately (interval 0), so without the cap each pop would
@@ -843,74 +1633,73 @@ export class RedisJM extends Hookable<RedisJMHooks> {
     this.lastPromotionCheck = now
 
     const delayedKey = this.getDelayedKey()
-    // Bounded batch: each due id costs ~3 serial round trips (ZREM → updateLog → RPUSH), so cap the
-    // sweep at 8 ids/pass to keep the promote step (awaited on the pop hot path) cheap. Combined with
-    // the 1000 ms rate-limit this promotes ~8 delayed runs/sec/instance; anything still due is picked
-    // up on the next sweep. Ids are independent (distinct hash fields / lane lists, and Redis resolves
-    // the ZREM claim race per-member), so promote them concurrently — each id's own ZREM→flip→RPUSH
-    // ordering is preserved within its chain.
-    const dueIds = await this.redis.zrangebyscore(delayedKey, '-inf', now, 'LIMIT', 0, 8)
-    await Promise.all(dueIds.map(async (jobId) => {
-      // The ZREM is the claim. Crash window: an instance that ZREM'd then died before the flip/RPUSH
-      // leaves the record `delayed` (or `queued`) but absent from the zset — maintenance's delayed
-      // branch reclaims it via the same two-pass suspectedAt flow as an orphaned queued record.
-      if ((await this.redis.zrem(delayedKey, jobId)) !== 1) return
-
-      // Capture the lane inside the (synchronous) mutator so the RPUSH targets the record's own lane.
-      let lane: string | undefined
-      const result = await this.updateLog(jobId, (record) => {
-        // Only a still-`delayed` record is promotable; anything else means the won claim points at a
-        // record that no longer owns this delayed slot.
-        if (record.status !== 'delayed') return false
+    // Bounded batch (8 ids/pass, ~2 round trips each) keeps this step — awaited on the pop hot path —
+    // cheap; anything still due is picked up on the next sweep. Ids are independent, so promote them
+    // concurrently.
+    // With scores: a stray entry is dropped only while its score is still the one read (see below).
+    const due = scorePairs(await this.redis.zrangebyscore(delayedKey, '-inf', now, 'WITHSCORES', 'LIMIT', 0, 8))
+    await Promise.all(due.map(async ([jobId, score]) => {
+      const { outcome, reason } = await this.updateLog(jobId, (record) => {
+        if (record.status !== 'delayed') return 'not-delayed'
         record.status = 'queued'
         delete record.readyAt
-        lane = record.lane
+        record.enqueuedAt = Date.now()
+        return { push: 'R' }
       })
-      if (result === 'written') {
-        await this.redis.rpush(this.getQueueKey(lane), jobId)
-      } else {
-        // Missing or rejected after a won ZREM: a delayed entry without a healthy `delayed` record is
-        // garbage. Release the lock so the runId isn't blocked forever.
+      if (outcome === 'missing') {
+        // A delayed entry without a record is garbage: drop it and release the lock so the runId isn't
+        // blocked forever.
         this.logger(`delayed job "${jobId}" had no promotable record; releasing lock`)
-        await this.redis.srem(this.getLocksKey(), jobId)
+        await this.purge(jobId, 'orphan', { delayed: true })
+      } else if (reason === 'not-delayed') {
+        // A stray delayed entry for a record that moved on (owns its own lock state): drop just the entry
+        // — and only while its score is the one read. A blind ZREM could erase the entry of a retry the
+        // run scheduled meanwhile, and the orphan check would then stale the run instead of retrying it.
+        await this.deleteIfUnchanged(delayedKey, 'z', [[jobId, score]])
       }
+      // else: promoted, or a racing instance promoted it first (precondition failed) — nothing to do.
     }))
   }
 
   /**
    * Re-queues a job whose name is not registered on this instance, keeping its lock held so a
-   * concurrent enqueue of the same runId can't duplicate it. Returns `true` if re-queued,
-   * `false` if the retry budget is exhausted (or disabled) and the caller should record an error.
+   * concurrent enqueue of the same runId can't duplicate it. Returns `'requeued'`; `'stray'` when the
+   * record is not `queued` (the popped entry is a stray duplicate — leave the record alone); or
+   * `'exhausted'` when the budget is used up / disabled or the record is gone, and the caller should
+   * record an error.
    */
-  private async requeueUnknownJob(jobId: string): Promise<boolean> {
+  private async requeueUnknownJob(jobId: string): Promise<'requeued' | 'stray' | 'exhausted'> {
     const limit = this.options.unknownJobRequeueLimit
-    if (limit <= 0) return false
-
-    const record = await this.readRecord(jobId)
-    if (!record) return false
-
-    const count = record.requeueCount ?? 0
-    if (count >= limit) return false
-
-    record.requeueCount = count + 1
-    record.status = 'queued'
-    await this.redis.hset(this.getLogKey(), jobId, JSON.stringify(record))
-    // Back of the queue (not the front) so this doesn't starve handleable work, and the lock
-    // is intentionally left in place. RPUSH to the record's own lane so a laned unknown job stays
-    // on its lane for a same-lane sibling to claim (end-to-end coverage lands with the step-3 consumer).
-    await this.redis.rpush(this.getQueueKey(record.lane), jobId)
-    return true
+    const { outcome, reason } = await this.updateLog(jobId, (record) => {
+      // Only a `queued` record is this pop's run. Flipping a `running` record back to `queued` (what an
+      // unguarded requeue of a stray entry did) let another worker claim it while it was running.
+      if (record.status !== 'queued') return 'stray'
+      const count = record.requeueCount ?? 0
+      if (limit <= 0 || count >= limit) return false
+      record.requeueCount = count + 1
+      record.enqueuedAt = Date.now()
+      // Back of the queue (not the front) so this doesn't starve handleable work; the lock stays held.
+      // RPUSH to the record's own lane so a laned unknown job stays on its lane for a same-lane sibling.
+      return { push: 'R' }
+    })
+    if (outcome === 'written') return 'requeued'
+    return reason === 'stray' ? 'stray' : 'exhausted'
   }
 
   /**
    * Starts a polling loop that calls `popAndExecute()`. Polls immediately after a job executes;
    * waits `interval` ms when the queue is empty.
    *
-   * Unless `maintenanceInterval` is `0`, also enqueues the built-in maintenance job — once
+   * Unless `maintenanceInterval` is `0`, also runs maintenance on this manager's own timer — once
    * immediately (so locks orphaned by a crash are reclaimed soon after restart) and then every
-   * `maintenanceInterval` ms. All instances enqueue concurrently; the lock dedupes the runs.
-   * Before the first enqueue it also proactively reclaims a stale maintenance lock left by a
-   * hard-killed instance, which would otherwise deadlock maintenance (it can't reclaim its own lock).
+   * `maintenanceInterval` ms — via {@link runMaintenance}. The timer is independent of the poll loop
+   * and the concurrency slots (maintenance still runs when every slot is held by a hung handler or the
+   * queue is backed up), passes never overlap on one instance, and the Redis lock inside
+   * `runMaintenance` lets about one pass per interval run across all instances.
+   *
+   * The built-in maintenance JOB is still registered (and its reserved `__maintenance` lane still
+   * polled) so maintenance entries enqueued by older instances during a rolling deploy are consumed;
+   * it now just calls `runMaintenance()`.
    *
    * @param interval - Milliseconds to wait between polls when idle (must be a positive number)
    *
@@ -925,66 +1714,117 @@ export class RedisJM extends Hookable<RedisJMHooks> {
     }
     if (this.polling) return
     this.polling = true
+    this.stopped = false
+    const generation = ++this.pollGeneration
+    const current = () => this.polling && generation === this.pollGeneration
+    // One-time eviction-policy sanity check (INFO memory — works on managed Redis that blocks CONFIG).
+    void this.checkEvictionPolicy()
 
     if (this.options.maintenanceInterval > 0) {
-      const job = this.jobsByName.get(MAINTENANCE_JOB_NAME) ?? createMaintenanceJob(this)
-      const tryQueue = () => {
-        // Don't enqueue after stop(): the bootstrap reclaim chain below is async, so a stop()
-        // that lands before it resolves would otherwise leave an orphaned maintenance entry.
-        if (!this.polling) return
-        this.queue(job, '', null).catch(() => {})
-      }
-      // Reclaim a stale maintenance lock first (no-op when none), THEN enqueue — so a lock
-      // orphaned by a hard kill can't permanently block maintenance from running.
-      this.reclaimStaleMaintenanceLock().then(tryQueue, tryQueue)
-      this.maintenanceTimer = setInterval(tryQueue, this.options.maintenanceInterval)
+      // Rolling-deploy compatibility: older instances still ENQUEUE the maintenance job, so keep its
+      // handler registered here (it runs the same lock-guarded pass as the timer).
+      if (!this.jobsByName.has(MAINTENANCE_JOB_NAME)) createMaintenanceJob(this)
+      // Maintenance lives OFF the queue: a timer of its own, so a full set of busy/hung concurrency
+      // slots or a deep backlog can never starve it (it is what reclaims those slots' records).
+      this.maintenanceTimer = setInterval(() => this.maintenanceTick(), this.options.maintenanceInterval)
+      this.maintenanceTick()
     }
 
     const concurrency = this.options.concurrency
-    const poll = async () => {
-      if (!this.polling) return
-
-      // All execution slots busy: wait for one run to free a slot, then re-poll immediately (a slot
-      // just opened). Do NOT pop while full — that would exceed the concurrency cap. In-flight runs
-      // swallow their own errors, so the race never rejects (the `.catch` is belt-and-suspenders).
-      if (this.inFlightRuns.size >= concurrency) {
-        await Promise.race(this.inFlightRuns).catch(() => {})
-        if (!this.polling) return
-        this.pollTimer = setTimeout(() => { this.currentPoll = poll() }, 0)
-        return
+    const laneConcurrency = this.laneConcurrencyByKey
+    // Schedules the next poll. `delay > 0` is the idle wait — the only wait `wake()` may cut short.
+    const schedule = (delay: number) => {
+      if (!current()) return
+      if (this.wakePending) {
+        this.wakePending = false
+        delay = 0
       }
+      this.idleWaiting = delay > 0
+      // Track every invocation in `currentPoll` (assigned synchronously inside the timer callback) so
+      // `stop()` can await a poll caught mid-pop before it drains `inFlightRuns` (see `currentPoll`).
+      this.pollTimer = setTimeout(() => {
+        this.idleWaiting = false
+        this.currentPoll = poll()
+      }, delay)
+    }
+    // Waits for any in-flight run to settle (a slot frees), then re-polls; with nothing in flight there
+    // is nothing to wait for, so fall back to the idle interval.
+    const waitForSlot = async () => {
+      if (this.inFlightRuns.size === 0) return schedule(interval)
+      // In-flight runs swallow their own errors, so the race never rejects (belt-and-suspenders catch).
+      await Promise.race(this.inFlightRuns).catch(() => {})
+      schedule(0)
+    }
+    const poll = async () => {
+      if (!current()) return
 
-      let thunk: null | (() => Promise<void>) = null
+      // All execution slots busy: wait for one run to free a slot. Do NOT pop while full — that would
+      // exceed the concurrency cap.
+      if (this.inFlightRuns.size >= concurrency) return waitForSlot()
+
+      // Per-lane caps: only lanes below their `laneConcurrency` cap are offered to the pop.
+      let popped: Awaited<ReturnType<RedisJM['popNext']>> = null
       try {
-        thunk = await this.popNext()
+        const plan = (await this.getPollPlan()).filter(({ key }) => {
+          const cap = laneConcurrency.get(key)
+          return cap === undefined || (this.laneInFlight.get(key) ?? 0) < cap
+        })
+        if (plan.length === 0) return waitForSlot()
+        popped = await this.popNext(plan)
       } catch (err) {
         // Keep the loop alive, but surface the failure instead of swallowing it silently.
-        this.logger('poll loop error', toError(err))
+        this.logPopError('poll loop error', err)
       }
 
-      if (thunk) {
+      if (popped) {
         // Dispatch WITHOUT awaiting so the loop can pop the next job concurrently. The thunk already
         // swallows RunSupersededError and handler errors internally (identical to the serial path); the
         // outer `.catch` guards against an unexpected infra fault becoming an unhandled rejection. Track
-        // the run so `stop()` can drain it and `concurrency` is enforced.
-        const run = thunk().catch((err) => {
+        // the run so `stop()` can drain it and `concurrency` / `laneConcurrency` are enforced.
+        const lane = popped.run === NOOP_THUNK ? undefined : popped.queueKey
+        if (lane !== undefined) this.laneInFlight.set(lane, (this.laneInFlight.get(lane) ?? 0) + 1)
+        const run = popped.run().catch((err) => {
           this.logger('in-flight run error', toError(err))
         })
         this.inFlightRuns.add(run)
         void run.finally(() => {
           this.inFlightRuns.delete(run)
+          if (lane === undefined) return
+          this.laneInFlight.set(lane, (this.laneInFlight.get(lane) ?? 1) - 1)
+          // A capped lane's slot just freed: if the loop is idling (it skipped this lane at its cap and
+          // found nothing elsewhere), re-poll now instead of after a full `interval`.
+          if (laneConcurrency.has(lane)) this.wake()
         })
       }
 
-      if (!this.polling) return
-      // Pacing (unchanged): work found → re-poll immediately; idle (empty queue / requeued unknown) →
-      // wait `interval`.
-      const delay = thunk ? 0 : interval
-      // Track every invocation in `currentPoll` (assigned synchronously inside the timer callback) so
-      // `stop()` can await a poll caught mid-pop before it drains `inFlightRuns` (see `currentPoll`).
-      this.pollTimer = setTimeout(() => { this.currentPoll = poll() }, delay)
+      // Pacing: work found → re-poll immediately; idle (empty queues / requeued unknown) → `interval`.
+      schedule(popped ? 0 : interval)
     }
+    this.schedulePoll = schedule
     this.currentPoll = poll()
+  }
+
+  /**
+   * Cuts the poll loop's idle wait short so it polls NOW — e.g. from a pub/sub "doorbell" that a
+   * producer rings after enqueueing. Respects slot accounting (`concurrency` / `laneConcurrency`), so
+   * it is the safe replacement for calling `popAndExecute()` ad hoc. No-op when the loop is not running
+   * or every slot is busy (the loop re-polls as soon as a slot frees anyway); a wake that arrives while
+   * a poll is in flight makes the next poll immediate.
+   *
+   * @example
+   * ```ts
+   * subscriber.on('message', () => manager.wake())
+   * ```
+   */
+  wake(): void {
+    if (!this.polling || !this.schedulePoll) return
+    if (this.inFlightRuns.size >= this.options.concurrency) return
+    if (this.idleWaiting) {
+      if (this.pollTimer) clearTimeout(this.pollTimer)
+      this.schedulePoll(0)
+    } else {
+      this.wakePending = true
+    }
   }
 
   /**
@@ -995,7 +1835,11 @@ export class RedisJM extends Hookable<RedisJMHooks> {
    * runs already in flight to finish on their own. `stop({ abort: true })` is a FAST abort-and-drain —
    * it additionally aborts every in-flight run's `ctx.signal` (reason `'manager stopped'`) so
    * cooperative handlers can bail out of wasted work early; `stop()` still awaits them to settle
-   * (abort is cooperative — nothing forcibly kills a handler).
+   * (abort is cooperative — nothing forcibly kills a handler). A handler that ignores its signal is only
+   * awaited until its execution timeout (`jobTimeout` / `JobMetadata.timeoutMs`) when one is set.
+   * The maintenance timer and `every()` timers are cleared too, an in-flight maintenance pass is
+   * awaited, in-flight `popAndExecute()` calls are drained, and `popAndExecute()` refuses to pop
+   * (returns `false`) until the next `start()`.
    *
    * @example
    * ```ts
@@ -1005,10 +1849,16 @@ export class RedisJM extends Hookable<RedisJMHooks> {
    */
   stop(options?: StopOptions): Promise<void> {
     this.polling = false
+    this.stopped = true
+    this.schedulePoll = undefined
+    this.idleWaiting = false
+    this.wakePending = false
     if (this.pollTimer) {
       clearTimeout(this.pollTimer)
       this.pollTimer = undefined
     }
+    for (const timer of this.everyTimers) clearInterval(timer)
+    this.everyTimers.clear()
     if (this.maintenanceTimer) {
       clearInterval(this.maintenanceTimer)
       this.maintenanceTimer = undefined
@@ -1024,6 +1874,9 @@ export class RedisJM extends Hookable<RedisJMHooks> {
       abortAll()
     }
     const drain = async () => {
+      // A maintenance pass in flight finishes on its own (it is short and bounded by the log size);
+      // awaiting it keeps `stop()`'s promise meaning "nothing of this manager is touching Redis".
+      await Promise.resolve(this.maintenancePass)
       // Await the in-flight poll invocation FIRST: a poll caught mid-pop has already removed the queue
       // entry from Redis, so the run it dispatches must be included in the drain — snapshotting
       // `inFlightRuns` before that dispatch would let `stop()` resolve while the popped job still
@@ -1036,199 +1889,667 @@ export class RedisJM extends Hookable<RedisJMHooks> {
       if (options?.abort) abortAll()
       // Await settlement of ALL in-flight runs. Each run's promise already swallows its own errors (the
       // poll loop logged them), so `allSettled` just waits without surfacing — `stop()` always resolves.
-      await Promise.allSettled([...this.inFlightRuns])
+      // `popAndExecute()` calls in flight (their pop and their run) are drained the same way.
+      await Promise.allSettled([...this.inFlightRuns, ...this.manualRuns])
     }
     return drain()
   }
 
   /**
-   * Reclaims the built-in maintenance job's lock if it was orphaned by a hard-killed instance.
-   * Because maintenance is the only thing that reclaims stale `running` locks, a maintenance run
-   * killed mid-execution would hold its own lock forever and block all future reclamation for the
-   * group — this breaks that deadlock at startup.
-   *
-   * Only reclaims locks that are *demonstrably* stale: a `running` record past the heartbeat
-   * threshold, or a lock with no backing record. It intentionally does NOT reclaim a `queued`
-   * record absent from the queue — that state is indistinguishable from a live instance's normal
-   * pop→start window, so reclaiming it would race a healthy run. (A maintenance job orphaned in
-   * that sub-millisecond window is the price of avoiding that race; prefer graceful `stop()` over
-   * SIGKILL.)
-   *
-   * One cutover exception: a `queued` maintenance record still PRESENT on the legacy default queue
-   * was enqueued by a pre-lanes (0.0.3) instance and would strand there — pure lane workers never
-   * poll that key. It is relocated onto the `__maintenance` lane (lock kept held) so it can run.
+   * One timer tick: start a lock-guarded maintenance pass unless this instance already has one in
+   * flight (passes never overlap on one instance), then check memory pressure. Failures are logged,
+   * never thrown.
    */
-  private async reclaimStaleMaintenanceLock(): Promise<void> {
-    const jobId = `${MAINTENANCE_JOB_NAME}#`
+  private maintenanceTick(): void {
+    if (this.maintenancePass) return
+    const pass = this.runMaintenance().then(
+      () => this.checkMemoryPressure(),
+      (err) => this.logger('maintenance pass failed', toError(err)),
+    )
+    this.maintenancePass = pass
+    void pass.finally(() => {
+      if (this.maintenancePass === pass) this.maintenancePass = undefined
+    })
+  }
+
+  /**
+   * Runs one maintenance pass if this instance wins the group's maintenance lock — what the
+   * `start()` timer calls every `maintenanceInterval`.
+   *
+   * Lock: `SET redisjm:<group>:maintenance-lock <token> NX PX <ttl>`, deliberately NOT released after
+   * the pass: its expiry spaces passes ~one interval apart across the whole fleet, however many
+   * instances tick. (`ttl` is `maintenanceInterval` minus a small margin so an instance's own next tick
+   * is not blocked by its own previous lock; `heartbeatInterval * roundsToStale` when auto-maintenance
+   * is disabled.)
+   *
+   * - lock acquired → full pass ({@link performMaintenance}), result `mode: 'full'`;
+   * - lock held by another instance → `null`;
+   * - the lock SET refused because Redis is OUT OF MEMORY → an EMERGENCY pass instead: no lock and no
+   *   writes, only deletions (expired terminal records, unparseable garbage records and their locks),
+   *   which Redis accepts at maxmemory. Deletions are idempotent, so concurrent emergency passes on
+   *   several instances are safe. Bounded like a full pass (`maxRecordsPerPass`), resuming from a
+   *   per-instance cursor. Result `mode: 'emergency'`, `staleCount: 0`.
+   * - any other lock error (connection, timeout, read-only replica…) → logged, `null`.
+   *
+   * @example
+   * ```ts
+   * const result = await manager.runMaintenance() // null when another instance holds the lock
+   * ```
+   */
+  async runMaintenance(): Promise<MaintenanceResult | null> {
+    const interval = this.options.maintenanceInterval
+    const ttl = interval > 0
+      // Margin: the lock is set a few ms AFTER this instance's tick fires, so a TTL of exactly one
+      // interval would still be held at its next tick and halve a lone instance's cadence.
+      ? Math.max(1, interval - Math.min(1000, Math.floor(interval / 10)))
+      : this.getStaleThreshold()
+    let acquired: string | null
+    try {
+      acquired = await this.redis.set(this.getMaintenanceLockKey(), randomUUID(), 'PX', ttl, 'NX')
+    } catch (err) {
+      const reason = classifyRedisError(err)
+      if (reason === 'oom') {
+        this.logger('Redis is out of memory; running an emergency (delete-only) maintenance pass', toError(err))
+        return this.performEmergencyMaintenance()
+      }
+      this.logger(`maintenance lock could not be acquired (${reason}); skipping this pass`, toError(err))
+      return null
+    }
+    if (acquired !== 'OK') return null
+    return this.performMaintenance()
+  }
+
+  /**
+   * One full, UNGUARDED maintenance pass (no lock — prefer {@link runMaintenance}, which the
+   * `start()` timer uses; this stays public for manual/one-off use).
+   *
+   * COST IS BOUNDED, not proportional to the log size: each stage examines at most
+   * `maxRecordsPerPass` items, and the log and lock scans resume from cursors persisted in Redis
+   * (`redisjm:<group>:maintenance-cursor` / `…:maintenance-locks-cursor`), so consecutive passes — on
+   * any instance — rotate through a large log. A failed cursor write just restarts that scan at 0.
+   * Presence checks are pipelined per batch; no per-record round trips except for the (rare) records
+   * that actually change.
+   *
+   * DELETIONS COME FIRST: every deletion runs before any write, so a pass on a Redis at maxmemory still
+   * frees what it can before the first write is refused. Every Redis operation is individually guarded:
+   * one failed write is counted and skipped instead of aborting the pass; failures are logged once per
+   * pass with their classified reason. Every record write is a compare-and-set against the record as
+   * read (see `updateLog`), so the pass can never overwrite a newer write (a claim, a heartbeat…).
+   *
+   * Stages:
+   *  - log batch: delete finished/error/stale records older than `keepFinishedInterval` and
+   *    unparseable/foreign records (and their locks); mark `running` records `stale` (lock released)
+   *    when their heartbeat lapsed or they ran longer than `maxRunMs`; two-pass orphan check of
+   *    `delayed` records missing from the delayed set, and of LEGACY `queued` records (no `enqueuedAt`,
+   *    written by <= 0.1.x) missing from their lane list and from `claiming` — first pass stamps
+   *    `suspectedAt`, a later one marks them `stale`. While a pre-0.2 instance was seen in the group
+   *    recently (it enqueues the maintenance job, which 0.2+ never does), new-format `queued` records
+   *    older than the stale threshold get the same check: an old consumer pops without a `claiming`
+   *    entry, so a crash between its pop and its claim would otherwise hold the run's lock forever;
+   *  - claiming: runs popped longer than the stale threshold ago and never claimed (the popping
+   *    instance died, or its claim failed) are put back at the head of their lane (`requeuedCount`); the
+   *    run never started, so nothing is lost or executed twice. Entries whose record moved on are removed;
+   *  - locks batch: a lock with no backing record is suspected on one pass and released on a later one
+   *    past the stale threshold (a pre-0.2 instance's enqueue is momentarily record-less);
+   *  - jobs batch: per-job bookkeeping upkeep — job-lock-set members whose lock is gone, lanes whose
+   *    list is empty, and jobs with nothing left are pruned.
+   *
+   * @returns Counts of stale, cleaned and requeued records (orphaned locks count toward `staleCount`), `mode: 'full'`
+   *
+   * @example
+   * ```ts
+   * const { staleCount, cleanedCount, requeuedCount } = await manager.performMaintenance()
+   * ```
+   */
+  async performMaintenance(): Promise<MaintenanceResult> {
+    const now = Date.now()
+    const ops = this.createOpGuard()
+    const cursorKeys = [
+      this.getMaintenanceCursorKey(),
+      this.getMaintenanceLocksCursorKey(),
+      this.getMaintenanceJobsCursorKey(),
+    ]
+
+    // ---- READ phase -------------------------------------------------------------------------------
+    // The scan cursors (each pass resumes where the last one — on any instance — stopped) and the
+    // legacy-instance marker in one round trip; then the independent stages read concurrently.
+    const legacyKey = this.getLegacySeenKey()
+    const [[logCursor], [locksCursor], [jobsCursor], [legacySeen]] = await this.pipelined(
+      [...cursorKeys, legacyKey],
+      (p, key) => (key === legacyKey ? p.exists(key) : p.get(key)),
+      ops,
+    )
+    const [log, claims, locks, jobs] = await Promise.all([
+      this.readLogStage(toCursor(logCursor), legacySeen === 1, now, ops),
+      this.readClaimingStage(now, ops),
+      this.readLockStage(toCursor(locksCursor), now, ops),
+      this.scanSetBatch(this.getJobRegistryKey(), toCursor(jobsCursor), Math.min(this.options.maxRecordsPerPass, JOB_PRUNE_BATCH)),
+    ])
+
+    // ---- DELETE phase — before any write (deletions still succeed when Redis is at maxmemory) ------
+    const cleanedCount = await this.cleanLogBatch(log, ops)
+    await this.inBatches(claims.drop, ops, (batch) => this.deleteIfUnchanged(this.getClaimingKey(), 'z', batch))
+    // Orphaned locks reclaimed — counted as stale (same bucket as the orphaned-queued reclaim).
+    let staleCount = await this.releaseLocks(locks.orphans, ops)
+    await this.batchDelete(this.getSuspectsKey(), locks.clear, 'hdel', ops)
+    // Per-job sets: drop lock-set members whose lock is gone (drift self-heal), empty lanes, and jobs
+    // with nothing left. Deletion-only script, one call per job, all in flight together.
+    await Promise.all(jobs.members.map((jobName) => ops.run(() => runScript(
+      this.redis,
+      PRUNE_JOB_SCRIPT,
+      [this.getLocksKey(), this.getJobLocksKey(jobName), this.getJobLanesKey(jobName), this.getJobRegistryKey()],
+      [jobName, JOB_LOCK_PRUNE_SAMPLE],
+    ))))
+
+    // ---- WRITE phase — compare-and-set per changed record, each guarded on its own ---------------
+    staleCount += await this.reclaimLiveRecords(log, now, ops)
+    // Overdue claims whose record is still `queued`: back to the HEAD of their lane (they were popped
+    // first). The compare-and-set guarantees the record is still `queued` at that instant — a late claim
+    // by the original popper either landed first (we skip) or will be fenced (its claim sees a re-queued
+    // record and a later pop's claim wins).
+    let requeuedCount = 0
+    for (const [jobId, json] of claims.requeue) {
+      await ops.run(async () => {
+        if (await this.requeueUnclaimed(jobId, json)) requeuedCount++
+      })
+    }
+    // First sighting of a record-less lock: stamp when we first saw it and wait for a later pass.
+    await this.inBatches(locks.stamp, ops, (batch) =>
+      this.redis.hset(this.getSuspectsKey(), Object.fromEntries(batch.map((member) => [member, String(now)]))))
+    // Persist the scan cursors so the next pass (on any instance) continues where this one stopped.
+    const nextCursors = [log.cursor, locks.cursor, jobs.cursor]
+    await this.pipelined(cursorKeys, (p, key, i) => p.set(key, nextCursors[i]), ops)
+
+    ops.report('maintenance pass')
+    return { staleCount, cleanedCount, requeuedCount, mode: 'full' }
+  }
+
+  /**
+   * Log stage reads: one bounded log batch (see {@link readLogBatch}) plus the presence checks of its
+   * `delayed` records (ZSCORE delayed) and LEGACY `queued` records (LPOS on their lane + ZSCORE claiming
+   * — a queued record parked in `claiming` is present; the claiming stage owns it), in one pipeline.
+   * `presence` maps each checked jobId to whether it is on its structure (`undefined` = read failed).
+   *
+   * New-format queued records normally need no check at all: their invariant (on the lane list or in
+   * `claiming`) makes the claiming stage the orphan detector. EXCEPT while a pre-0.2 instance is around
+   * (`legacyActive`, mixed rolling deploy, see `noteLegacyInstance`): its consumer pops with a plain
+   * LMPOP — no `claiming` entry — so if it dies before its claim, a new-format record is left `queued` on
+   * neither structure, holding its lock forever. During that window, new-format queued records older
+   * than the stale threshold get the legacy LPOS check too (the cost the old instances pay anyway).
+   */
+  private async readLogStage(
+    cursor: string,
+    legacyActive: boolean,
+    now: number,
+    ops: OpGuard,
+  ): Promise<LogBatch & { presence: Map<string, boolean | undefined> }> {
+    const batch = await this.readLogBatch(cursor, now)
+    const staleThreshold = this.getStaleThreshold()
+    const checked = batch.live.filter(([, r]) => r.status === 'delayed' || (r.status === 'queued' && (
+      r.enqueuedAt === undefined || (legacyActive && now - r.enqueuedAt > staleThreshold)
+    )))
+    const replies = await this.pipelined(checked, (p, [jobId, r]) => {
+      if (r.status === 'delayed') {
+        p.zscore(this.getDelayedKey(), jobId)
+      } else {
+        p.lpos(this.getQueueKey(r.lane), jobId)
+        p.zscore(this.getClaimingKey(), jobId)
+      }
+    }, ops)
+    const presence = new Map(checked.map(([jobId], i) => [
+      jobId,
+      replies[i].includes(undefined) ? undefined : replies[i].some((reply) => reply !== null),
+    ]))
+    return { ...batch, presence }
+  }
+
+  /**
+   * Claiming stage reads: runs popped longer than the stale threshold ago and still not claimed (the
+   * popping instance died, or its claim failed). Those whose record is still `queued` are to be
+   * `requeue`d (with the JSON read, the compare-and-set's seed); the rest (claimed since, gone, or
+   * garbage) leave a stale claiming entry to `drop` (`[jobId, score read]`).
+   */
+  private async readClaimingStage(now: number, ops: OpGuard): Promise<{
+    drop: Array<[string, string]>
+    requeue: Array<[string, string]>
+  }> {
+    let overdue: Array<[string, string]> = []
+    try {
+      overdue = scorePairs(await this.redis.zrangebyscore(
+        this.getClaimingKey(), '-inf', now - this.getStaleThreshold(), 'WITHSCORES', 'LIMIT', 0, this.options.maxRecordsPerPass,
+      ))
+    } catch (err) {
+      ops.fail(err)
+    }
+    const replies = await this.pipelined(overdue, (p, [jobId]) => p.hget(this.getLogKey(), jobId), ops)
+    const drop: Array<[string, string]> = []
+    const requeue: Array<[string, string]> = []
+    overdue.forEach(([jobId, score], i) => {
+      const [json] = replies[i]
+      if (json === undefined) return // read failed: leave it for the next pass
+      if (typeof json === 'string' && this.parseRecord(json, jobId)?.status === 'queued') requeue.push([jobId, json])
+      // Dropped with the score read: a pop of the same jobId since then (a fresh mark) is spared.
+      else drop.push([jobId, score])
+    })
+    return { drop, requeue }
+  }
+
+  /**
+   * Locks stage reads, resuming from its own cursor — works without the full log map. A lock with no
+   * backing record is suspected on one pass (`stamp`) and released on a later one past the stale
+   * threshold (`orphans`): a pre-0.2 instance's enqueue is momentarily record-less. Concurrently, suspicions
+   * that no longer apply (record landed, or lock released elsewhere) are collected to `clear` — the
+   * suspects hash only ever holds record-less locks, so one bounded HSCAN covers it in practice.
+   */
+  private async readLockStage(cursor: string, now: number, ops: OpGuard): Promise<{
+    cursor: string
+    orphans: string[]
+    stamp: string[]
+    clear: string[]
+  }> {
+    const logKey = this.getLogKey()
     const locksKey = this.getLocksKey()
-    if ((await this.redis.sismember(locksKey, jobId)) !== 1) return
-
-    const reclaim = async () => {
-      await this.redis.srem(locksKey, jobId)
-      await this.redis.hdel(this.getLogKey(), jobId)
+    const suspectsKey = this.getSuspectsKey()
+    const staleThreshold = this.getStaleThreshold()
+    const max = this.options.maxRecordsPerPass
+    const readLocks = async () => {
+      const batch = await this.scanSetBatch(locksKey, cursor, max)
+      const members = batch.members
+      const hasRecord = await this.pipelined(members, (p, m) => p.hexists(logKey, m), ops)
+      const recordless = members.filter((_, i) => hasRecord[i][0] === 0)
+      const suspicion = await this.pipelined(recordless, (p, m) => p.hget(suspectsKey, m), ops)
+      const orphans: string[] = []
+      const stamp: string[] = []
+      recordless.forEach((member, i) => {
+        const [suspectedAt] = suspicion[i]
+        if (suspectedAt === undefined) return // read failed
+        if (suspectedAt === null) stamp.push(member)
+        else if (now - Number(suspectedAt) > staleThreshold) orphans.push(member)
+      })
+      return { cursor: batch.cursor, orphans, stamp }
     }
-
-    const json = await this.redis.hget(this.getLogKey(), jobId)
-    if (!json) {
-      // Lock held with no backing record — unambiguously orphaned; reclaim it.
-      await this.redis.srem(locksKey, jobId)
-      return
+    const readSuspects = async () => {
+      let suspects: string[] = []
+      try {
+        suspects = [...(await this.scanHashBatch(suspectsKey, '0', max, true)).entries.keys()]
+      } catch (err) {
+        ops.fail(err)
+      }
+      const state = await this.pipelined(suspects, (p, m) => {
+        p.sismember(locksKey, m)
+        p.hexists(logKey, m)
+      }, ops)
+      return suspects.filter((_, i) => {
+        const [locked, hasRecord] = state[i]
+        return locked !== undefined && hasRecord !== undefined && (hasRecord === 1 || locked === 0)
+      })
     }
+    const [lockState, staleSuspicions] = await Promise.all([readLocks(), readSuspects()])
+    return { ...lockState, clear: [...new Set([...lockState.orphans, ...staleSuspicions])] }
+  }
 
-    const record = this.parseRecord(json, jobId)
-    if (!record) {
-      await reclaim()
-      return
-    }
-
-    if (record.status === 'running') {
-      const lastHeartbeat = record.heartbeat ?? record.startedAt ?? 0
-      if (Date.now() - lastHeartbeat > this.getStaleThreshold()) await reclaim()
-    } else if (record.status === 'queued') {
-      // Cutover safety: a maintenance job enqueued by a pre-lanes (0.0.3) instance sits on the LEGACY
-      // default queue, which pure lane workers never poll — it would strand there with the lock held and
-      // deadlock group-wide maintenance. Relocate it onto the __maintenance lane (polled by every
-      // lane-aware instance), keeping the lock held so no duplicate run is created. Safe against a
-      // concurrent default-lane consumer: if that consumer already popped the entry, our LREM removes
-      // nothing and we skip the re-push.
-      const legacyKey = this.getQueueKey()
-      if ((await this.redis.lpos(legacyKey, jobId)) !== null) {
-        // Stamp the lane BEFORE moving the entry so a concurrent performMaintenance resolves the record
-        // to the __maintenance lane (its two-pass orphan check tolerates the sub-ms move window).
-        record.lane = MAINTENANCE_LANE
-        await this.redis.hset(this.getLogKey(), jobId, JSON.stringify(record))
-        if ((await this.redis.lrem(legacyKey, 1, jobId)) > 0) {
-          await this.redis.rpush(this.getQueueKey(MAINTENANCE_LANE), jobId)
+  /**
+   * Write stage of the log batch: marks `running` records `stale` when their heartbeat lapsed or they
+   * ran longer than `maxRunMs`, and runs the two-pass orphan check of the presence-checked records — a
+   * first pass stamps `suspectedAt`, a later one past the stale threshold marks them `stale` (the
+   * pop→claim window looks the same as an orphan, hence two passes). Every write is a compare-and-set
+   * seeded with the scanned JSON (the lock release and history TTL ride on it — see `transition`).
+   * Returns how many records were marked stale.
+   */
+  private async reclaimLiveRecords(
+    log: LogBatch & { presence: Map<string, boolean | undefined> },
+    now: number,
+    ops: OpGuard,
+  ): Promise<number> {
+    const staleThreshold = this.getStaleThreshold()
+    let staled = 0
+    for (const [jobId, snapshot] of log.live) {
+      let mutate: (record: JobLogRecord) => Mutation
+      if (snapshot.status === 'running') {
+        if (!this.runOverdue(snapshot, now)) continue // cheap pre-filter on the snapshot
+        mutate = (record) => {
+          // Still the same execution, still running, still overdue on its CURRENT heartbeat?
+          if (record.status !== 'running' || record.executionId !== snapshot.executionId) return false
+          const reason = this.runOverdue(record, now)
+          if (!reason) return false
+          this.markStale(record, reason, now)
+        }
+      } else {
+        if (!log.presence.has(jobId)) continue // new-format queued: covered by the claiming stage
+        const present = log.presence.get(jobId)
+        if (present === undefined) continue // presence read failed
+        if (present && snapshot.suspectedAt === undefined) continue
+        mutate = (record) => {
+          // Claimed / promoted / reclaimed since the scan → not ours to touch.
+          if (record.status !== snapshot.status) return false
+          if (present) {
+            // Back on its structure: clear a pending suspicion.
+            if (record.suspectedAt === undefined) return false
+            delete record.suspectedAt
+          } else if (record.suspectedAt === undefined) {
+            // Two-pass orphan detection, pass 1: suspect.
+            record.suspectedAt = now
+          } else if (now - record.suspectedAt > staleThreshold) {
+            // Pass 2: still orphaned past the threshold → reclaim.
+            this.markStale(record, 'orphaned', now)
+          } else {
+            return false
+          }
         }
       }
+      await ops.run(async () => {
+        const { outcome, record } = await this.updateLog(jobId, mutate, log.entries.get(jobId))
+        if (outcome === 'written' && record?.status === 'stale') staled++
+      })
+    }
+    return staled
+  }
+
+  /**
+   * Whether a `running` record is overdue for reclaim, and why: `'maxRunMs'` when it has run longer
+   * than `maxRunMs` (checked against `startedAt`, independent of the heartbeat — a hung handler's
+   * heartbeat timer keeps the record looking alive forever), else `'heartbeat'` when its heartbeat
+   * lapsed past the stale threshold, else `null`.
+   */
+  private runOverdue(record: JobLogRecord, now: number): 'maxRunMs' | 'heartbeat' | null {
+    const maxRunMs = this.options.maxRunMs
+    if (maxRunMs > 0 && record.startedAt !== undefined && now - record.startedAt > maxRunMs) return 'maxRunMs'
+    const lastHeartbeat = record.heartbeat ?? record.startedAt ?? 0
+    return now - lastHeartbeat > this.getStaleThreshold() ? 'heartbeat' : null
+  }
+
+  /**
+   * Marks `record` stale for `reason`. The lock release and history TTL ride on the transition that
+   * writes it (see `transition`); the counterpart that undoes a heartbeat/orphan stale is
+   * `acceptRunningOrStale`.
+   */
+  private markStale(record: JobLogRecord, reason: NonNullable<JobLogRecord['staleReason']>, now: number): void {
+    record.status = 'stale'
+    record.finishedAt = now
+    record.staleReason = reason
+    delete record.suspectedAt
+    if (reason === 'maxRunMs') record.error = `Run exceeded maxRunMs (${this.options.maxRunMs}ms)`
+  }
+
+  /**
+   * The EMERGENCY pass {@link runMaintenance} runs when Redis refuses the maintenance lock with an OOM
+   * error: lock-free and delete-only — expired terminal records and unparseable garbage records are
+   * HDEL'd and the garbage records' locks SREM'd (in batches), nothing is written. Deletions are
+   * idempotent, so several instances running it concurrently is safe. Bounded by `maxRecordsPerPass`;
+   * the shared cursor can't be written under OOM, so it resumes from a per-instance cursor instead.
+   */
+  private async performEmergencyMaintenance(): Promise<MaintenanceResult> {
+    const ops = this.createOpGuard()
+    const batch = await this.readLogBatch(this.emergencyCursor, Date.now())
+    this.emergencyCursor = batch.cursor
+    const cleanedCount = await this.cleanLogBatch(batch, ops)
+    ops.report('emergency maintenance pass')
+    return { staleCount: 0, cleanedCount, requeuedCount: 0, mode: 'emergency' }
+  }
+
+  /**
+   * Records that a pre-0.2 instance is active in this group (seen: one of its maintenance-job entries
+   * was popped — 0.2+ never enqueues that job). Opens the window in which maintenance also orphan-checks
+   * new-format `queued` records (see `performMaintenance`). Fire-and-forget: a failed write only means
+   * the window opens on the next sighting.
+   */
+  private noteLegacyInstance(): void {
+    const ttl = Math.max(LEGACY_WINDOW_MS, 10 * this.getStaleThreshold())
+    this.redis.set(this.getLegacySeenKey(), String(Date.now()), 'PX', ttl).catch(() => {})
+  }
+
+  /**
+   * Scans `key` with `cmd` from `cursor`, `count` per call, handing each page to `onPage` until it
+   * returns `false` or the scan completes. Returns the cursor to resume from (`'0'` = completed).
+   */
+  private async scan(
+    cmd: 'hscan' | 'sscan',
+    key: string,
+    cursor: string,
+    count: number,
+    onPage: (items: string[]) => boolean,
+  ): Promise<string> {
+    let next = cursor
+    let more: boolean
+    do {
+      const [c, items] = await this.redis[cmd](key, next, 'COUNT', count)
+      next = c
+      more = onPage(items)
+    } while (next !== '0' && more)
+    return next
+  }
+
+  /**
+   * HSCANs `key` from `cursor` until about `max` entries were collected or the scan completed — with
+   * `onePage`, a single HSCAN call. Returns the entries (deduped by field: HSCAN can return a field
+   * twice under concurrent writes; last value wins) and the cursor to resume from (`'0'` = completed).
+   */
+  private async scanHashBatch(key: string, cursor: string, max: number, onePage = false): Promise<{ entries: Map<string, string>; cursor: string }> {
+    const entries = new Map<string, string>()
+    const next = await this.scan('hscan', key, cursor, Math.min(max, 500), (flat) => {
+      // HSCAN replies as a flat array alternating field, value, field, value, …
+      for (let i = 0; i < flat.length; i += 2) entries.set(flat[i], flat[i + 1])
+      return !onePage && entries.size < max
+    })
+    return { entries, cursor: next }
+  }
+
+  /** SSCAN counterpart of {@link scanHashBatch}. */
+  private async scanSetBatch(key: string, cursor: string, max: number): Promise<{ members: string[]; cursor: string }> {
+    const members = new Set<string>()
+    const next = await this.scan('sscan', key, cursor, Math.min(max, 500), (batch) => {
+      for (const m of batch) members.add(m)
+      return members.size < max
+    })
+    return { members: [...members], cursor: next }
+  }
+
+  /**
+   * Queues `add(pipeline, item, i)`'s commands (one or more) per item in a single pipeline and returns
+   * each item's replies, in order; a per-command error, or a failed pipeline, yields `undefined` for
+   * that reply (counted by `ops`).
+   */
+  private async pipelined<T>(
+    items: T[],
+    add: (pipeline: ReturnType<Redis['pipeline']>, item: T, i: number) => void,
+    ops: OpGuard,
+  ): Promise<unknown[][]> {
+    if (items.length === 0) return []
+    const pipeline = this.redis.pipeline()
+    const ends = items.map((item, i) => {
+      add(pipeline, item, i)
+      return pipeline.length
+    })
+    let replies: unknown[]
+    try {
+      replies = ((await pipeline.exec()) ?? []).map(([err, value]) => {
+        if (!err) return value
+        ops.fail(err)
+        return undefined
+      })
+    } catch (err) {
+      ops.fail(err)
+      replies = []
+    }
+    return ends.map((end, i) => {
+      const start = i === 0 ? 0 : ends[i - 1]
+      return Array.from({ length: end - start }, (_, k) => replies[start + k])
+    })
+  }
+
+  /**
+   * Scans one bounded log batch from `cursor` and splits it (see {@link planLogCleanup}) — the read
+   * half shared by the full and the emergency pass.
+   */
+  private async readLogBatch(cursor: string, now: number): Promise<LogBatch> {
+    const { entries, cursor: next } = await this.scanHashBatch(this.getLogKey(), cursor, this.options.maxRecordsPerPass)
+    return { entries, cursor: next, ...this.planLogCleanup(entries, now) }
+  }
+
+  /**
+   * The deletion half shared by the full and the emergency pass: compare-and-deletes the batch's
+   * garbage and expired records (a record replaced since the scan — e.g. the runId was re-enqueued — is
+   * kept), then releases the locks of the garbage records actually deleted (a replaced one owns its lock
+   * now). Returns how many records were deleted.
+   */
+  private async cleanLogBatch(batch: LogBatch, ops: OpGuard): Promise<number> {
+    const deleted = await this.deleteRecordsIfUnchanged(batch, ops)
+    await this.releaseLocks(batch.garbage.filter((id) => deleted.has(id)), ops)
+    return deleted.size
+  }
+
+  /**
+   * Splits scanned log entries into deletable `garbage` (unparseable/foreign — retention never
+   * applies), `expired` terminal records (finished/error/stale older than `keepFinishedInterval`), and
+   * `live` non-terminal records (running/queued/delayed) for the write stages.
+   */
+  private planLogCleanup(entries: Map<string, string>, now: number): Pick<LogBatch, 'garbage' | 'expired' | 'live'> {
+    const garbage: string[] = []
+    const expired: string[] = []
+    const live: Array<[string, JobLogRecord]> = []
+    for (const [jobId, json] of entries) {
+      // Defense-in-depth: one corrupt/foreign record must not abort the whole sweep.
+      const record = this.parseRecord(json, jobId)
+      if (!record) {
+        garbage.push(jobId)
+      } else if (isTerminal(record.status)) {
+        if (record.finishedAt !== undefined && now - record.finishedAt > this.options.keepFinishedInterval) {
+          expired.push(jobId)
+        }
+      } else if (record.status === 'running' || record.status === 'queued' || record.status === 'delayed') {
+        live.push([jobId, record])
+      }
+    }
+    return { garbage, expired, live }
+  }
+
+  /** Runs `fn` per batch of {@link DELETE_BATCH_SIZE} items, in order, each batch guarded by `ops`. */
+  private async inBatches<T>(items: T[], ops: OpGuard, fn: (batch: T[]) => Promise<unknown>): Promise<void> {
+    for (let i = 0; i < items.length; i += DELETE_BATCH_SIZE) {
+      const batch = items.slice(i, i + DELETE_BATCH_SIZE)
+      await ops.run(() => fn(batch))
     }
   }
 
   /**
-   * Scans the job log for stale and expired records:
-   * 1. Marks running jobs as `"stale"` if heartbeat expired (`now - lastHeartbeat > heartbeatInterval * roundsToStale`)
-   * 2. Marks orphaned queued jobs as `"stale"` — a `queued` record that is no longer in the queue
-   *    list was popped by an instance that died before the `start` event fired. Detection is
-   *    two-pass to avoid racing the normal pop→start window: the first scan stamps `suspectedAt`,
-   *    a later scan reclaims the lock if the record is still orphaned past the stale threshold.
-   * 3. Removes finished/error/stale records older than `keepFinishedInterval`, and deletes
-   *    unparseable/foreign records (garbage that retention would otherwise hoard forever).
-   * 4. Reclaims orphaned locks — a locks-set member with NO backing log record, which the
-   *    record-driven loop above can never see. Same two-pass suspicion as stage 2 (via a
-   *    `suspects` hash) so an in-flight enqueue isn't mistaken for a permanent orphan.
-   *
-   * @returns Counts of stale and cleaned records (orphaned locks count toward `staleCount`)
-   *
-   * @example
-   * ```ts
-   * const { staleCount, cleanedCount } = await manager.performMaintenance()
-   * ```
+   * Deletes `members` from `key` in batches (one HDEL/SREM/ZREM per batch, see {@link inBatches}).
+   * Returns how many were actually removed (per Redis' replies).
    */
-  async performMaintenance(): Promise<MaintenanceResult> {
+  private async batchDelete(key: string, members: string[], cmd: 'hdel' | 'srem' | 'zrem', ops: OpGuard): Promise<number> {
+    let removed = 0
+    await this.inBatches(members, ops, async (batch) => {
+      removed += await this.redis[cmd](key, ...batch)
+    })
+    return removed
+  }
+
+  /**
+   * Deletes a batch's scanned log records with a compare-and-delete (see `DELETE_IF_UNCHANGED_SCRIPT`),
+   * in batches: `expired` only while unchanged since the scan; `garbage` only while it is still the very
+   * value judged garbage — re-read as RAW bytes (it need not be valid UTF-8, so the scanned decoded copy
+   * needn't hash like the stored bytes) and re-judged by the manager's own parser, the single source of
+   * truth for "is a record". Returns the ids actually deleted.
+   */
+  private async deleteRecordsIfUnchanged(batch: LogBatch, ops: OpGuard): Promise<Set<string>> {
     const logKey = this.getLogKey()
-    const locksKey = this.getLocksKey()
-    const suspectsKey = this.getSuspectsKey()
-    // Incremental HSCAN over the log hash (bounded slices) rather than one blocking O(N) HGETALL.
-    const entries = await this.scanHash(logKey)
-    const now = Date.now()
-    let staleCount = 0
-    let cleanedCount = 0
+    const pairs: Array<[string, string]> = batch.expired.map((id) => [id, sha1Hex(batch.entries.get(id) ?? '')])
+    await this.inBatches(batch.garbage, ops, async (ids) => {
+      const raws = await this.redis.hmgetBuffer(logKey, ...ids)
+      raws.forEach((raw, i) => {
+        if (raw && !isRecordJson(raw.toString())) pairs.push([ids[i], sha1Hex(raw)])
+      })
+    })
+    const deleted = new Set<string>()
+    await this.inBatches(pairs, ops, async (slice) => {
+      for (const id of await this.deleteIfUnchanged(logKey, 'h', slice)) deleted.add(id)
+    })
+    return deleted
+  }
 
-    const staleThreshold = this.getStaleThreshold()
+  /**
+   * One compare-and-delete call (see `DELETE_IF_UNCHANGED_SCRIPT`): `'h'` pairs are (field, SHA-1 of the
+   * value read), `'z'` pairs (member, score read). Resolves the fields / members actually deleted.
+   */
+  private async deleteIfUnchanged(key: string, kind: 'h' | 'z', pairs: Array<[string, string]>): Promise<string[]> {
+    if (pairs.length === 0) return []
+    const reply = await runScript(this.redis, DELETE_IF_UNCHANGED_SCRIPT, [key], [kind, ...pairs.flat()])
+    return Array.isArray(reply) ? reply.map(String) : []
+  }
 
-    // `entries` (a Map keyed by jobId) doubles as the "has a backing log record this scan" lookup
-    // that stage 4 (below) uses to tell a lock that owns a record apart from a record-less orphan.
-    for (const [jobId, json] of entries) {
-      // Defense-in-depth: one corrupt/foreign record must not abort the whole sweep and
-      // stall stale-reclaim + cleanup for every other job in the group.
-      const record = this.parseRecord(json, jobId)
-      if (!record) {
-        // Unparseable/foreign record. Previously this branch `continue`d, so under
-        // `keepFinishedInterval > 0` these accumulated in the hash forever. Drop it and its lock
-        // unconditionally (garbage — retention doesn't apply); the jobId came straight from the hash
-        // field, so releasing the matching lock is safe.
-        await this.dropGarbageRecordAndLock(jobId)
-        cleanedCount++
-        continue
+  /**
+   * Releases maintenance-reclaimed run locks (garbage records' and orphaned ones) in batches: per batch
+   * ONE transaction SREMs them from the global locks set and from each job's lock set (deletions —
+   * accepted under OOM). Returns how many global locks were removed.
+   */
+  private async releaseLocks(jobIds: string[], ops: OpGuard): Promise<number> {
+    let released = 0
+    await this.inBatches(jobIds, ops, async (batch) => {
+      const byJob = new Map<string, string[]>()
+      for (const jobId of batch) {
+        const { jobName } = splitJobId(jobId)
+        const ids = byJob.get(jobName)
+        if (ids) ids.push(jobId)
+        else byJob.set(jobName, [jobId])
       }
+      const tx = this.redis.multi().srem(this.getLocksKey(), ...batch)
+      for (const [jobName, ids] of byJob) tx.srem(this.getJobLocksKey(jobName), ...ids)
+      const [[err, removed] = [null, 0]] = (await tx.exec()) ?? []
+      if (err) throw err
+      released += Number(removed)
+    })
+    return released
+  }
 
-      if (record.status === 'running') {
-        const lastHeartbeat = record.heartbeat ?? record.startedAt ?? 0
-        if (now - lastHeartbeat > staleThreshold) {
-          record.status = 'stale'
-          record.finishedAt = now
-          await this.redis.hset(logKey, jobId, JSON.stringify(record))
-          await this.redis.srem(locksKey, jobId)
-          staleCount++
+  /**
+   * Per-pass failure tally for maintenance (see `OpGuard`): `run` executes one guarded Redis operation,
+   * `fail` records a failure caught elsewhere, `report` logs ONCE per pass with the count and the
+   * classified reason of the first failure.
+   */
+  private createOpGuard(): OpGuard {
+    let failures = 0
+    let firstError: unknown
+    const fail = (err: unknown) => {
+      failures++
+      if (failures === 1) firstError = err
+    }
+    return {
+      fail,
+      run: async (op) => {
+        try {
+          await op()
+          return true
+        } catch (err) {
+          fail(err)
+          return false
         }
-      } else if (record.status === 'queued' || record.status === 'delayed') {
-        // Liveness proof differs by status: a `queued` record must still be on its lane queue; a
-        // `delayed` record must still be on the delayed zset. An overdue-but-present delayed entry is
-        // healthy — promotion owns due entries, so maintenance must NOT stale it. The two-pass
-        // suspectedAt reclaim below is identical for both (only the presence check above differs).
-        const present = record.status === 'queued'
-          ? (await this.redis.lpos(this.getQueueKey(record.lane), jobId)) !== null
-          : (await this.redis.zscore(this.getDelayedKey(), jobId)) !== null
-        if (!present) {
-          if (record.suspectedAt === undefined) {
-            record.suspectedAt = now
-            await this.redis.hset(logKey, jobId, JSON.stringify(record))
-          } else if (now - record.suspectedAt > staleThreshold) {
-            record.status = 'stale'
-            record.finishedAt = now
-            delete record.suspectedAt
-            await this.redis.hset(logKey, jobId, JSON.stringify(record))
-            await this.redis.srem(locksKey, jobId)
-            staleCount++
-          }
-        } else if (record.suspectedAt !== undefined) {
-          delete record.suspectedAt
-          await this.redis.hset(logKey, jobId, JSON.stringify(record))
-        }
-      } else if (record.status === 'finished' || record.status === 'error' || record.status === 'stale') {
-        if (record.finishedAt !== undefined && now - record.finishedAt > this.options.keepFinishedInterval) {
-          await this.redis.hdel(logKey, jobId)
-          cleanedCount++
+      },
+      report: (label) => {
+        if (failures === 0) return
+        this.logger(
+          `${label}: ${failures} Redis operation(s) failed (${classifyRedisError(firstError)}); continued with the rest`,
+          toError(firstError),
+        )
+      },
+    }
+  }
+
+  /**
+   * Dispatches a MANAGER-level hook as an isolated observer: each registered handler is awaited in
+   * turn and a throwing/rejecting one is logged and skipped — it can neither change the run's outcome
+   * or Redis state nor prevent the other handlers from being notified. (Job-level hooks are NOT routed
+   * through here: they are the lifecycle and keep their throw semantics.)
+   */
+  private async emit<N extends keyof RedisJMHooks>(name: N, payload: Parameters<RedisJMHooks[N]>[0]): Promise<void> {
+    const caller = async (hooks: Array<(...args: any[]) => any>, args: any[]) => {
+      for (const hook of hooks) {
+        try {
+          await hook(...args)
+        } catch (err) {
+          this.logger(`manager "${String(name)}" hook threw (ignored — manager hooks are observers)`, toError(err))
         }
       }
     }
-
-    // Stage 4: orphaned-lock reclaim. A locks-set member with NO backing log record is invisible to
-    // the record-driven loop above — it's created when `enqueue` crashes between its SADD and HSET
-    // (or the rollback `.catch()` also fails): the runId stays locked forever (`queue()` returns
-    // false, `isQueued()` true) with no record and no queue entry. Detect it two-pass, because an
-    // enqueue mid-flight (SADD done, HSET a few ms later) is momentarily indistinguishable from a
-    // permanent orphan. NOTE ON STAGE TIMING: a record enqueued *between* the log scan above and the
-    // lock scan here would look orphaned — that transient false positive is exactly why detection is
-    // two-pass (pass 1 suspects, pass 2 exonerates once the record lands), never single-pass.
-    const lockedIds = await this.scanSet(locksKey)
-    const suspects = await this.scanHash(suspectsKey)
-    for (const member of lockedIds) {
-      if (entries.has(member)) continue // has a record — reachable above, not an orphan
-      const suspectedAt = suspects.get(member)
-      if (suspectedAt === undefined) {
-        // First sighting of a record-less lock: stamp when we first saw it and wait for a later pass.
-        await this.redis.hset(suspectsKey, member, String(now))
-      } else if (now - Number(suspectedAt) > staleThreshold) {
-        // Still record-less past the stale threshold — a real queued-side loss, not an in-flight
-        // enqueue. Release the lock and clear the suspicion. Counted as stale (same bucket as the
-        // orphaned-queued reclaim in stage 2).
-        await this.redis.srem(locksKey, member)
-        await this.redis.hdel(suspectsKey, member)
-        staleCount++
-      }
-    }
-
-    // Exonerate suspects that no longer apply: the enqueue completed (a log record now exists) or the
-    // lock was released elsewhere (unqueue / a concurrent reclaim). This is the second pass that makes
-    // the false-positive window safe — an enqueue caught mid-flight on pass 1 is cleared here on pass 2.
-    for (const [member] of suspects) {
-      if (entries.has(member) || !lockedIds.has(member)) {
-        await this.redis.hdel(suspectsKey, member)
-      }
-    }
-
-    return { staleCount, cleanedCount }
+    await (this.callHookWith as (c: typeof caller, n: N, ...a: any[]) => Promise<void>)(caller, name, payload)
   }
 
   // -- private helpers --
@@ -1246,68 +2567,72 @@ export class RedisJM extends Hookable<RedisJMHooks> {
   }
 
   /**
-   * Fencing + self-heal decision shared by the heartbeat and update hooks — the recovery side of the
-   * stale-then-recovered execution-fencing asymmetry.
+   * Self-heal decision shared by the heartbeat and update hooks (after their executionId fence, see
+   * `updateOwned` in `registerJob`) — the recovery side of the stale-then-recovered execution-fencing
+   * asymmetry.
    *
    * A live handler whose heartbeat lapsed — maintenance staled its record and released its lock while
    * the event loop was pinned — still OWNS that record as long as its `executionId` matches. The
    * moment it writes again (a heartbeat, `setProgress`, or `setAttrs`) it proves it's alive, so we
-   * resurrect: flip `stale` → `running` and clear the maintenance-stamped `finishedAt` here; the
-   * caller then re-SADDs the lock so a producer can't double-enqueue the runId now that the run is
-   * demonstrably still going. This closes the old asymmetry where such a run's updates were rejected
-   * yet its finish (fenced on executionId only) still landed, freezing progress and dropping attrs.
+   * resurrect: flip `stale` → `running` and clear the maintenance-stamped `finishedAt`; the transition
+   * re-takes the lock with the write (stale → running) so a producer can't double-enqueue the runId now
+   * that the run is demonstrably still going. This closes the old asymmetry where such a run's updates
+   * were rejected yet its finish (fenced on executionId only) still landed, freezing progress and
+   * dropping attrs.
    *
-   * Returns:
-   *  - `'running'`     — record is healthy and ours; apply the write.
-   *  - `'resurrected'` — record was `stale` but ours; flipped back to `running` (caller re-locks).
-   *  - `false`         — reject: the owner changed (executionId mismatch) or the record reached a
-   *                      terminal/non-running state a live run can't own (finished/error/queued/delayed).
-   *                      The zombie stays fenced — once a successor re-enqueues the runId (fresh record,
-   *                      no/other executionId), the old execution's writes keep rejecting exactly as before.
+   * Returns `true` (apply the write) for a `running` record or a resurrected `stale` one; `false`
+   * (reject) for a record that reached a terminal/non-running state a live run can't own
+   * (finished/error/queued/delayed, or a `maxRunMs` stale). Once a successor re-enqueues the runId
+   * (fresh record, no/other executionId), the old execution's writes keep failing the fence.
    */
-  private acceptRunningOrStale(record: JobLogRecord, executionId: string): 'running' | 'resurrected' | false {
-    if (record.executionId !== executionId) return false
-    if (record.status === 'running') return 'running'
-    if (record.status === 'stale') {
+  private acceptRunningOrStale(record: JobLogRecord): boolean {
+    if (record.status === 'running') return true
+    // A `maxRunMs` stale is maintenance's verdict that this execution ran too long — final for its
+    // heartbeats and updates. A hung handler's heartbeat timer keeps firing, so resurrecting here would
+    // undo the backstop on the next heartbeat (and re-lock the runId forever). Rejecting also aborts the
+    // run's signal.
+    if (record.status === 'stale' && record.staleReason !== 'maxRunMs') {
       record.status = 'running'
       delete record.finishedAt
-      return 'resurrected'
+      delete record.staleReason
+      return true
     }
     return false
   }
 
   /**
-   * Releases a jobId's lock and, unless finished records are being retained
-   * (`keepFinishedInterval > 0`), drops its log entry too. Shared by every terminal path
-   * (finish, error, unknown-job drop, corrupt-record cleanup) so the retention policy lives in one spot.
+   * Purges one run's state in one atomic, deletion-only step (see `PURGE_SCRIPT` — accepted under OOM):
+   * its record and run lock, plus the requested `lane` list entry / `claiming` / `delayed` / `suspects`
+   * entries. `'force'` purges unconditionally; `'orphan'` only while no valid record backs the jobId: the
+   * stored value is read here as RAW bytes and judged by the manager's own parser — a record means
+   * "skip" — and the script then purges only while the value is still exactly what was judged (absent,
+   * or that garbage). So a record re-enqueued since is never deleted or unlocked, and Lua never has to
+   * agree with `JSON.parse` on what a record is. Resolves whether it purged.
    */
-  private async releaseLockAndMaybeDropLog(jobId: string): Promise<void> {
-    await this.redis.srem(this.getLocksKey(), jobId)
-    if (this.options.keepFinishedInterval === 0) {
-      await this.redis.hdel(this.getLogKey(), jobId)
+  private async purge(
+    jobId: string,
+    mode: 'force' | 'orphan',
+    also: { lane?: string; claiming?: boolean; delayed?: boolean; suspects?: boolean } = {},
+  ): Promise<boolean> {
+    const flags = (also.lane ? 'q' : '') + (also.claiming ? 'c' : '') + (also.delayed ? 'd' : '') + (also.suspects ? 's' : '')
+    let witness = ''
+    if (mode === 'orphan') {
+      const raw = await this.redis.hgetBuffer(this.getLogKey(), jobId)
+      if (raw) {
+        if (isRecordJson(raw.toString())) return false
+        witness = sha1Hex(raw)
+      }
     }
-  }
-
-  /**
-   * Re-establishes a jobId's lock — the self-heal counterpart to {@link releaseLockAndMaybeDropLog}.
-   * Called by the heartbeat/update/error-retry hooks when a run resurrects a record maintenance had
-   * staled (and SREM'd its lock): re-acquiring the lock restores dedupe so a producer can't
-   * double-enqueue the runId now that the execution has proven itself alive.
-   */
-  private async reacquireLock(jobId: string): Promise<void> {
-    await this.redis.sadd(this.getLocksKey(), jobId)
-  }
-
-  /**
-   * Unconditionally drops a garbage record and its lock (SREM lock + HDEL record). Unlike
-   * `releaseLockAndMaybeDropLog`, retention never applies here: the record is unparseable/foreign
-   * garbage, so keeping it under `keepFinishedInterval > 0` would only hoard it forever. Shared by
-   * the corrupt-record branches in `popAndExecute` and `performMaintenance` so that decision lives
-   * in one spot.
-   */
-  private async dropGarbageRecordAndLock(jobId: string): Promise<void> {
-    await this.redis.srem(this.getLocksKey(), jobId)
-    await this.redis.hdel(this.getLogKey(), jobId)
+    const keys = [
+      this.getLogKey(),
+      this.getLocksKey(),
+      this.getJobLocksKey(splitJobId(jobId).jobName),
+      this.getClaimingKey(),
+      this.getDelayedKey(),
+      this.getSuspectsKey(),
+      also.lane ?? this.getLogKey(),
+    ]
+    return Number(await runScript(this.redis, PURGE_SCRIPT, keys, [jobId, mode, flags, witness])) === 1
   }
 
   /** Milliseconds a `running` heartbeat may lapse before the job is considered stale. */
@@ -1327,49 +2652,12 @@ export class RedisJM extends Hookable<RedisJMHooks> {
       this.logger(`skipping unparseable log record "${jobId}"`)
       return null
     }
-    // Shape guard: valid JSON that isn't a record object — a foreign field holding `"42"`,
-    // `"true"`, `null`, or an array — would otherwise flow through `as JobLogRecord` as a record
-    // with every property `undefined`. Require a non-null object with a string `status` before
-    // trusting it; anything else is malformed and treated as garbage by the callers.
-    if (typeof value !== 'object' || value === null || typeof (value as JobLogRecord).status !== 'string') {
+    // Shape guard (see `isRecordShape`): anything else is malformed and treated as garbage by the callers.
+    if (!isRecordShape(value)) {
       this.logger(`skipping malformed log record "${jobId}"`)
       return null
     }
-    return value as JobLogRecord
-  }
-
-  /**
-   * Incrementally reads a hash via `HSCAN` (COUNT 100) instead of one blocking O(N) `HGETALL`, so a
-   * large log hash is loaded in bounded slices. HSCAN can return the same field across iterations
-   * under concurrent writes, so results are deduped by field (last value wins).
-   */
-  private async scanHash(key: string): Promise<Map<string, string>> {
-    const byField = new Map<string, string>()
-    let cursor = '0'
-    do {
-      const [next, flat] = await this.redis.hscan(key, cursor, 'COUNT', 100)
-      // HSCAN replies as a flat array alternating field, value, field, value, …
-      for (let i = 0; i < flat.length; i += 2) {
-        byField.set(flat[i], flat[i + 1])
-      }
-      cursor = next
-    } while (cursor !== '0')
-    return byField
-  }
-
-  /**
-   * Incrementally reads a set via `SSCAN` (COUNT 100) instead of a single `SMEMBERS`. SSCAN may
-   * repeat a member across iterations under concurrent writes, so members are deduped.
-   */
-  private async scanSet(key: string): Promise<Set<string>> {
-    const members = new Set<string>()
-    let cursor = '0'
-    do {
-      const [next, batch] = await this.redis.sscan(key, cursor, 'COUNT', 100)
-      for (const m of batch) members.add(m)
-      cursor = next
-    } while (cursor !== '0')
-    return members
+    return value
   }
 
   /** Fetches and parses a single log record by `jobId`; `null` if absent or unparseable. */
@@ -1378,15 +2666,22 @@ export class RedisJM extends Hookable<RedisJMHooks> {
     return json ? this.parseRecord(json, jobId) : null
   }
 
-  private async enqueue<TInputs>(
+  /**
+   * The single enqueue implementation behind `enqueue` / `enqueueMany` / `queue` / `queueFirst`:
+   * validation and the inputs-size guard in JS, then ONE `ENQUEUE_SCRIPT` call for all entries (dedupe
+   * via the run lock, `maxInFlight` → `'busy'`, lane cap → `'full'`, record + queue/delayed entry +
+   * bookkeeping sets). The script is atomic and, under maxmemory, refused before any write — so a failed
+   * enqueue leaves nothing behind and there is nothing to roll back. A Redis failure throws
+   * `RedisJMEnqueueError` for the whole call.
+   */
+  private async enqueueRun<TInputs>(
     job: Job<TInputs, any>,
-    runId: string,
-    inputs: TInputs,
+    entries: Array<{ runId: string; inputs: TInputs }>,
     pushCmd: 'rpush' | 'lpush',
     options?: QueueOptions,
-  ): Promise<boolean> {
+  ): Promise<EnqueueResult[]> {
     // Authoritative lane validation: the producer path never goes through registerJob, so validate
-    // here (before taking the lock) as well as at registration.
+    // here (before any Redis write) as well as at registration.
     this.validateLane(job.getLane(), job.getName())
 
     const delay = options?.delay
@@ -1397,70 +2692,242 @@ export class RedisJM extends Hookable<RedisJMHooks> {
       // A priority insert stages the run at the FRONT of the live queue; there is no "front" of a
       // time-ordered delayed set, so combining the two is contradictory — reject it.
       if (delay > 0 && pushCmd === 'lpush') {
-        throw new TypeError('queueFirst() cannot be combined with a delay — a priority insert cannot be delayed')
+        throw new TypeError('queueFirst() / enqueue({ first: true }) cannot be combined with a delay — a priority insert cannot be delayed')
       }
     }
+    if (entries.length === 0) return []
 
-    const jobId = job.getJobId(runId)
-    const locksKey = this.getLocksKey()
-
-    const added = await this.redis.sadd(locksKey, jobId)
-    if (added === 0) return false
-
+    const meta = job.getMetadata()
+    const { jobName, lane } = meta
     const isDelayed = delay !== undefined && delay > 0
-    try {
-      const record: JobLogRecord<TInputs> = {
+    const now = Date.now()
+    // Effective max serialized inputs size: the job's value wins, `0` = unlimited.
+    const maxInputsBytes = meta.maxInputsBytes !== undefined ? positiveOrZero(meta.maxInputsBytes) : this.options.maxInputsBytes
+    const args: Array<string | number> = []
+    for (const { runId, inputs } of entries) {
+      const jobId = job.getJobId(runId)
+      const inputsJson = JSON.stringify(inputs) as string | undefined
+      // Size guard BEFORE any Redis traffic: one oversized payload must not be what fills Redis. In a
+      // batch, one oversized entry rejects the whole batch (nothing written).
+      if (maxInputsBytes > 0) {
+        const size = Buffer.byteLength(inputsJson ?? '', 'utf8')
+        if (size > maxInputsBytes) {
+          throw await this.enqueueFailure(
+            jobName, runId, jobId,
+            new Error(`serialized inputs are ${size} bytes, limit is ${maxInputsBytes}`),
+            'inputs-too-large',
+          )
+        }
+      }
+      const record: Omit<JobLogRecord, 'inputs'> = {
         jobId,
-        jobName: job.getName(),
+        jobName,
         runId,
-        inputs,
         targetGroup: this.targetGroup,
-        // `undefined` for the default lane; JSON.stringify omits it, so a default-lane record
-        // serializes byte-for-byte as in 0.0.3 (no `lane` key).
-        lane: job.getLane(),
+        // `undefined` for the default lane; JSON.stringify omits it, so a default-lane record carries
+        // no `lane` key (as in 0.0.3).
+        lane,
         // A delayed record holds the lock (dedupe still applies while waiting), like `queued`.
         status: isDelayed ? 'delayed' : 'queued',
         progress: 0,
       }
-      if (isDelayed) {
-        record.readyAt = Date.now() + delay!
-      }
-      // Write the log record BEFORE the queue/delayed entry: that entry is what makes the job
-      // promotable/poppable, so if it landed first a concurrent poller could act on it before the
-      // record exists. (A crash between these writes instead leaves a `queued`/`delayed` record
-      // absent from its structure — reclaimed by maintenance.)
-      await this.redis.hset(this.getLogKey(), jobId, JSON.stringify(record))
-      if (isDelayed) {
-        await this.redis.zadd(this.getDelayedKey(), record.readyAt!, jobId)
-      } else {
-        await this.redis[pushCmd](this.getQueueKey(job.getLane()), jobId)
-      }
-      return true
-    } catch (err) {
-      await this.redis.srem(locksKey, jobId).catch(() => {})
-      await this.redis.hdel(this.getLogKey(), jobId).catch(() => {})
-      // Roll back a possibly-written delayed entry too (mirrors the queue-list rollback).
-      if (isDelayed) await this.redis.zrem(this.getDelayedKey(), jobId).catch(() => {})
-      throw err
+      if (isDelayed) record.readyAt = now + delay!
+      else record.enqueuedAt = now
+      args.push(jobId, serializeRecord(record, inputsJson), record.readyAt ?? 0)
     }
+
+    const keys = [
+      this.getLocksKey(),
+      this.getLogKey(),
+      this.getDelayedKey(),
+      this.getQueueKey(lane),
+      this.getJobLocksKey(jobName),
+      this.getJobLanesKey(jobName),
+      this.getJobRegistryKey(),
+    ]
+    const header = [
+      jobName,
+      isDelayed ? 'D' : pushCmd === 'lpush' ? 'L' : 'R',
+      this.resolveLaneCap(meta) ?? -1,
+      nonNegativeInt(meta.maxInFlight) ?? -1,
+    ]
+    let statuses: unknown
+    try {
+      statuses = await runScript(this.redis, ENQUEUE_SCRIPT, keys, [...header, ...args])
+    } catch (err) {
+      // One script call: nothing was written (OOM refuses it up front). Report it per the first entry.
+      const { runId } = entries[0]
+      throw await this.enqueueFailure(jobName, runId, job.getJobId(runId), err)
+    }
+    const list = Array.isArray(statuses) ? statuses : []
+    return entries.map(({ runId }, i) => ({
+      status: (list[i] ?? 'deduped') as EnqueueResult['status'],
+      jobId: job.getJobId(runId),
+    }))
   }
 
   /**
-   * Read-modify-write of a single log record. Returns `'missing'` when there is no record,
-   * `'rejected'` when the mutator returned `false` (a deliberate abort — the record isn't in a
-   * state worth touching, or no longer belongs to this execution), and `'written'` otherwise.
-   * The distinction lets fencing hooks tell "the record's owner changed" (rejected) apart from
-   * "the record was unqueued/cleaned mid-run" (missing).
+   * Effective enqueue cap of a job's lane: the smaller of `JobMetadata.maxQueued` and
+   * `laneCaps[lane]` when either is defined, else `undefined` (no cap, no LLEN round trip).
    */
-  private async updateLog(
+  private resolveLaneCap(meta: JobMetadata): number | undefined {
+    const caps = [nonNegativeInt(meta.maxQueued), this.options.laneCaps[this.laneLabel(meta.lane)]]
+      .filter((c): c is number => c !== undefined)
+    return caps.length ? Math.min(...caps) : undefined
+  }
+
+  /**
+   * Builds the `RedisJMEnqueueError` for a failed enqueue write, counts OOM refusals, and notifies the
+   * `enqueueFailed` observers (isolated — an observer can't mask the error). Returns the error for the
+   * caller to throw.
+   */
+  private async enqueueFailure(
+    jobName: string,
+    runId: string,
     jobId: string,
-    mutate: (record: JobLogRecord) => void | boolean,
-  ): Promise<'written' | 'rejected' | 'missing'> {
-    const record = await this.readRecord(jobId)
-    if (!record) return 'missing'
-    if (mutate(record) === false) return 'rejected'
-    await this.redis.hset(this.getLogKey(), jobId, JSON.stringify(record))
-    return 'written'
+    err: unknown,
+    forcedReason?: EnqueueErrorReason,
+  ): Promise<RedisJMEnqueueError> {
+    const reason = forcedReason ?? classifyRedisError(err)
+    if (reason === 'oom') this.oomRefusals++
+    const error = new RedisJMEnqueueError(reason, jobId, err)
+    await this.emit('enqueueFailed', { jobId, jobName, runId, reason, error })
+    return error
+  }
+
+  /**
+   * Atomic read-modify-write of a single log record: read it, let `mutate` change it (see `Mutation`),
+   * then write it with a compare-and-set (`TRANSITION_SCRIPT`) that only lands if the stored JSON is
+   * still exactly what was read, together with the queue-structure side effects the status change
+   * implies (see {@link transition}). On a lost race the record is re-read and `mutate` re-applied (up to
+   * `CAS_ATTEMPTS` times), so a concurrent writer — a claim, a heartbeat, a finish, another instance's
+   * maintenance — is never overwritten by a stale copy. `mutate` must therefore be re-runnable: it gets
+   * a fresh copy each attempt, and what it decided is read back from the returned `LogUpdate`.
+   *
+   * The first attempt starts from `seed` (JSON the caller already read), else from the JSON this
+   * instance last saw of the record (`recordJson`) — no read at all on the hot path. A stale seed just
+   * loses its compare-and-set (not counted as an attempt) and the record is re-read; a rejection decided
+   * on a seed is likewise re-checked on a fresh read, so outcomes are exactly those of a read-first
+   * write.
+   *
+   * Writes from THIS instance to the same record are queued and run one at a time. Without that, a
+   * handler firing many `ctx.setProgress()`/`setAttrs()` calls concurrently (or one racing a heartbeat
+   * or the finish) would have its own writes lose each other's compare-and-set: with N concurrent local
+   * writers the last needs N attempts, so beyond `CAS_ATTEMPTS` the update — or the terminal write —
+   * threw. Serialized, local writers never conflict; the CAS retry budget is left for genuinely
+   * concurrent writers on OTHER instances (maintenance, a promotion), which are rare per record.
+   *
+   * Outcome `'missing'` when there is no (parseable) record, `'rejected'` when the mutator rejected
+   * (the record isn't in a state worth touching, or no longer belongs to this execution) or a take-from-
+   * set precondition failed, and `'written'` otherwise. Throws on a Redis error, or when every attempt
+   * lost its race.
+   */
+  private updateLog(
+    jobId: string,
+    mutate: (record: JobLogRecord) => Mutation,
+    seed?: string,
+  ): Promise<LogUpdate> {
+    const previous = this.recordWrites.get(jobId) ?? Promise.resolve()
+    const run = () => this.updateLogNow(jobId, mutate, seed)
+    const result = previous.then(run, run)
+    const tail = result.then(() => {}, () => {})
+    this.recordWrites.set(jobId, tail)
+    void tail.then(() => {
+      if (this.recordWrites.get(jobId) === tail) this.recordWrites.delete(jobId)
+    })
+    return result
+  }
+
+  /** One compare-and-set read-modify-write of a record (see {@link updateLog}, which serializes these). */
+  private async updateLogNow(
+    jobId: string,
+    mutate: (record: JobLogRecord) => Mutation,
+    seed?: string,
+  ): Promise<LogUpdate> {
+    let next = seed ?? this.recordJson.get(jobId)
+    // Forgotten unless this write leaves the record `running` under this instance (re-set below).
+    this.recordJson.delete(jobId)
+    for (let attempt = 0; attempt < CAS_ATTEMPTS;) {
+      const seeded = next !== undefined
+      let json: string | null | undefined = next
+      next = undefined
+      if (!seeded) {
+        json = await this.redis.hget(this.getLogKey(), jobId)
+        attempt++
+      }
+      const record = json ? this.parseRecord(json, jobId) : null
+      // Only a compare-and-set proves a seed current: a verdict reached on a seed alone (no record,
+      // a rejection) is re-checked against a fresh read.
+      if (!json || !record) {
+        if (seeded) continue
+        return { outcome: 'missing' }
+      }
+      const before = record.status
+      const mutation = mutate(record)
+      if (mutation === false || typeof mutation === 'string') {
+        if (seeded) continue
+        return { outcome: 'rejected', record, reason: mutation || undefined }
+      }
+      const written = JSON.stringify(record)
+      const result = await this.transition(jobId, json, written, before, record, mutation || undefined)
+      if (result === 1) {
+        if (record.status === 'running') this.recordJson.set(jobId, written)
+        return { outcome: 'written', record }
+      }
+      if (result === -1) return { outcome: 'missing' }
+      if (result === -2) return { outcome: 'rejected', reason: 'precondition' }
+      // 0: someone else wrote the record since we read it → re-read and re-apply.
+    }
+    throw new Error(`record "${jobId}" kept changing under concurrent writers; gave up after ${CAS_ATTEMPTS} attempts`)
+  }
+
+  /**
+   * Runs `TRANSITION_SCRIPT` for one record write (see there for the ops and result codes), DERIVING
+   * the queue-structure side effects from the status change, so the structure invariant — "a `queued`
+   * record is on its lane list or in `claiming`; a `delayed` one is on the delayed set; a live run holds
+   * its lock, a terminal one doesn't" — is stated once, here, instead of by every caller:
+   * - leaving `queued` (or a queued record pushed back) → out of `claiming` (or, with
+   *   `takeFromClaiming`, only if still there);
+   * - `delayed` → `queued` (promotion) → taken off the delayed set, aborting unless still there;
+   *   entering `delayed` → onto the delayed set at `readyAt`;
+   * - entering a terminal status → the lock is released and the record retired with the write: a
+   *   history TTL of `keepFinishedInterval`, or — `finished`/`error` with `keepFinishedInterval: 0` —
+   *   deleted (a `stale` record is always kept: a live run may still resurrect it);
+   * - `stale` → `running`/`delayed` (a resurrected run, a retry off a staled run) → the lock is re-taken;
+   * - `extra.push` → pushed onto the record's lane (head `'L'` / tail `'R'`).
+   */
+  private async transition(
+    jobId: string,
+    expected: string,
+    next: string,
+    before: JobStatus,
+    record: JobLogRecord,
+    extra?: { push: 'L' | 'R'; takeFromClaiming?: boolean },
+  ): Promise<number> {
+    const after = record.status
+    const keepFinished = this.options.keepFinishedInterval
+    const claiming = extra?.takeFromClaiming
+      ? 'take'
+      : before === 'queued' && (after !== 'queued' || extra) ? 'remove' : ''
+    const delayed = before === 'delayed' && after === 'queued'
+      ? 'take'
+      : before !== 'delayed' && after === 'delayed' ? 'add' : ''
+    let lock = ''
+    if (isTerminal(after) && after !== before) lock = keepFinished === 0 && after !== 'stale' ? 'drop' : 'retire'
+    else if (before === 'stale' && (after === 'running' || after === 'delayed')) lock = 'take'
+    const { jobName } = splitJobId(jobId)
+    const pushKey = extra ? this.getQueueKey(record.lane) : this.getLogKey()
+    const keys = [
+      this.getLogKey(),
+      this.getClaimingKey(),
+      this.getLocksKey(),
+      this.getDelayedKey(),
+      pushKey,
+      this.getJobLocksKey(jobName),
+      this.getJobLanesKey(jobName),
+    ]
+    const args = [jobId, sha1Hex(expected), next, extra?.push ?? '', claiming, delayed, record.readyAt ?? 0, lock, keepFinished]
+    return Number(await runScript(this.redis, TRANSITION_SCRIPT, keys, args))
   }
 
   /**
@@ -1506,7 +2973,7 @@ export class RedisJM extends Hookable<RedisJMHooks> {
 
   /**
    * Hash mapping jobId → epoch-ms when maintenance first saw its lock held with no backing log
-   * record. Backs the two-pass orphaned-lock reclaim in `performMaintenance` (stage 4), the same
+   * record. Backs the two-pass orphaned-lock reclaim in `performMaintenance` (locks stage), the same
    * way `suspectedAt` on a record backs the orphaned-queued reclaim.
    */
   private getSuspectsKey(): string {
@@ -1515,6 +2982,66 @@ export class RedisJM extends Hookable<RedisJMHooks> {
 
   private getLogKey(): string {
     return `redisjm:${this.targetGroup}:log`
+  }
+
+  /**
+   * Sorted set of popped-but-not-yet-claimed runs (member = jobId, score = pop time). The pop script
+   * adds to it atomically with the LPOP; the claim removes it. An entry older than the stale threshold
+   * is a run whose popping instance died or whose claim failed — maintenance puts it back on its lane.
+   */
+  private getClaimingKey(): string {
+    return `redisjm:${this.targetGroup}:claiming`
+  }
+
+  /** Set of the job names that have (or recently had) runs in this group — maintenance's job index. */
+  private getJobRegistryKey(): string {
+    return `redisjm:${this.targetGroup}:jobs`
+  }
+
+  /**
+   * Per-job set of the jobIds currently holding a run lock — `inFlight()` / `maxInFlight` read its size
+   * in O(1). Kept in step with the global locks set by the scripts; drift self-heals (maintenance
+   * prunes members whose lock is gone).
+   */
+  private getJobLocksKey(jobName: string): string {
+    return `redisjm:${this.targetGroup}:jobs:${jobName}:locks`
+  }
+
+  /**
+   * Per-job set of the lane list KEYS the job has (had) entries on. Every push registers its lane here
+   * atomically; consumers also drain a job's old lanes (after its lane changed across a deploy), and
+   * maintenance prunes lanes whose list is empty.
+   */
+  private getJobLanesKey(jobName: string): string {
+    return `redisjm:${this.targetGroup}:jobs:${jobName}:lanes`
+  }
+
+  /** String key (with a TTL) marking that a pre-0.2 instance was recently seen in this group. */
+  private getLegacySeenKey(): string {
+    return `redisjm:${this.targetGroup}:legacy-seen`
+  }
+
+  /** String key holding the persisted log-scan cursor of maintenance (rotates passes across instances). */
+  private getMaintenanceCursorKey(): string {
+    return `redisjm:${this.targetGroup}:maintenance-cursor`
+  }
+
+  /** String key holding the persisted job-registry scan cursor of maintenance's job-upkeep stage. */
+  private getMaintenanceJobsCursorKey(): string {
+    return `redisjm:${this.targetGroup}:maintenance-jobs-cursor`
+  }
+
+  /** String key holding the persisted lock-scan cursor of maintenance's orphaned-lock stage. */
+  private getMaintenanceLocksCursorKey(): string {
+    return `redisjm:${this.targetGroup}:maintenance-locks-cursor`
+  }
+
+  /**
+   * String key of the group-wide maintenance lock (see {@link runMaintenance}). Expires on its own;
+   * never deleted, so its TTL is what spaces maintenance passes across instances.
+   */
+  private getMaintenanceLockKey(): string {
+    return `redisjm:${this.targetGroup}:maintenance-lock`
   }
 
   /**
