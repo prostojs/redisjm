@@ -387,4 +387,44 @@ describe.skipIf(!REDIS_URL)('integration (real Redis)', () => {
     expect(retries).toBe(1)
     expect(finalErrors).toBe(0)                            // a retry is not a final failure
   })
+
+  it('11. run-event payloads carry the claimed attempt when the retry is claimed by another manager', async () => {
+    // WHY: the attempt must come from the record at claim, not from a per-instance counter: attempt 1
+    // fails on manager A, the retry (attempt 2) is claimed by manager B on its own connection, and the
+    // payloads B emits for it must say 2.
+    const group = newGroup()
+    const a = newManager({ heartbeatInterval: 100, maintenanceInterval: 0, logger: false }, group)
+    const b = newManager({ heartbeatInterval: 100, maintenanceInterval: 0, logger: false }, group, h.newClient())
+    const meta = { jobName: 'handoff', attempts: 2, backoff: 0 }
+    a.createJob<{ fail: boolean }>(meta, async () => {
+      throw new Error('attempt on A fails')
+    })
+    const jobB = b.createJob<{ fail: boolean }>(meta, async (inputs) => {
+      await sleep(250) // long enough for a heartbeat
+      if (inputs.fail) throw new Error('attempt on B fails')
+    })
+    const seen: Record<string, number[]> = {}
+    for (const name of ['start', 'finish', 'error', 'retry', 'heartbeat'] as const) {
+      b.hook(name, (p: { runId: string; attempt: number }) => {
+        (seen[`${name}:${p.runId}`] ??= []).push(p.attempt)
+      })
+    }
+
+    expect(await jobB.queue('ok', { fail: false })).toBe(true)
+    expect(await jobB.queue('bad', { fail: true })).toBe(true)
+    expect(await a.popAndExecute()).toBe(true)
+    expect(await a.popAndExecute()).toBe(true)
+    // Both retries are staged (backoff 0); B's first pop promotes them.
+    expect(await b.popAndExecute()).toBe(true)
+    expect(await b.popAndExecute()).toBe(true)
+
+    for (const runId of ['ok', 'bad']) {
+      expect(seen[`start:${runId}`]).toEqual([2])
+      expect(seen[`retry:${runId}`]).toBeUndefined()
+      expect(seen[`heartbeat:${runId}`]?.length).toBeGreaterThan(0)
+      expect(seen[`heartbeat:${runId}`]?.every((n) => n === 2)).toBe(true)
+    }
+    expect(seen['finish:ok']).toEqual([2])
+    expect(seen['error:bad']).toEqual([2]) // final failure
+  })
 })

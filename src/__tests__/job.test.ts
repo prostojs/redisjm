@@ -1,6 +1,6 @@
 import { afterEach, describe, it, expect, vi } from 'vitest'
 import { JobTimeoutError } from '../errors'
-import { getStartPhaseExecutionId, Job } from '../job'
+import { getStartPhasePayload, Job } from '../job'
 import { RedisJM } from '../redisjm'
 import type { JobContext } from '../types'
 import { createMockRedis } from './mock-redis'
@@ -165,6 +165,39 @@ describe('Job', () => {
       expect(onStart).toHaveBeenCalledWith(
         expect.objectContaining({ runId: 'my-run-id' }),
       )
+    })
+  })
+
+  describe('attempt', () => {
+    // WHY: a direct execute() has no record to claim, so its payloads carry a defined attempt —
+    // `options.attempt`, else 1 — on every event, including the spreads (update, error).
+    it('stamps options.attempt (default 1) on every payload of a direct execute', async () => {
+      const seen: Record<string, number[]> = {}
+      const job = new Job<null>(metadata, async (_inputs, ctx) => {
+        await ctx.setProgress(0.5)
+      })
+      for (const name of ['start', 'finish', 'update'] as const) {
+        job.hook(name, (p: { attempt: number }) => { (seen[name] ??= []).push(p.attempt) })
+      }
+      await job.execute(null, { runId: 'a' })
+      await job.execute(null, { runId: 'b', attempt: 3 })
+      expect(seen).toEqual({ start: [1, 3], update: [1, 3], finish: [1, 3] })
+
+      const failing = new Job(metadata, () => { throw new Error('boom') })
+      const onError = vi.fn()
+      failing.hook('error', onError)
+      await expect(failing.execute(null, { runId: 'c', attempt: 2 })).rejects.toThrow('boom')
+      expect(onError).toHaveBeenCalledWith(expect.objectContaining({ attempt: 2 }))
+    })
+
+    it('rejects an attempt that is not an integer >= 1 before dispatching anything', async () => {
+      const onStart = vi.fn()
+      const job = new Job<null>(metadata, vi.fn())
+      job.hook('start', onStart)
+      for (const attempt of [0, -1, 1.5, Number.NaN]) {
+        await expect(job.execute(null, { runId: 'a', attempt })).rejects.toThrow(TypeError)
+      }
+      expect(onStart).not.toHaveBeenCalled()
     })
   })
 
@@ -528,7 +561,7 @@ describe('Job', () => {
       job.hook('start', (p) => { executionId = p.executionId; throw thrown })
       const err = await job.execute('x', { targetGroup: 'g' }).catch((e) => e)
       expect(err).toBe(thrown)
-      expect(getStartPhaseExecutionId(err)).toBe(executionId)
+      expect(getStartPhasePayload(err)?.executionId).toBe(executionId)
     })
 
     it('normalizes a thrown primitive so it can be tagged, and leaves handler errors untagged', async () => {
@@ -536,11 +569,11 @@ describe('Job', () => {
       job.hook('start', () => { throw 'nope' })
       const err = await job.execute('x', { targetGroup: 'g' }).catch((e) => e)
       expect(err).toBeInstanceOf(Error)
-      expect(getStartPhaseExecutionId(err)).toBeDefined()
+      expect(getStartPhasePayload(err)).toBeDefined()
 
       const failing = new Job<string>(metadata, () => { throw new Error('handler') })
       const handlerErr = await failing.execute('x', { targetGroup: 'g' }).catch((e) => e)
-      expect(getStartPhaseExecutionId(handlerErr)).toBeUndefined()
+      expect(getStartPhasePayload(handlerErr)).toBeUndefined()
     })
   })
 

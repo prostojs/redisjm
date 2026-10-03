@@ -159,14 +159,14 @@ describe('hardening', () => {
       const job = m.createJob({ jobName: 'j' }, vi.fn())
       await seed({ jobId: 'j#r1', status: 'stale', staleReason: 'maxRunMs', executionId: 'e1', finishedAt: Date.now() }, false)
       const abort = vi.fn()
-      await job.callHook('heartbeat', { job, targetGroup: 'g', runId: 'r1', inputs: null, executionId: 'e1', manager: m, abort })
+      await job.callHook('heartbeat', { job, targetGroup: 'g', runId: 'r1', inputs: null, executionId: 'e1', attempt: 1, manager: m, abort })
       expect((await readRecord('j#r1'))?.status).toBe('stale')
       expect(await m.isLocked('j#r1')).toBe(false)
       expect(abort).toHaveBeenCalled()
 
       // A heartbeat-reason stale from the same execution still self-heals (unchanged behaviour).
       await seed({ jobId: 'j#r2', status: 'stale', staleReason: 'heartbeat', executionId: 'e2', finishedAt: Date.now() }, false)
-      await job.callHook('heartbeat', { job, targetGroup: 'g', runId: 'r2', inputs: null, executionId: 'e2', manager: m, abort: vi.fn() })
+      await job.callHook('heartbeat', { job, targetGroup: 'g', runId: 'r2', inputs: null, executionId: 'e2', attempt: 1, manager: m, abort: vi.fn() })
       const healed = await readRecord('j#r2')
       expect(healed?.status).toBe('running')
       expect(healed?.staleReason).toBeUndefined()

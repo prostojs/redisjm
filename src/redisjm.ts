@@ -3,7 +3,7 @@ import { Hookable } from 'hookable'
 import type Redis from 'ioredis'
 import { classifyRedisError, JobTimeoutError, RedisJMEnqueueError } from './errors'
 import type { EnqueueErrorReason, RedisErrorReason } from './errors'
-import { getStartPhaseExecutionId, Job } from './job'
+import { getStartPhasePayload, Job } from './job'
 import { createMaintenanceJob, MAINTENANCE_JOB_NAME, MAINTENANCE_LANE } from './maintenance'
 import {
   DELETE_IF_UNCHANGED_SCRIPT,
@@ -167,6 +167,11 @@ const DELETE_BATCH_SIZE = 500
 function splitJobId(jobId: string): { jobName: string; runId: string } {
   const i = jobId.indexOf('#')
   return i === -1 ? { jobName: jobId, runId: '' } : { jobName: jobId.slice(0, i), runId: jobId.slice(i + 1) }
+}
+
+/** The 1-based attempt a claim of `record` writes (a record without `attempt` has had no claims). */
+function nextAttempt(record: JobLogRecord): number {
+  return (record.attempt ?? 0) + 1
 }
 
 /** Whether a status is terminal (the run is over: its lock is released, its record only kept as history). */
@@ -1000,7 +1005,7 @@ export class RedisJM extends Hookable<RedisJMHooks> {
           record.startedAt = now
           record.heartbeat = now
           record.executionId = payload.executionId
-          record.attempt = (record.attempt ?? 0) + 1
+          record.attempt = nextAttempt(record)
           delete record.suspectedAt
         })
       } catch (err) {
@@ -1014,7 +1019,10 @@ export class RedisJM extends Hookable<RedisJMHooks> {
       if (claim.outcome === 'rejected' && claim.reason !== 'claimed') {
         throw new RunSupersededError(`run "${jobId}" was superseded before it could claim its record`)
       }
-      // 'missing' → no backing record (direct `job.execute()` pattern); proceed silently.
+      // Stamp the attempt the claim wrote (right even when another instance ran the earlier attempts)
+      // on the payload every later hook of this execution shares. 'missing' → no backing record
+      // (direct `job.execute()` pattern): keep the caller's value.
+      payload.attempt = claim.record?.attempt ?? payload.attempt
       await this.emit('start', payload as unknown as JobEventPayload)
     })
 
@@ -1083,7 +1091,6 @@ export class RedisJM extends Hookable<RedisJMHooks> {
         // `retry` fires instead of the manager-level `error` hook.
         await this.emit('retry', {
           ...(payload as unknown as JobErrorEventPayload),
-          attempt: record.attempt ?? 1,
           nextAttemptAt: record.readyAt!,
         } as JobRetryEventPayload)
         return
@@ -1311,9 +1318,12 @@ export class RedisJM extends Hookable<RedisJMHooks> {
     // Defer the execution into a thunk so the poll loop can run it WITHOUT awaiting (concurrency): the
     // thunk owns a per-execution AbortController (registered so `stop({ abort: true })` can signal it,
     // removed when the run settles) and reproduces the serial path's terminal error handling exactly.
-    // Capture only `inputs`, not the whole parsed record: the thunk lives in `inFlightRuns` for the
-    // run's lifetime, so closing over just the payload lets the record wrapper be collected sooner.
+    // Capture only `inputs` and the predicted attempt, not the whole parsed record: the thunk lives in
+    // `inFlightRuns` for the run's lifetime, so closing over just those lets the record wrapper be
+    // collected sooner. The prediction is what the claim should write (the claim stamps the real one);
+    // only job-level `start` hooks registered before `registerJob` (they run pre-claim) ever see it.
     const { inputs } = logRecord
+    const attempt = nextAttempt(logRecord)
     const timeoutMs = job.getTimeoutMs() ?? this.options.jobTimeout
     return async () => {
       const controller = new AbortController()
@@ -1326,6 +1336,7 @@ export class RedisJM extends Hookable<RedisJMHooks> {
           // Resolved execution timeout (job value wins; 0 = none). On expiry execute() settles with a
           // JobTimeoutError even if the handler never does, so this slot frees.
           timeoutMs,
+          attempt,
           // Identify this manager as the driver (so only its hooks act) and route infra errors here.
           manager: this,
           logger: this.logger,
@@ -1347,9 +1358,9 @@ export class RedisJM extends Hookable<RedisJMHooks> {
         }
         // A failure in the START phase (claim write, or a job-level `start` hook) happened after the
         // pop removed the entry and before the run was established — recover it explicitly.
-        const startExecutionId = getStartPhaseExecutionId(err)
-        if (startExecutionId !== undefined) {
-          await this.recoverStartPhaseFailure({ job, jobId, runId, inputs, executionId: startExecutionId, err, controller })
+        const startPayload = getStartPhasePayload(err)
+        if (startPayload) {
+          await this.recoverStartPhaseFailure(jobId, startPayload, err)
           return
         }
         // The job's `error` event already recorded the failure in Redis and re-broadcast it.
@@ -1545,16 +1556,7 @@ export class RedisJM extends Hookable<RedisJMHooks> {
    *   deterministic hook failure would otherwise spin pop→requeue forever.
    * Never throws.
    */
-  private async recoverStartPhaseFailure(ctx: {
-    job: Job<any, any>
-    jobId: string
-    runId: string
-    inputs: unknown
-    executionId: string
-    err: unknown
-    controller: AbortController
-  }): Promise<void> {
-    const { job, jobId, runId, inputs, executionId, err } = ctx
+  private async recoverStartPhaseFailure(jobId: string, payload: JobEventPayload<any>, err: unknown): Promise<void> {
     // A primitive is never a key (WeakSet.has answers `false` for it).
     if (claimWriteFailures.has(err as object)) {
       await this.recoverUnclaimed(jobId, err)
@@ -1562,21 +1564,16 @@ export class RedisJM extends Hookable<RedisJMHooks> {
     }
     const error = toError(err)
     const reason = classifyRedisError(err)
+    // The attempt this execution's claim wrote; stays `undefined` when the run was never claimed.
+    let attempt: number | undefined
     try {
       const record = await this.readRecord(jobId)
-      if (record?.executionId === executionId) {
-        // Claimed by this execution: the normal (fenced) failure path decides retry vs. final.
+      if (record?.executionId === payload.executionId) {
+        // Claimed by this execution (whose payload already carries the claimed attempt): the normal
+        // (fenced) failure path decides retry vs. final.
+        attempt = payload.attempt
         try {
-          await job.callHook('error', {
-            job,
-            targetGroup: this.targetGroup,
-            runId,
-            inputs,
-            executionId,
-            manager: this,
-            abort: (abortReason?: string) => ctx.controller.abort(abortReason ?? 'aborted'),
-            error,
-          })
+          await payload.job.callHook('error', { ...payload, error })
         } catch (hookErr) {
           this.logger('error hook failed', toError(hookErr))
         }
@@ -1596,7 +1593,7 @@ export class RedisJM extends Hookable<RedisJMHooks> {
       return
     }
     this.logger(`job "${jobId}" failed to start (${reason}); failed`, error)
-    await this.emitStartFailed(jobId, reason, 'failed', error)
+    await this.emitStartFailed(jobId, reason, 'failed', error, attempt)
   }
 
   /** Fires the `startFailed` observers for `jobId`. */
@@ -1605,9 +1602,10 @@ export class RedisJM extends Hookable<RedisJMHooks> {
     reason: RedisErrorReason,
     action: StartFailedEventPayload['action'],
     error: Error,
+    attempt?: number,
   ): Promise<void> {
     const { jobName, runId } = splitJobId(jobId)
-    await this.emit('startFailed', { jobId, jobName, runId, reason, action, error })
+    await this.emit('startFailed', { jobId, jobName, runId, reason, action, error, attempt })
   }
 
   /** Pauses popping for `ms` (see `popsPausedUntil`); never shortens an already longer pause. */

@@ -9,6 +9,7 @@ import type {
   JobAttrs,
   JobAttrValue,
   JobContext,
+  JobEventPayload,
   JobExecuteOptions,
   JobFunction,
   JobHooks,
@@ -18,18 +19,19 @@ import type {
 
 /**
  * Errors thrown out of the START phase of an execution (the `start` hook chain, which contains the
- * manager's claim), mapped to that execution's fencing token. Internal (not re-exported): the manager
+ * manager's claim), mapped to that execution's event payload. Internal (not re-exported): the manager
  * uses it to tell a start-phase failure — which needs requeue/drop/fail recovery because the popped
- * entry is gone — apart from a handler or `finish`-hook failure, and to fence that recovery on the
- * right executionId. A WeakMap so the mapping lives exactly as long as the error object.
+ * entry is gone — apart from a handler or `finish`-hook failure, to fence that recovery on the right
+ * executionId, and to dispatch the recovery's `error` hook with the execution's own payload. A WeakMap
+ * so the mapping lives exactly as long as the error object.
  */
-const startPhaseFailures = new WeakMap<object, string>()
+const startPhaseFailures = new WeakMap<object, JobEventPayload<any>>()
 
 /**
- * Returns the executionId of the execution whose START phase threw `err`, or `undefined` when `err`
+ * Returns the event payload of the execution whose START phase threw `err`, or `undefined` when `err`
  * did not come out of a start phase. Internal helper for the manager's start-failure recovery.
  */
-export function getStartPhaseExecutionId(err: unknown): string | undefined {
+export function getStartPhasePayload(err: unknown): JobEventPayload<any> | undefined {
   // A primitive is never a key (WeakMap.get answers `undefined` for it).
   return startPhaseFailures.get(err as object)
 }
@@ -91,6 +93,10 @@ export class Job<TInputs = unknown, TAttrs extends { [K in keyof TAttrs]: JobAtt
     const runId = options?.runId ?? (typeof inputs === 'string' ? inputs : JSON.stringify(inputs))
     const heartbeatInterval = options?.heartbeatInterval
     const timeoutMs = options?.timeoutMs
+    const attempt = options?.attempt ?? 1
+    if (!Number.isInteger(attempt) || attempt < 1) {
+      throw new TypeError(`execute(options.attempt): attempt must be an integer >= 1, got ${String(attempt)}`)
+    }
     // A fresh fencing token per execution: the record's owner is whoever's `start` stamped it.
     const executionId = randomUUID()
 
@@ -110,13 +116,15 @@ export class Job<TInputs = unknown, TAttrs extends { [K in keyof TAttrs]: JobAtt
       }
     }
 
-    const payload = {
+    const payload: JobEventPayload<TInputs> = {
       job: this,
       targetGroup,
       runId,
       inputs,
       executionId,
       manager: options?.manager,
+      // Replaced by the manager's claim with the attempt it wrote (see `JobEventPayload.attempt`).
+      attempt,
       abort: (reason?: string) => controller.abort(reason ?? 'aborted'),
     }
 
@@ -153,13 +161,13 @@ export class Job<TInputs = unknown, TAttrs extends { [K in keyof TAttrs]: JobAtt
     try {
       // `start` is the claim: a failed claim or Redis outage here is NOT a job failure, so it
       // propagates directly (via the `finally`) without ever dispatching the `error` hook. It is
-      // tagged with this execution's fencing token so a manager can tell a start-phase failure (the
-      // popped entry needs requeue/drop/fail recovery) from a handler failure.
+      // tagged with this execution's payload (incl. its fencing token) so a manager can tell a
+      // start-phase failure (the popped entry needs requeue/drop/fail recovery) from a handler failure.
       try {
         await this.callHook('start', payload)
       } catch (err) {
         const tagged = toTaggable(err)
-        startPhaseFailures.set(tagged, executionId)
+        startPhaseFailures.set(tagged, payload)
         throw tagged
       }
       if (heartbeatInterval && heartbeatInterval > 0) {

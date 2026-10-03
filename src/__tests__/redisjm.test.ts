@@ -1510,7 +1510,7 @@ describe('RedisJM', () => {
       // Fire the manager's heartbeat hook for this run (as a late/leaked timer would). The guarded
       // write is rejected (record already left running), so onHeartbeat now calls payload.abort — pass
       // a no-op abort since this hand-built payload has no real execution behind it.
-      await job.callHook('heartbeat', { job, targetGroup: 'test-group', runId: 'r1', inputs: null, executionId: 'x', abort: () => {} })
+      await job.callHook('heartbeat', { job, targetGroup: 'test-group', runId: 'r1', inputs: null, executionId: 'x', attempt: 1, abort: () => {} })
 
       const record = JSON.parse((await redis.hget('redisjm:test-group:log', jobId))!) as JobLogRecord
       expect(record.status).toBe('stale')
@@ -2069,7 +2069,7 @@ describe('RedisJM', () => {
       const abort = vi.fn()
 
       await job.callHook('heartbeat', {
-        job, targetGroup: 'test-group', runId: 'r1', inputs: null, executionId: 'exec-1', manager: m, abort,
+        job, targetGroup: 'test-group', runId: 'r1', inputs: null, executionId: 'exec-1', attempt: 1, manager: m, abort,
       })
 
       const record = JSON.parse((await redis.hget('redisjm:test-group:log', jobId))!) as JobLogRecord
@@ -2233,6 +2233,119 @@ describe('RedisJM', () => {
       expect(rec.status).toBe('finished')
       expect(rec.attempt).toBe(3)
       expect(await m.isQueued('retry#r1')).toBe(false)
+    })
+
+    // WHY: a start listener must be able to tell a first run from a retry. Every run-event payload —
+    // job- and manager-level start/finish/error/heartbeat/update, plus retry — carries the attempt the
+    // claim wrote; a job-level start hook registered before registerJob (pre-claim) sees the same
+    // number, predicted from the popped record.
+    it('stamps the claimed attempt on every run-event payload across retries', async () => {
+      vi.useFakeTimers()
+      vi.setSystemTime(1_700_000_000_000)
+      const m = new RedisJM(redis, 'test-group', { heartbeatInterval: 100, keepFinishedInterval: 60000, maintenanceInterval: 0, logger: false })
+      let calls = 0
+      const job = new Job<string>({ jobName: 'att', attempts: 3, backoff: 0 }, async (_inputs, ctx) => {
+        calls++
+        await ctx.setProgress(calls / 3)
+        await vi.advanceTimersByTimeAsync(150) // one heartbeat per attempt
+        if (calls < 3) throw new Error(`boom ${calls}`)
+      })
+      const seen: Record<string, number[]> = {}
+      const record = (name: string) => (p: { attempt: number }) => { (seen[name] ??= []).push(p.attempt) }
+      job.hook('start', record('preClaimStart'))
+      m.registerJob(job)
+      for (const name of ['start', 'finish', 'error', 'heartbeat', 'update'] as const) job.hook(name, record(`job.${name}`))
+      for (const name of ['start', 'finish', 'error', 'retry', 'heartbeat', 'update'] as const) m.hook(name, record(`m.${name}`))
+
+      await m.queue(job, 'r1', 'x')
+      for (let i = 0; i < 3; i++) {
+        expect(await m.popAndExecute()).toBe(true)
+        vi.setSystemTime(Date.now() + 1500) // past the promotion rate limit
+      }
+
+      expect(calls).toBe(3)
+      expect(seen).toEqual({
+        'preClaimStart': [1, 2, 3],
+        'job.start': [1, 2, 3],
+        'm.start': [1, 2, 3],
+        'job.update': [1, 2, 3],
+        'm.update': [1, 2, 3],
+        'job.heartbeat': [1, 2, 3],
+        'm.heartbeat': [1, 2, 3],
+        'job.error': [1, 2],
+        'm.retry': [1, 2],
+        'job.finish': [3],
+        'm.finish': [3],
+      })
+      const rec = JSON.parse((await redis.hget('redisjm:test-group:log', 'att#r1'))!) as JobLogRecord
+      expect(rec.attempt).toBe(3)
+    })
+
+    // WHY: the payload attempt is the record's value AT CLAIM, not a local counter: a record that
+    // already counts attempts made elsewhere (e.g. another instance) continues from there.
+    it("continues from the record's count at claim", async () => {
+      const m = new RedisJM(redis, 'test-group', { keepFinishedInterval: 60000, maintenanceInterval: 0, logger: false })
+      const job = m.createJob({ jobName: 'cl', attempts: 5 }, vi.fn())
+      const onStart = vi.fn()
+      const onFinish = vi.fn()
+      m.hook('start', onStart)
+      m.hook('finish', onFinish)
+
+      // A queued record whose earlier attempts ran elsewhere: 3 already claimed → this claim is #4.
+      await m.queue(job, 'cont', 'x')
+      const cont = JSON.parse((await redis.hget('redisjm:test-group:log', 'cl#cont'))!) as JobLogRecord
+      cont.attempt = 3
+      await redis.hset('redisjm:test-group:log', 'cl#cont', JSON.stringify(cont))
+      expect(await m.popAndExecute()).toBe(true)
+      expect(onStart).toHaveBeenLastCalledWith(expect.objectContaining({ runId: 'cont', attempt: 4 }))
+      expect(onFinish).toHaveBeenLastCalledWith(expect.objectContaining({ runId: 'cont', attempt: 4 }))
+    })
+
+    // WHY: the pop's read only PREDICTS the attempt; the claim's compare-and-set result is the truth. A
+    // record that changes between the pop and the claim (here: its attempt count) must be reported as
+    // the claim wrote it, not as predicted.
+    it('replaces the predicted attempt with the one the claim actually wrote', async () => {
+      const m = new RedisJM(redis, 'test-group', { keepFinishedInterval: 60000, maintenanceInterval: 0, logger: false })
+      const job = new Job({ jobName: 'pr', attempts: 9 }, vi.fn())
+      const preClaim: number[] = []
+      job.hook('start', (p) => { preClaim.push(p.attempt) })
+      m.registerJob(job)
+      const onStart = vi.fn()
+      m.hook('start', onStart)
+      await m.queue(job, 'r1', 'x')
+      // Right after the pop's read of the record, another writer bumps its attempt to 6.
+      const realHget = redis.hget
+      vi.mocked(redis.hget).mockImplementationOnce(async (...args: any[]) => {
+        const json = await (realHget as any)(...args)
+        const changed = JSON.parse(json) as JobLogRecord
+        changed.attempt = 6
+        await redis.hset('redisjm:test-group:log', 'pr#r1', JSON.stringify(changed))
+        return json
+      })
+      expect(await m.popAndExecute()).toBe(true)
+      expect(preClaim).toEqual([1]) // predicted from the pop's read
+      expect(onStart).toHaveBeenCalledWith(expect.objectContaining({ attempt: 7 })) // claimed
+    })
+
+    // WHY: a job-level start hook that throws AFTER the claim is routed through the error path by the
+    // manager's recovery, which builds its own payload — it must carry the claimed attempt too, and so
+    // must the startFailed event.
+    it('carries the claimed attempt through start-phase failure recovery', async () => {
+      const m = new RedisJM(redis, 'test-group', { keepFinishedInterval: 60000, maintenanceInterval: 0, logger: false })
+      const job = m.createJob({ jobName: 'sf', attempts: 2, backoff: 10_000 }, vi.fn())
+      job.hook('start', () => { throw new Error('hook boom') })
+      const onError = vi.fn()
+      const onRetry = vi.fn()
+      const onStartFailed = vi.fn()
+      job.hook('error', onError)
+      m.hook('retry', onRetry)
+      m.hook('startFailed', onStartFailed)
+
+      await m.queue(job, 'r1', 'x')
+      expect(await m.popAndExecute()).toBe(true)
+      expect(onError).toHaveBeenCalledWith(expect.objectContaining({ attempt: 1 }))
+      expect(onRetry).toHaveBeenCalledWith(expect.objectContaining({ attempt: 1 }))
+      expect(onStartFailed).toHaveBeenCalledWith(expect.objectContaining({ action: 'failed', attempt: 1 }))
     })
 
     // WHY: with attempts:2 an always-failing handler retries once, then on the final attempt fires the

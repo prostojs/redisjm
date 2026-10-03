@@ -480,6 +480,7 @@ interface JobExecuteOptions {
   logger?: RedisJMLogger      // sink for infra errors (failed heartbeat write, throwing error hook, late handler settle)
   signal?: AbortSignal        // external abort plumbed into ctx.signal (e.g. shutdown)
   timeoutMs?: number          // execution timeout; rejects with JobTimeoutError on expiry
+  attempt?: number            // 1-based attempt stamped on every event payload (default 1)
 }
 ```
 
@@ -565,7 +566,7 @@ The one case to call it: a worker that never calls `start()` (e.g. a `popAndExec
 
 ## Events
 
-Both `Job` and `RedisJM` emit events via [hookable](https://github.com/unjs/hookable). Run-event payloads also carry `executionId` (the per-run fencing token), `abort(reason?)` (a cooperative kill-switch for this run — see [Cancellation](#cancellation)), and `manager` (the driving `RedisJM`, absent for a direct `job.execute()`):
+Both `Job` and `RedisJM` emit events via [hookable](https://github.com/unjs/hookable). Run-event payloads (`start`, `finish`, `error`, `retry`, `timeout`, `heartbeat`, `update`) also carry `executionId` (the per-run fencing token), `attempt` (the 1-based attempt of this execution — see [Attempt numbers](#attempt-numbers)), `abort(reason?)` (a cooperative kill-switch for this run — see [Cancellation](#cancellation)), and `manager` (the driving `RedisJM`, absent for a direct `job.execute()`):
 
 | Event | Extra payload fields | Emitted by | Description |
 |---|---|---|---|
@@ -577,7 +578,7 @@ Both `Job` and `RedisJM` emit events via [hookable](https://github.com/unjs/hook
 | `heartbeat` | — | Job + manager | Periodic heartbeat tick |
 | `update` | `progress?, attrs?` | Job + manager | On setProgress/setAttrs |
 | `enqueueFailed` | `{ jobId, jobName, runId, reason, error }` | **manager only** | An enqueue threw `RedisJMEnqueueError` (fired right before it is thrown) |
-| `startFailed` | `{ jobId, jobName, runId, reason, action, error }` | **manager only** | A popped run failed to start; `action` says how it was recovered — see [Start-failure recovery](#start-failure-recovery) |
+| `startFailed` | `{ jobId, jobName, runId, reason, action, error, attempt? }` | **manager only** | A popped run failed to start; `action` says how it was recovered — see [Start-failure recovery](#start-failure-recovery) |
 | `memoryPressure` | a `health()` snapshot | **manager only** | Redis memory crossed `memoryWarnRatio` (from the maintenance timer; once per crossing) |
 
 `RedisJM` re-dispatches run events only when `targetGroup` matches (and, when a `manager` is stamped, only on the manager that drove the run) and updates the Redis log accordingly.
@@ -609,6 +610,21 @@ manager.hook('error', (payload) => {
 manager.hook('enqueueFailed', ({ jobId, reason }) => metrics.increment('enqueue_failed', { reason }))
 manager.hook('memoryPressure', (health) => pageOnCall(`redis at ${health.usedRatio}`))
 ```
+
+### Attempt numbers
+
+`payload.attempt` tells a first run (`1`) from a retry (`2`, `3`, …) on every run event, job- and manager-level:
+
+```typescript
+manager.hook('start', ({ job, runId, attempt }) => {
+  if (attempt > 1) console.log(`${job.getJobId(runId)}: retry #${attempt - 1}`)
+})
+```
+
+- It is the run's attempt count as stored with the run, so it is correct when a retry is picked up by a different instance than the one whose attempt failed. Every event of the same execution carries the same number; for `retry` it is the attempt that just failed.
+- Job-level `start` hooks registered **before** `registerJob` run before the run is claimed and see the expected attempt (the same number unless the run was changed in between).
+- A direct `job.execute()` uses `options.attempt` (an integer `>= 1`, default `1`).
+- `startFailed` carries `attempt` only for `action: 'failed'` when a job-level `start` hook threw after the claim.
 
 ### Observability & error handling
 
@@ -1038,6 +1054,7 @@ Deploy **consumers first or all at once**, and keep the mixed window short. Whil
 - **0.1.x maintenance writes are not compare-and-set** and can overwrite a concurrent 0.2 claim; that run's `ctx.signal` aborts (ownership loss) and it ends `stale`.
 - **0.1.x enqueues and finishes don't maintain the per-job lock sets**, so `maxInFlight` and `inFlight()` drift (over- or under-counting) until those runs drain and maintenance prunes the sets. Don't rely on `maxInFlight` until the whole group is on 0.2.
 - **0.1.x enqueues don't record lanes**, so a 0.2 consumer can't find their runs on an old lane. Change a job's lane only in a later deploy, once no 0.1.x instance is left.
+- **`payload.attempt`** is read from the record's `attempt`, which 0.1.x claims increment the same way, so a 0.2 instance claiming a retry whose earlier attempt ran on 0.1.x reports the right number (0.1.x instances' own payloads have no `attempt`).
 - **`popAndExecute()`-only workers** (no `start()`) still need `createMaintenanceJob(manager)` registered during the window: 0.1.x instances keep enqueueing the maintenance job on the `__maintenance` lane, which every instance polls.
 
 ## Full Example: Distributed Job Processing

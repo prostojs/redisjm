@@ -353,6 +353,11 @@ export interface JobExecuteOptions {
    * (`JobMetadata.timeoutMs` ?? `RedisJMOptions.jobTimeout`); a direct `job.execute()` honors it as given.
    */
   timeoutMs?: number
+  /**
+   * 1-based attempt number (an integer `>= 1`, default `1`) stamped on this execution's event payloads
+   * (`JobEventPayload.attempt`); a manager's claim replaces it with the attempt it wrote.
+   */
+  attempt?: number
 }
 
 /** Context object passed to the job function during execution. */
@@ -378,7 +383,7 @@ export type JobFunction<TInputs = unknown, TAttrs extends { [K in keyof TAttrs]:
   ctx: JobContext<TAttrs>,
 ) => void | Promise<void>
 
-/** Payload for `start`, `finish`, and `heartbeat` events. */
+/** Payload for `start`, `finish`, and `heartbeat` events (and the base of every other run-event payload). */
 export interface JobEventPayload<TInputs = unknown> {
   job: Job<TInputs, any>
   targetGroup: string
@@ -388,6 +393,13 @@ export interface JobEventPayload<TInputs = unknown> {
   executionId: string
   /** The manager driving this execution, when run through one (absent for direct `job.execute()`). */
   manager?: RedisJM
+  /**
+   * 1-based attempt of THIS execution (`1` = first run, `N` = (N-1)-th retry) as its claim wrote it to
+   * the run record — right even when another instance ran the earlier attempts. Job-level `start` hooks
+   * registered before `registerJob` run pre-claim and see the predicted value; a direct `job.execute()`
+   * uses `JobExecuteOptions.attempt`.
+   */
+  attempt: number
   /**
    * Aborts THIS execution's context signal (`ctx.signal`) with the given reason (default `'aborted'`).
    * The manager's heartbeat hook calls it on ownership loss (stale/superseded/unqueued); it is also
@@ -404,13 +416,11 @@ export interface JobErrorEventPayload<TInputs = unknown> extends JobEventPayload
 
 /**
  * Payload for the manager-level `retry` event, fired for each scheduled retry (not final failure).
- * Extends `JobEventPayload` with the error that caused the retry, the 1-based attempt that failed,
- * and the epoch-ms time the next attempt becomes poppable.
+ * Extends `JobEventPayload` (whose `attempt` is the 1-based attempt that just failed) with the error
+ * that caused the retry and the epoch-ms time the next attempt becomes poppable.
  */
 export interface JobRetryEventPayload<TInputs = unknown> extends JobEventPayload<TInputs> {
   error: Error
-  /** The 1-based attempt number that just failed and triggered the retry. */
-  attempt: number
   /** Epoch ms when the retried run becomes poppable (its delayed `readyAt`). */
   nextAttemptAt: number
 }
@@ -449,6 +459,11 @@ export interface StartFailedEventPayload {
   reason: RedisErrorReason
   action: 'requeued' | 'deferred' | 'failed'
   error: Error
+  /**
+   * The 1-based attempt the claim wrote — set only for `'failed'` when the claim had landed (a
+   * job-level `start` hook threw after it); `undefined` when the run was never claimed.
+   */
+  attempt?: number
 }
 
 /** Payload for `update` events. Extends `JobEventPayload` with optional progress and attrs. */
