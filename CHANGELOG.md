@@ -1,3 +1,12 @@
+## [0.2.1](https://github.com/prostojs/redisjm/compare/v0.2.0...v0.2.1) (2026-10-03)
+
+
+### Features
+
+* attempt number on job event payloads ([8c32c5d](https://github.com/prostojs/redisjm/commit/8c32c5dfe45ec50d4b4d0a9313905348c372349d))
+
+
+
 # [0.2.0](https://github.com/prostojs/redisjm/compare/v0.1.1...v0.2.0) (2026-10-03)
 
 
