@@ -1,3 +1,12 @@
+## [0.3.1](https://github.com/prostojs/redisjm/compare/v0.3.0...v0.3.1) (2026-10-05)
+
+
+### Bug Fixes
+
+* presence keys expire with their leases; guard presence timing options ([faf8b1e](https://github.com/prostojs/redisjm/commit/faf8b1e6eeff0e9f68681814911104c1bf878483))
+
+
+
 # [0.3.0](https://github.com/prostojs/redisjm/compare/v0.2.1...v0.3.0) (2026-10-05)
 
 
