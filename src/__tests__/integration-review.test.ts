@@ -169,6 +169,67 @@ describe.skipIf(!REDIS_URL)('review regressions (shared Redis)', () => {
     expect(await m.queue(job, 'r1', null)).toBe(true) // the runId is usable again
   })
 
+  it('a run claimed between the maintenance scan and its LPOS check keeps its record and finishes normally', async () => {
+    // WHY: 0.1.x wrote its scan snapshot back with a plain HSET — a record popped and claimed after the
+    // scan reverted to `queued` without its executionId, so the run's finish was fenced out, its lock
+    // stayed held and its next heartbeat aborted it.
+    const group = newGroup()
+    const m = newManager({ maintenanceInterval: 0, heartbeatInterval: 20, roundsToStale: 1 }, group)
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    let aborted: boolean | undefined
+    const finished: string[] = []
+    const job = m.createJob({ jobName: 'rotate' }, async (_inputs, ctx) => {
+      await gate
+      aborted = ctx.signal.aborted
+    })
+    job.hook('finish', (payload) => { finished.push(payload.runId) })
+    // A legacy instance in the group puts queued records older than the stale threshold on the LPOS path.
+    await m.queue(new Job({ jobName: MAINTENANCE_JOB_NAME, lane: MAINTENANCE_LANE }, async () => {}), 'legacy-tick', null)
+    await m.popAndExecute()
+    // An unstarted manager has no maintenance handler and re-queues the tick: drop it so it can't keep
+    // winning the pop (the legacy marker is already set).
+    await h.redis.del(`redisjm:${group}:lane:${MAINTENANCE_LANE}:queue`)
+    await m.queue(job, 'r1', null)
+    await sleep(40)
+    // The pass scans the record as `queued`; the consumer pops and claims it before the presence check.
+    const client = newClient()
+    const realHscan = client.hscan.bind(client) as (...args: any[]) => Promise<unknown>
+    let execution: Promise<unknown> | undefined
+    ;(client as any).hscan = async (...args: any[]) => {
+      const reply = await realHscan(...args)
+      if (!execution && String(args[0]).endsWith(':log')) {
+        execution = m.popAndExecute()
+        await until(async () => (await m.get('rotate#r1'))?.status === 'running')
+      }
+      return reply
+    }
+    const lposChecked: unknown[] = []
+    const realPipeline = client.pipeline.bind(client)
+    ;(client as any).pipeline = (...args: any[]) => {
+      const p = realPipeline(...args)
+      const realLpos = p.lpos.bind(p) as (...a: any[]) => unknown
+      ;(p as any).lpos = (...a: any[]) => { lposChecked.push(a[1]); return realLpos(...a) }
+      return p
+    }
+    const result = await newManager({ maintenanceInterval: 0, heartbeatInterval: 20, roundsToStale: 1 }, group, client)
+      .performMaintenance()
+    expect(execution).toBeDefined()
+    expect(lposChecked).toContain('rotate#r1')
+    expect(result.staleCount).toBe(0)
+    const running = await m.get('rotate#r1')
+    expect(running?.status).toBe('running')
+    expect(running?.executionId).toBeDefined()
+    expect(running?.suspectedAt).toBeUndefined()
+
+    release()
+    await execution
+    expect(aborted).toBe(false)
+    expect(finished).toEqual(['r1'])
+    expect((await m.get('rotate#r1'))?.status).toBe('finished')
+    expect(await m.isLocked('rotate#r1')).toBe(false)
+  })
+
   it('without a legacy instance, new-format queued records are not LPOS-checked (cost stays bounded)', async () => {
     const group = newGroup()
     const m = newManager({ maintenanceInterval: 0, heartbeatInterval: 20, roundsToStale: 1 }, group)
