@@ -56,6 +56,16 @@ export interface JobMetadata {
    */
   timeoutMs?: number
   /**
+   * When the run's `ctx.signal` aborts for any reason other than its own execution timeout (ownership
+   * loss, `stop({ abort: true })`, `payload.abort()`, an external `signal`), wait at most this many ms for
+   * the handler to settle on its own, then settle the attempt with a `JobAbortedError` — freeing the slot
+   * without waiting for the handler (it keeps running detached; its writes are fenced). `false` (default)
+   * = wait for the handler (or its timeout) as before. `0` = settle on the next timer tick. Overrides `RedisJMOptions.abortGraceMs`; `false` opts this job out of the manager default.
+   * The abandoned attempt is an ordinary failure and CONSUMES an attempt: set `attempts > 1` if an aborted
+   * run must be re-run elsewhere.
+   */
+  abortGraceMs?: number | false
+  /**
    * Backpressure cap: an enqueue of this job is refused with `{ status: 'full' }` (nothing written, no
    * lock taken) while its LANE's queue list already holds `>= maxQueued` entries. Combined with
    * `RedisJMOptions.laneCaps` — the smaller defined cap wins. Counts the lane list only (O(1) `LLEN`):
@@ -150,6 +160,26 @@ export interface RedisJMOptions {
    */
   jobTimeout?: number
   /**
+   * Default abort grace for every job run by this manager: when a run's `ctx.signal` aborts for a reason
+   * other than its execution timeout (ownership loss, `stop({ abort: true })`, `payload.abort()`), wait at
+   * most this many ms for the handler to settle, then abandon it and fail the attempt with a
+   * `JobAbortedError` — so a handler that ignores its signal can't hold its concurrency slot, or
+   * `stop()`, hostage. `false`/unset (default) = wait for the handler. A job's own
+   * `JobMetadata.abortGraceMs` wins. Must be `false` or a finite number `>= 0` (else `TypeError`). An
+   * abandoned attempt goes through the normal failure path, so with the default `attempts: 1` it ends
+   * `error`; set `attempts > 1` if an aborted run must be re-run elsewhere.
+   */
+  abortGraceMs?: number | false
+  /**
+   * Register this instance in the group's fleet registry while `start()` runs, so `fleet()` can report
+   * the live consumers and their capacity (default `true`). Costs one small Redis write (a lease `ZADD`) per
+   * instance per `heartbeatInterval` — the info is rewritten only when it changes — and two small keys per
+   * group; set `false` to opt out.
+   */
+  presence?: boolean
+  /** Free-text label stored with this instance's fleet entry (e.g. a pod name; max 200 chars). */
+  instanceLabel?: string
+  /**
    * Backstop for hung handlers that have no timeout: maintenance marks a `running` record `stale`
    * (and releases its lock) once `now - startedAt > maxRunMs`, REGARDLESS of its heartbeat — a hung
    * handler's heartbeat timer keeps the record looking alive forever otherwise. The staled run can no
@@ -235,7 +265,9 @@ export interface StopOptions {
   /**
    * When `true`, abort every in-flight run's `ctx.signal` (reason `'manager stopped'`) before draining
    * — a fast shutdown that lets cooperative handlers bail out of wasted work early. Abort is
-   * cooperative: nothing forcibly kills a handler; `stop()` still awaits all in-flight runs to settle.
+   * cooperative: nothing forcibly kills a handler; `stop()` still awaits all in-flight runs to settle —
+   * unless `abortGraceMs` is set, in which case a handler still pending that many ms after the abort is
+   * abandoned (its attempt fails with a `JobAbortedError`, consuming an attempt) and `stop()` resolves.
    * Default `false` — a graceful drain that lets in-flight runs finish on their own.
    */
   abort?: boolean
@@ -354,6 +386,14 @@ export interface JobExecuteOptions {
    */
   timeoutMs?: number
   /**
+   * Abort grace in ms (`false`/unset = none): once `ctx.signal` aborts for a reason other than the
+   * timeout, a handler still pending after this many ms is abandoned and `execute()` rejects with a
+   * `JobAbortedError` (after dispatching the `error` hook). A handler that settles within the grace
+   * decides the outcome itself. Must be `false` or a finite number `>= 0` (else `TypeError`). The manager
+   * passes the resolved value (`JobMetadata.abortGraceMs` ?? `RedisJMOptions.abortGraceMs`).
+   */
+  abortGraceMs?: number | false
+  /**
    * 1-based attempt number (an integer `>= 1`, default `1`) stamped on this execution's event payloads
    * (`JobEventPayload.attempt`); a manager's claim replaces it with the attempt it wrote.
    */
@@ -372,7 +412,9 @@ export interface JobContext<TAttrs extends { [K in keyof TAttrs]: JobAttrValue }
    * rejected) — or when the manager shuts down with `stop({ abort: true })`. Abort is COOPERATIVE:
    * nothing forcibly stops the handler, so check `signal.aborted` (or listen for `'abort'`) at natural
    * checkpoints to stop wasted work whose writes would only be fenced out. `signal.reason` carries a
-   * short string cause.
+   * short string cause. With `abortGraceMs` (or `timeoutMs`) the attempt is settled without the handler
+   * once the grace (timeout) elapses; from then on this context is INERT: `setProgress` / `setAttrs`
+   * resolve without writing anything.
    */
   signal: AbortSignal
 }
@@ -535,6 +577,13 @@ export interface RedisJMHooks {
    * crossing; re-armed when it drops back below. Payload: a `health()` snapshot.
    */
   memoryPressure: (payload: RedisJMHealth) => void | Promise<void>
+  /**
+   * Fires after each maintenance pass THIS instance ran (the timer, `runMaintenance()`,
+   * `performMaintenance()`, the legacy maintenance job), or when a pass could not run because of an error.
+   * Not fired for a pass skipped because another instance holds the maintenance lock. On the timer it
+   * fires before `memoryPressure`.
+   */
+  maintenance: (payload: MaintenanceEventPayload) => void | Promise<void>
 }
 
 /**
@@ -577,7 +626,8 @@ export interface RedisJMHealth {
  * other jobs. `total = queued + delayed + running`. It can be LOWER than the lock-set size `maxInFlight`
  * compares against while that set holds drift (members whose run already ended — e.g. a lock released
  * by a pre-0.2 instance — until maintenance prunes them), so an enqueue can briefly report `'busy'`
- * with `total < maxInFlight`.
+ * with `total < maxInFlight`. For hot paths that only need the number, `RedisJM.inFlightCount()` is one
+ * O(1) `SCARD` and reads no records.
  */
 export interface InFlightCounts {
   /** Runs of this job in flight: `queued + delayed + running` (queued includes popped-not-yet-claimed). */
@@ -662,4 +712,90 @@ export interface MaintenanceResult {
    * and `staleCount` is always `0`.
    */
   mode: 'full' | 'emergency'
+}
+
+/** Payload of the manager-level `maintenance` event: the outcome of one pass this instance ran. */
+export interface MaintenanceEventPayload {
+  /** The pass result (`mode: 'full' | 'emergency'`); `null` when the lock read failed or the pass threw. */
+  result: MaintenanceResult | null
+  /** Redis operations that failed and were skipped inside the pass (the pass still completed). */
+  failedOps: number
+  /** The first failure: the thrown error, the lock error, or the first failed operation. */
+  error?: Error
+  /** Classified cause of `error`. */
+  reason?: RedisErrorReason
+  /** Wall-clock ms of the pass itself (lock acquisition excluded); for a lock failure, of the failed lock attempt. */
+  durationMs: number
+}
+
+/** One live consumer instance of a group, as listed by `RedisJM.fleet()`. */
+export interface FleetInstance {
+  instanceId: string
+  /** The `instanceLabel` option, when set. */
+  label?: string
+  /** The instance's `concurrency`. */
+  concurrency: number
+  /** Lane labels it consumes (`'default'` for the default lane). */
+  lanes: string[]
+  /** Its normalized `laneConcurrency` option. */
+  laneConcurrency: Record<string, number>
+  /** Poll-loop runs in flight at its last refresh. */
+  busy: number
+  /** Epoch ms (instance clock) when it started. */
+  startedAt: number
+  /** Redis server ms of its last refresh (`expiresAt - ttl`). */
+  seenAt: number
+  /** Redis server ms after which, absent a refresh, it counts as gone. */
+  expiresAt: number
+}
+
+/** Snapshot returned by `RedisJM.fleet()`. */
+export interface RedisJMFleet {
+  /** Live instances, sorted by `instanceId`. */
+  instances: FleetInstance[]
+  /** Sum of the instances' `concurrency`. */
+  slots: number
+  /** Sum of the instances' `busy`. */
+  busy: number
+  /**
+   * Per lane: how many instances consume it and the sum of `min(concurrency, laneConcurrency[lane] ??
+   * concurrency)`. Lanes share each instance's `concurrency`, so lane slots do NOT add up across lanes.
+   */
+  lanes: Record<string, { instances: number; slots: number }>
+}
+
+/** Options for `RedisJM.listQueued()`. */
+export interface ListQueuedOptions {
+  /** Lane label (`'default'` = the default lane). Omitted → every lane the group has entries on. */
+  lane?: string
+  /** Only runs of this job. */
+  jobName?: string
+  /** Max entries (default `100`, max `1000`). */
+  limit?: number
+  /** Skip this many matching entries of the ordered sequence (default `0`). Cost grows with the offset. */
+  offset?: number
+}
+
+/** One run listed by `RedisJM.listQueued()`. */
+export interface QueuedEntry {
+  jobId: string
+  jobName: string
+  runId: string
+  /** Lane label; absent only for a delayed / popped entry whose record is missing or unreadable. */
+  lane?: string
+  /** `'queued'` (on a lane list, or popped and not yet claimed) or `'delayed'`. */
+  status: 'queued' | 'delayed'
+  /** Epoch ms of the pop — present for a run popped but not yet claimed (its record is still `queued`). */
+  poppedAt?: number
+  /** Epoch ms the run becomes poppable — present for `'delayed'`. */
+  readyAt?: number
+}
+
+/** One page of `RedisJM.listQueued()`. */
+export interface QueuedPage {
+  entries: QueuedEntry[]
+  /** Offset for the next page; absent when the sequence is exhausted. */
+  nextOffset?: number
+  /** `false` when a per-call scan / decode bound stopped the listing early (narrow it with `lane` / `jobName`). */
+  complete: boolean
 }

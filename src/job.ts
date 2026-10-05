@@ -1,8 +1,8 @@
 import { randomUUID } from 'node:crypto'
 import { Hookable } from 'hookable'
-import { JobTimeoutError } from './errors'
+import { JobAbortedError, JobTimeoutError } from './errors'
 import type { RedisJM } from './redisjm'
-import { positiveOrZero, toError, toTaggable } from './utils'
+import { checkAbortGraceMs, positiveOrZero, toError, toTaggable } from './utils'
 import type {
   EnqueueOptions,
   EnqueueResult,
@@ -80,6 +80,12 @@ export class Job<TInputs = unknown, TAttrs extends { [K in keyof TAttrs]: JobAtt
    * slot) forever. If the abandoned handler later settles, that is reported once via `options.logger`
    * (never an unhandled rejection).
    *
+   * With `options.abortGraceMs` (a number `>= 0`) the same settle-and-abandon applies to every OTHER abort
+   * of `ctx.signal` (ownership loss, `payload.abort()`, an external `signal`): a handler still pending
+   * `abortGraceMs` after the abort is abandoned and `execute()` rejects with a `JobAbortedError`; one that
+   * settles within the grace decides the outcome itself. Once an attempt is abandoned (timeout or abort),
+   * `ctx.setProgress` / `ctx.setAttrs` short-circuit (resolve, dispatch nothing).
+   *
    * @param inputs - The job inputs passed to the job function
    * @param options - Target group, heartbeat interval, explicit runId, timeout, abort signal
    *
@@ -93,6 +99,7 @@ export class Job<TInputs = unknown, TAttrs extends { [K in keyof TAttrs]: JobAtt
     const runId = options?.runId ?? (typeof inputs === 'string' ? inputs : JSON.stringify(inputs))
     const heartbeatInterval = options?.heartbeatInterval
     const timeoutMs = options?.timeoutMs
+    const abortGraceMs = checkAbortGraceMs(options?.abortGraceMs, 'execute(options)')
     const attempt = options?.attempt ?? 1
     if (!Number.isInteger(attempt) || attempt < 1) {
       throw new TypeError(`execute(options.attempt): attempt must be an integer >= 1, got ${String(attempt)}`)
@@ -128,6 +135,11 @@ export class Job<TInputs = unknown, TAttrs extends { [K in keyof TAttrs]: JobAtt
       abort: (reason?: string) => controller.abort(reason ?? 'aborted'),
     }
 
+    // Set when the attempt was settled WITHOUT the handler (timeout / abort grace elapsed): the handler
+    // keeps running detached. A cheap short-circuit only — the fenced write (a rejected write emits no
+    // `update`) is what actually keeps a detached handler's `ctx` calls out of the record.
+    let abandoned = false
+
     const ctx: JobContext<TAttrs> = {
       setProgress: (progress: number) => {
         // `Number.isFinite` does not coerce, so it already rejects non-numbers (NaN, Infinity, 'x', ...).
@@ -136,9 +148,11 @@ export class Job<TInputs = unknown, TAttrs extends { [K in keyof TAttrs]: JobAtt
         }
         // Clamp into [0, 1] rather than trusting the caller — a progress bar outside the range is meaningless.
         const clamped = Math.max(0, Math.min(1, progress))
+        if (abandoned) return Promise.resolve()
         return this.callHook('update', { ...payload, progress: clamped })
       },
       setAttrs: (attrs: TAttrs) => {
+        if (abandoned) return Promise.resolve()
         return this.callHook('update', { ...payload, attrs })
       },
       signal: controller.signal,
@@ -183,7 +197,14 @@ export class Job<TInputs = unknown, TAttrs extends { [K in keyof TAttrs]: JobAtt
         }, heartbeatInterval)
       }
       try {
-        await this.runHandler(inputs, ctx, controller, timeoutMs, runId, options?.logger)
+        await this.runHandler(inputs, ctx, controller, runId, {
+          timeoutMs,
+          abortGraceMs,
+          logger: options?.logger,
+          onAbandon: () => {
+            abandoned = true
+          },
+        })
       } catch (err) {
         // Only a job-function failure is a real job error. Dispatch the `error` hook, then rethrow
         // the ORIGINAL error. A throwing `error` hook is itself infra: report it and still rethrow
@@ -211,19 +232,26 @@ export class Job<TInputs = unknown, TAttrs extends { [K in keyof TAttrs]: JobAtt
   }
 
   /**
-   * Invokes the job function, racing it against `timeoutMs` when set. On expiry: abort the run's
-   * signal with reason `'timeout'` and reject with a `JobTimeoutError` — the handler promise is
-   * abandoned (JS cannot kill it), so the caller's `finally` clears the heartbeat and frees the slot
-   * right away. The abandoned promise gets a handler that logs ONCE if it later settles or rejects, so a
-   * late rejection never becomes an unhandled rejection and a late completion is still visible.
+   * Invokes the job function, racing it against `timeoutMs` and — once the run's signal aborts for another
+   * reason — against `abortGraceMs`, when set. On expiry of the timeout: abort the run's signal with
+   * reason `'timeout'` and reject with a `JobTimeoutError`. On expiry of the grace: reject with a
+   * `JobAbortedError`. Either way the handler promise is abandoned (JS cannot kill it), so the caller's
+   * `finally` clears the heartbeat and frees the slot right away. `onAbandon` runs BEFORE the rethrow (the
+   * caller short-circuits its `ctx` writes). The abandoned promise gets a handler that logs ONCE if it later settles
+   * or rejects, so a late rejection never becomes an unhandled rejection and a late completion is still
+   * visible. A handler that settles on its own first (also within a grace) decides the outcome itself.
    */
   private async runHandler(
     inputs: TInputs,
     ctx: JobContext<TAttrs>,
     controller: AbortController,
-    timeout: number | undefined,
     runId: string,
-    logger: JobExecuteOptions['logger'],
+    opts: {
+      timeoutMs: number | undefined
+      abortGraceMs: number | false | undefined
+      logger: JobExecuteOptions['logger']
+      onAbandon: () => void
+    },
   ): Promise<void> {
     // Invoke synchronously (a sync throw still becomes a rejection, exactly like `await this.fn(...)`).
     let handler: Promise<void>
@@ -232,37 +260,61 @@ export class Job<TInputs = unknown, TAttrs extends { [K in keyof TAttrs]: JobAtt
     } catch (err) {
       handler = Promise.reject(err)
     }
-    const timeoutMs = positiveOrZero(timeout)
-    if (timeoutMs === 0) {
+    const timeoutMs = positiveOrZero(opts.timeoutMs)
+    const grace = opts.abortGraceMs === false ? undefined : opts.abortGraceMs
+    if (timeoutMs === 0 && grace === undefined) {
       await handler
       return
     }
 
     const jobId = this.getJobId(runId)
     let timer: ReturnType<typeof setTimeout> | undefined
-    // Set when the timer fires; doubles as the "timed out" flag checked after the race.
-    let timeoutError: JobTimeoutError | undefined
-    const expiry = new Promise<never>((_, reject) => {
-      timer = setTimeout(() => {
-        timeoutError = new JobTimeoutError(timeoutMs, jobId)
-        // Reject BEFORE aborting: an abort listener in the handler may reject the handler promise
-        // synchronously; the `timeoutError` check below makes the timeout win regardless of order.
-        reject(timeoutError)
-        controller.abort('timeout')
-      }, timeoutMs)
+    let graceTimer: ReturnType<typeof setTimeout> | undefined
+    let onAbort: (() => void) | undefined
+    // Set by whichever guard fires first; doubles as the "abandoned" flag checked after the race.
+    let abandonError: JobTimeoutError | JobAbortedError | undefined
+    const abandonment = new Promise<never>((_, reject) => {
+      if (timeoutMs > 0) {
+        timer = setTimeout(() => {
+          abandonError = new JobTimeoutError(timeoutMs, jobId)
+          // Reject BEFORE aborting: an abort listener in the handler may reject the handler promise
+          // synchronously; the `abandonError` check below makes the timeout win regardless of order.
+          reject(abandonError)
+          controller.abort('timeout')
+        }, timeoutMs)
+      }
+      if (grace !== undefined) {
+        onAbort = () => {
+          // The timeout aborts the signal itself (reason 'timeout'): it has already won.
+          if (abandonError || graceTimer) return
+          graceTimer = setTimeout(() => {
+            abandonError = new JobAbortedError(toError(controller.signal.reason ?? 'aborted').message, grace, jobId)
+            reject(abandonError)
+          }, grace)
+        }
+        // Aborted before (or while) the start phase ran: the grace begins as the handler starts.
+        if (controller.signal.aborted) onAbort()
+        else controller.signal.addEventListener('abort', onAbort, { once: true })
+      }
     })
     try {
-      await Promise.race([handler, expiry])
+      await Promise.race([handler, abandonment])
     } catch (err) {
-      if (!timeoutError) throw err
+      if (!abandonError) throw err
+      opts.onAbandon()
       // Abandoned handler: observe its eventual outcome once, so it is never an unhandled rejection.
+      const what = abandonError instanceof JobTimeoutError
+        ? `its ${timeoutMs}ms timeout`
+        : `its abort (${abandonError.reason})`
       handler.then(
-        () => logger?.(`job "${jobId}" handler settled after its ${timeoutMs}ms timeout (result discarded)`),
-        (lateErr) => logger?.(`job "${jobId}" handler rejected after its ${timeoutMs}ms timeout`, toError(lateErr)),
+        () => opts.logger?.(`job "${jobId}" handler settled after ${what} (result discarded)`),
+        (lateErr) => opts.logger?.(`job "${jobId}" handler rejected after ${what}`, toError(lateErr)),
       )
-      throw timeoutError
+      throw abandonError
     } finally {
       clearTimeout(timer)
+      clearTimeout(graceTimer)
+      if (onAbort) controller.signal.removeEventListener('abort', onAbort)
     }
   }
 
@@ -386,6 +438,14 @@ export class Job<TInputs = unknown, TAttrs extends { [K in keyof TAttrs]: JobAtt
   getTimeoutMs(): number | undefined {
     const raw = this.metadata.timeoutMs
     return raw === undefined ? undefined : positiveOrZero(raw)
+  }
+
+  /**
+   * This job's own abort grace (`JobMetadata.abortGraceMs`): a number of ms, `false` (explicitly none,
+   * overriding a manager default), or `undefined` (defer to the manager's `abortGraceMs`).
+   */
+  getAbortGraceMs(): number | false | undefined {
+    return this.metadata.abortGraceMs
   }
 
   /**

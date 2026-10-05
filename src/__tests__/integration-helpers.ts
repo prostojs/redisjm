@@ -18,7 +18,7 @@ import { createServer } from 'node:net'
 import Redis from 'ioredis'
 import { afterAll, afterEach, beforeAll } from 'vitest'
 import { RedisJM } from '../redisjm'
-import type { RedisJMOptions } from '../types'
+import type { JobMetadata, RedisJMOptions } from '../types'
 
 export const REDIS_URL = process.env.REDIS_URL
 
@@ -208,4 +208,19 @@ export function useDedicatedRedis(prefix: string): RedisHarness & {
       }
     },
   }
+}
+
+/** A handler that never settles. */
+export const hung = (): Promise<void> => new Promise<void>(() => {})
+
+/** Pops the head of the default lane of `group` the way a consumer does, leaving it in `claiming`. */
+export const popOnly = (m: RedisJM, group: string): Promise<{ key: string; jobId: string } | null> =>
+  (m as any).popFromLanes([{ key: `redisjm:${group}:queue`, spec: '*' }])
+
+/** Registers job `hang` (a handler that never settles), queues run `r1`, starts the loop and waits for `running`. */
+export async function startHung(manager: RedisJM, metadata: Partial<JobMetadata> = {}): Promise<void> {
+  const job = manager.createJob({ jobName: 'hang', ...metadata }, hung)
+  await job.queue('r1', null)
+  manager.start(10)
+  await until(async () => (await manager.get('hang#r1'))?.status === 'running')
 }

@@ -8,21 +8,27 @@ import { createMaintenanceJob, MAINTENANCE_JOB_NAME, MAINTENANCE_LANE } from './
 import {
   DELETE_IF_UNCHANGED_SCRIPT,
   ENQUEUE_SCRIPT,
+  FLEET_SCRIPT,
+  LIST_QUEUED_SCRIPT,
   POP_SCRIPT,
+  PRESENCE_SCRIPT,
   PRUNE_JOB_SCRIPT,
   PURGE_SCRIPT,
   runScript,
   sha1Hex,
   TRANSITION_SCRIPT,
 } from './scripts'
-import { nonNegativeInt, positiveOrZero, toError, toTaggable } from './utils'
+import { checkAbortGraceMs, nonNegativeInt, positiveOrZero, toError, toTaggable } from './utils'
 import type {
   EnqueueOptions,
   EnqueueResult,
   EveryOptions,
+  FleetInstance,
   InFlightCounts,
   ListPage,
   ListPageOptions,
+  ListQueuedOptions,
+  RedisJMFleet,
   RedisJMHealth,
   JobAttrs,
   JobAttrValue,
@@ -34,7 +40,10 @@ import type {
   JobRetryEventPayload,
   JobStatus,
   JobUpdateEventPayload,
+  MaintenanceEventPayload,
   MaintenanceResult,
+  QueuedEntry,
+  QueuedPage,
   QueueOptions,
   RedisJMHooks,
   RedisJMLogger,
@@ -56,6 +65,9 @@ const DEFAULT_OPTIONS: Omit<ResolvedRedisJMOptions, 'maintenanceInterval'> = {
   lanePriority: [],
   concurrency: 1,
   jobTimeout: 0,
+  abortGraceMs: false,
+  presence: true,
+  instanceLabel: '',
   maxRunMs: 0,
   laneConcurrency: {},
   laneCaps: {},
@@ -72,6 +84,18 @@ const OLD_LANE_REFRESH_MS = 5000
 
 /** How many entries from the head of an OLD lane the pop script inspects for an allow-listed job. */
 const OLD_LANE_SCAN_LIMIT = 100
+
+/** Max length of `instanceLabel`. */
+const MAX_INSTANCE_LABEL = 200
+
+/** Records per `HMGET` of `getMany` (one pipeline carries every chunk). */
+const GET_MANY_CHUNK = 500
+
+/** `listQueued` bounds: default / max page size, and the per-call decode and scan caps of the script. */
+const LIST_QUEUED_DEFAULT_LIMIT = 100
+const LIST_QUEUED_MAX_LIMIT = 1000
+const LIST_QUEUED_DECODE_CAP = 500
+const LIST_QUEUED_SCAN_CAP = 10_000
 
 /** Max jobs whose bookkeeping sets one maintenance pass prunes (one small script call each). */
 const JOB_PRUNE_BATCH = 100
@@ -115,6 +139,8 @@ interface OpGuard {
   fail: (err: unknown) => void
   /** Logs ONCE per pass: the failure count and the classified reason of the first failure. */
   report: (label: string) => void
+  /** The failures so far: how many, and the first one (`undefined` when none). */
+  summary: () => { failures: number; firstError: unknown }
 }
 
 /** One scanned log batch of a maintenance pass, split by `RedisJM.planLogCleanup`. */
@@ -401,6 +427,25 @@ export class RedisJM extends Hookable<RedisJMHooks> {
    * so it holds about one entry per run executing here.
    */
   private readonly recordJson = new Map<string, string>()
+  /** This manager's id in the group's fleet registry (stable across `stop()` / `start()`). */
+  private readonly instanceId = randomUUID()
+  /** Fleet-presence refresh timer, alive between `start()` and `stop()`. */
+  private presenceTimer: ReturnType<typeof setInterval> | undefined
+  /**
+   * Every presence write (refresh, deregistration) runs through this chain, one at a time, each op
+   * re-checking its intent when it runs (see {@link queuePresence}). Never rejects.
+   */
+  private presenceTail: Promise<void> = Promise.resolve()
+  /** A refresh is queued and has not started yet: further timer ticks coalesce into it. */
+  private presenceRefreshQueued = false
+  /** The info JSON stored in Redis by the last successful write (`undefined` = none is stored). */
+  private presenceSent: string | undefined
+  /** The static part of the fleet entry's info (lanes, label, …), cached until the registrations change. */
+  private presenceBase: Record<string, unknown> | undefined
+  /** Whether the current presence-refresh failure episode was already logged. */
+  private presenceFailLogged = false
+  /** Epoch ms of the last `start()` (the fleet entry's `startedAt`). */
+  private startedAt = 0
 
   /**
    * @param redis - An ioredis client instance
@@ -420,6 +465,11 @@ export class RedisJM extends Hookable<RedisJMHooks> {
     const heartbeatInterval = options?.heartbeatInterval ?? DEFAULT_OPTIONS.heartbeatInterval
     const roundsToStale = options?.roundsToStale ?? DEFAULT_OPTIONS.roundsToStale
     const concurrency = options?.concurrency ?? DEFAULT_OPTIONS.concurrency
+    const abortGraceMs = checkAbortGraceMs(options?.abortGraceMs, 'RedisJMOptions') ?? DEFAULT_OPTIONS.abortGraceMs
+    const instanceLabel = options?.instanceLabel ?? DEFAULT_OPTIONS.instanceLabel
+    if (typeof instanceLabel !== 'string' || instanceLabel.length > MAX_INSTANCE_LABEL) {
+      throw new TypeError(`instanceLabel must be a string of at most ${MAX_INSTANCE_LABEL} characters`)
+    }
     // Validate before flooring: reject NaN/Infinity/< 1 outright, then floor a valid value (2.7 → 2)
     // so a single instance never runs zero or a fractional number of jobs at once.
     if (!Number.isFinite(concurrency) || concurrency < 1) {
@@ -435,6 +485,9 @@ export class RedisJM extends Hookable<RedisJMHooks> {
       lanePriority: options?.lanePriority ?? DEFAULT_OPTIONS.lanePriority,
       concurrency: Math.floor(concurrency),
       jobTimeout: positiveOrZero(options?.jobTimeout),
+      abortGraceMs,
+      presence: options?.presence ?? DEFAULT_OPTIONS.presence,
+      instanceLabel,
       maxRunMs: positiveOrZero(options?.maxRunMs),
       laneConcurrency: normalizeLaneLimits(options?.laneConcurrency),
       laneCaps: normalizeLaneLimits(options?.laneCaps),
@@ -458,6 +511,15 @@ export class RedisJM extends Hookable<RedisJMHooks> {
   /** Returns a copy of the resolved options with defaults applied. */
   getOptions(): ResolvedRedisJMOptions {
     return { ...this.options }
+  }
+
+  /**
+   * This manager's id in the group's fleet registry (see {@link fleet}): a random UUID, fixed for the
+   * manager's lifetime (it survives `stop()` / `start()`), so a log line or a `fleet()` entry can be tied
+   * back to the process.
+   */
+  getInstanceId(): string {
+    return this.instanceId
   }
 
   /**
@@ -595,7 +657,8 @@ export class RedisJM extends Hookable<RedisJMHooks> {
    * In-flight runs of one job name, without scanning the log: reads the job's lock set and exactly those
    * records (one `HMGET`) — O(runs in flight of this job), independent of the log size and of every other
    * job. Popped-not-yet-claimed runs count as `queued`. See `InFlightCounts` for how `total` relates to
-   * the lock-set size `maxInFlight` is enforced against.
+   * the lock-set size `maxInFlight` is enforced against. When only the number is needed, use
+   * {@link inFlightCount} (one O(1) `SCARD`).
    *
    * @example
    * ```ts
@@ -608,13 +671,30 @@ export class RedisJM extends Hookable<RedisJMHooks> {
     if (ids.length === 0) return counts
     const values = await this.redis.hmget(this.getLogKey(), ...ids)
     values.forEach((json, i) => {
-      const status = json ? this.parseRecord(json, ids[i])?.status : undefined
+      const status = this.decodeRecord(json, ids[i])?.status
       if (status === 'queued' || status === 'delayed' || status === 'running') {
         counts[status]++
         counts.total++
       }
     })
     return counts
+  }
+
+  /**
+   * Number of runs of `jobName` holding a lock — queued (including popped-not-yet-claimed), delayed and
+   * running — as ONE O(1) `SCARD` of the job's lock set, reading no records. It is exactly what
+   * `maxInFlight` is enforced against: an enqueue sees `'busy'` iff this is `>= maxInFlight` at that
+   * instant. Prefer it to {@link inFlight} on hot paths that only gate on the number. In a group where a
+   * pre-0.2 instance still writes, the count drifts (that instance neither adds to nor removes from the
+   * per-job set) until those runs drain and maintenance prunes the set — see Upgrading.
+   *
+   * @example
+   * ```ts
+   * if (await manager.inFlightCount('send-email') >= 10) return // shed load
+   * ```
+   */
+  async inFlightCount(jobName: string): Promise<number> {
+    return this.redis.scard(this.getJobLocksKey(jobName))
   }
 
   /**
@@ -655,6 +735,123 @@ export class RedisJM extends Hookable<RedisJMHooks> {
   }
 
   /**
+   * Records for many jobIds in ONE round trip (a pipeline of `HMGET`s, 500 fields per command), in input
+   * order — duplicates included; `undefined` for a missing or unparseable record. Inputs are included, as
+   * with {@link get}. `[]` makes no Redis call.
+   *
+   * @example
+   * ```ts
+   * const records = await manager.getMany(['send-email#a', 'send-email#b'])
+   * ```
+   */
+  async getMany(jobIds: string[]): Promise<Array<JobLogRecord | undefined>> {
+    if (jobIds.length === 0) return []
+    const pipeline = this.redis.pipeline()
+    for (let i = 0; i < jobIds.length; i += GET_MANY_CHUNK) {
+      pipeline.hmget(this.getLogKey(), ...jobIds.slice(i, i + GET_MANY_CHUNK))
+    }
+    const jsons: Array<string | null> = []
+    for (const [err, values] of (await pipeline.exec()) ?? []) {
+      if (err) throw err
+      jsons.push(...(values as Array<string | null>))
+    }
+    return jobIds.map((jobId, i) => this.decodeRecord(jsons[i], jobId) ?? undefined)
+  }
+
+  /**
+   * Lists runs waiting to run, in the order they leave the queue — one atomic, read-only snapshot, no
+   * inputs ever leaving Redis. The sequence is: runs popped but not yet claimed (by pop time), then the
+   * lane lists head → tail (a priority insert is at the head), then the delayed set by `readyAt` (each is
+   * pushed to its lane's tail when it falls due). With `lane` this is the order in which the current
+   * entries leave that lane (absent new head inserts); across lanes there is NO global pop order —
+   * consumers interleave lanes per `laneStrategy`. Without `lane`, every lane the group has entries on is
+   * listed: `default` first, then the others alphabetically (the reserved `__maintenance` lane only when
+   * asked for explicitly). A run whose lane lists are only in a pre-0.2 producer's lane set is found only
+   * when its lane is named or registered locally.
+   *
+   * A `lane` filter on the delayed / popped entries resolves each one's lane from its record, inside the
+   * script (`cjson`, at most 500 decodes per call — decode cost scales with the record's size, on the Redis
+   * thread). A per-call decode / scan bound sets `complete: false`: narrow the listing with `lane` /
+   * `jobName`. `complete: false` is EXPECTED when a page needs more than 500 record decodes — no `lane`
+   * filter, many delayed / popped entries inside the page. Without `lane`, the lanes to read are
+   * discovered client-side first (a registry `SMEMBERS`, then one pipelined read of the lane sets; with
+   * `jobName` only that one job's lane set, in the pipeline) — two small round trips before the script.
+   * Same exposure as {@link listPage} / {@link get}: runIds may carry entity ids — gate any
+   * admin endpoint built on it.
+   *
+   * @example
+   * ```ts
+   * let page = await manager.listQueued({ lane: 'images', limit: 50 })
+   * while (page.nextOffset !== undefined) page = await manager.listQueued({ lane: 'images', limit: 50, offset: page.nextOffset })
+   * ```
+   */
+  async listQueued(options: ListQueuedOptions = {}): Promise<QueuedPage> {
+    const limit = Math.min(LIST_QUEUED_MAX_LIMIT, Math.max(1, nonNegativeInt(options.limit) ?? LIST_QUEUED_DEFAULT_LIMIT))
+    const offset = nonNegativeInt(options.offset) ?? 0
+    const filter = options.lane === undefined ? '' : this.laneLabel(options.lane)
+    const labels = filter ? [filter] : await this.listedLaneLabels(options.jobName)
+    const res = await runScript(
+      this.redis,
+      LIST_QUEUED_SCRIPT,
+      [this.getClaimingKey(), this.getDelayedKey(), this.getLogKey(), ...labels.map((label) => this.getQueueKey(label))],
+      [
+        filter,
+        options.jobName === undefined ? '' : `${options.jobName}#`,
+        offset,
+        limit,
+        LIST_QUEUED_DECODE_CAP,
+        LIST_QUEUED_SCAN_CAP,
+        ...labels,
+      ],
+    )
+    const flat = Array.isArray(res) ? res : []
+    const entries: QueuedEntry[] = []
+    for (let i = 2; i + 3 < flat.length; i += 4) {
+      const kind = String(flat[i])
+      const jobId = String(flat[i + 1])
+      const score = Number(flat[i + 2])
+      const lane = String(flat[i + 3])
+      const entry: QueuedEntry = { jobId, ...splitJobId(jobId), status: kind === 'd' ? 'delayed' : 'queued' }
+      if (lane) entry.lane = lane
+      if (kind === 'c') entry.poppedAt = score
+      if (kind === 'd') entry.readyAt = score
+      entries.push(entry)
+    }
+    const page: QueuedPage = { entries, complete: Number(flat[0]) === 1 }
+    if (Number(flat[1]) === 1) page.nextOffset = offset + entries.length
+    return page
+  }
+
+  /**
+   * The lane labels `listQueued` walks when no lane is given: `default`, then every other lane — the
+   * lists named by the jobs' lane sets (all jobs, or just `jobName`'s) and the ones this instance knows
+   * (registered jobs' lanes) — alphabetically; the reserved maintenance lane is left out.
+   */
+  private async listedLaneLabels(jobName?: string): Promise<string[]> {
+    const others = new Set<string>()
+    const add = (label: string) => {
+      if (label !== 'default' && label !== MAINTENANCE_LANE) others.add(label)
+    }
+    for (const job of this.registeredJobs) add(this.laneLabel(job.getLane()))
+    const names = jobName === undefined ? await this.redis.smembers(this.getJobRegistryKey()) : [jobName]
+    for (const keys of await this.readJobLaneSets(names)) {
+      for (const key of keys) {
+        const label = this.laneLabelOfKey(key)
+        if (label !== undefined) add(label)
+      }
+    }
+    return ['default', ...[...others].sort()]
+  }
+
+  /** The lane sets (lane list KEYS) of each named job, in one pipeline; `[]` for a failed read. */
+  private async readJobLaneSets(names: string[]): Promise<string[][]> {
+    if (names.length === 0) return []
+    const pipeline = this.redis.pipeline()
+    for (const name of names) pipeline.smembers(this.getJobLanesKey(name))
+    return ((await pipeline.exec()) ?? []).map(([err, keys]) => (!err && Array.isArray(keys) ? (keys as string[]) : []))
+  }
+
+  /**
    * Enqueues `job` every `intervalMs` from this instance's own timer (works with or without `start()`;
    * cleared by `stop()`), and returns a function that stops it. With `skipIfInFlight` (default) every
    * tick uses the same runId, so the run lock dedupes a tick while the previous run is still
@@ -685,6 +882,160 @@ export class RedisJM extends Hookable<RedisJMHooks> {
     return () => {
       clearInterval(timer)
       this.everyTimers.delete(timer)
+    }
+  }
+
+  /**
+   * The live consumer instances of this group — those running `start()` with `presence` on — and their
+   * capacity (see `RedisJMFleet`): per instance its `concurrency`, lanes, `laneConcurrency` and how busy
+   * it was at its last refresh, and the group totals (`slots`, `busy`, per-lane consumers and slots).
+   * One read-only script, O(instances); works under maxmemory and on replicas. Liveness is a lease on
+   * REDIS server time, refreshed every `heartbeatInterval` and lapsing after `heartbeatInterval ×
+   * roundsToStale` (so a pinned event loop lapses like its runs do).
+   *
+   * NOT counted: drain workers that only call `popAndExecute()`, producer-only processes, instances with
+   * `presence: false`, and instances older than 0.3.0 — during a rolling deploy `fleet()` under-counts
+   * until the rollout completes.
+   *
+   * @example
+   * ```ts
+   * const { slots, lanes } = await manager.fleet()
+   * const wave = lanes['images']?.slots ?? 0
+   * ```
+   */
+  async fleet(): Promise<RedisJMFleet> {
+    const res = await runScript(this.redis, FLEET_SCRIPT, [this.getInstancesKey(), this.getInstanceInfoKey()], [])
+    const flat = Array.isArray(res) ? res : []
+    const instances: FleetInstance[] = []
+    for (let i = 1; i + 2 < flat.length; i += 3) {
+      const instanceId = String(flat[i])
+      const expiresAt = Number(flat[i + 1])
+      const info = this.parseInstanceInfo(flat[i + 2], instanceId)
+      if (!info) continue
+      const { ttlMs, ...rest } = info
+      instances.push({ ...rest, seenAt: expiresAt - ttlMs, expiresAt })
+    }
+    instances.sort((a, b) => (a.instanceId < b.instanceId ? -1 : a.instanceId > b.instanceId ? 1 : 0))
+    const fleet: RedisJMFleet = { instances, slots: 0, busy: 0, lanes: {} }
+    for (const instance of instances) {
+      fleet.slots += instance.concurrency
+      fleet.busy += instance.busy
+      for (const lane of instance.lanes) {
+        const entry = (fleet.lanes[lane] ??= { instances: 0, slots: 0 })
+        entry.instances++
+        entry.slots += Math.min(instance.concurrency, instance.laneConcurrency[lane] ?? instance.concurrency)
+      }
+    }
+    return fleet
+  }
+
+  /** A fleet entry's stored info JSON, or `null` (logged) when it is missing or not an instance record. */
+  private parseInstanceInfo(
+    json: unknown,
+    instanceId: string,
+  ): (Omit<FleetInstance, 'seenAt' | 'expiresAt'> & { ttlMs: number }) | null {
+    let value: any
+    try {
+      value = typeof json === 'string' ? JSON.parse(json) : undefined
+    } catch {
+      value = undefined
+    }
+    const valid = typeof value === 'object' && value !== null
+      && typeof value.concurrency === 'number' && typeof value.busy === 'number'
+      && typeof value.startedAt === 'number' && typeof value.ttlMs === 'number'
+      && Array.isArray(value.lanes) && value.lanes.every((lane: unknown) => typeof lane === 'string')
+      && typeof value.laneConcurrency === 'object' && value.laneConcurrency !== null
+    if (!valid) {
+      this.logger(`skipping unreadable fleet entry "${instanceId}"`)
+      return null
+    }
+    return {
+      instanceId,
+      ...(typeof value.label === 'string' && value.label ? { label: value.label } : {}),
+      concurrency: value.concurrency,
+      lanes: value.lanes,
+      laneConcurrency: value.laneConcurrency,
+      busy: value.busy,
+      startedAt: value.startedAt,
+      ttlMs: value.ttlMs,
+    }
+  }
+
+  /**
+   * Runs a presence write after every earlier one: refreshes and deregistrations never overlap, so a
+   * refresh can't re-add an entry a deregistration just removed, and a quick `stop()` / `start()` can't
+   * race. `op` must not reject and re-checks the intent (timer armed or not) when it runs.
+   */
+  private queuePresence(op: () => Promise<void>): Promise<void> {
+    return (this.presenceTail = this.presenceTail.then(op))
+  }
+
+  /** Queues a refresh of this instance's fleet entry (see {@link refreshPresence}); coalesces while one is queued. */
+  private schedulePresenceRefresh(): void {
+    if (this.presenceRefreshQueued) return
+    this.presenceRefreshQueued = true
+    void this.queuePresence(() => {
+      this.presenceRefreshQueued = false
+      return this.refreshPresence()
+    })
+  }
+
+  /** The info the fleet entry carries besides `busy`: rebuilt only when jobs are (un)registered or on `start()`. */
+  private presenceBaseInfo(): Record<string, unknown> {
+    return (this.presenceBase ??= {
+      ...(this.options.instanceLabel ? { label: this.options.instanceLabel } : {}),
+      concurrency: this.options.concurrency,
+      lanes: [...new Set([...this.registeredJobs].map((job) => this.laneLabel(job.getLane())))]
+        .filter((label) => label !== MAINTENANCE_LANE)
+        .sort(),
+      laneConcurrency: this.options.laneConcurrency,
+      startedAt: this.startedAt,
+      ttlMs: this.getStaleThreshold(),
+    })
+  }
+
+  /**
+   * Refreshes this instance's fleet entry (see {@link fleet}) — a no-op unless `start()` armed the timer.
+   * The lease (ZADD) is renewed every beat; the info JSON is sent only when it differs from what Redis
+   * holds (or Redis lost it). Never rejects; a failure is logged once per episode (under maxmemory the
+   * refresh is refused and the entry lapses after its ttl — truthful: a Redis at maxmemory refuses every
+   * pop anyway).
+   */
+  private async refreshPresence(): Promise<void> {
+    if (!this.presenceTimer) return
+    const info = JSON.stringify({ ...this.presenceBaseInfo(), busy: this.inFlightRuns.size })
+    const keys = [this.getInstancesKey(), this.getInstanceInfoKey()]
+    const ttlMs = this.getStaleThreshold()
+    try {
+      const unchanged = info === this.presenceSent
+      // `1` = no info was sent and Redis holds none for this instance (lapsed, flushed): send it now.
+      const needInfo = await runScript(this.redis, PRESENCE_SCRIPT, keys, [this.instanceId, ttlMs, unchanged ? '' : info])
+      if (needInfo === 1) await runScript(this.redis, PRESENCE_SCRIPT, keys, [this.instanceId, ttlMs, info])
+      this.presenceSent = info
+      this.presenceFailLogged = false
+    } catch (err) {
+      if (this.presenceFailLogged) return
+      this.presenceFailLogged = true
+      this.logger(`fleet presence refresh failed (${classifyRedisError(err)}); this instance may lapse from fleet()`, toError(err))
+    }
+  }
+
+  /**
+   * Removes this instance's fleet entry (best effort, logged on failure): one `MULTI ZREM + HDEL`
+   * (deletions, accepted under maxmemory). A no-op when a later `start()` re-armed the timer meanwhile.
+   */
+  private async deregisterPresence(): Promise<void> {
+    if (this.presenceTimer) return
+    try {
+      const results = await this.redis.multi()
+        .zrem(this.getInstancesKey(), this.instanceId)
+        .hdel(this.getInstanceInfoKey(), this.instanceId)
+        .exec()
+      const failed = (results ?? []).find(([err]) => err)
+      if (failed) throw failed[0]
+      this.presenceSent = undefined
+    } catch (err) {
+      this.logger('fleet presence deregistration failed (the entry lapses on its own)', toError(err))
     }
   }
 
@@ -949,6 +1300,7 @@ export class RedisJM extends Hookable<RedisJMHooks> {
     }
     // Early feedback for a bad lane declaration (enqueue re-validates on the producer path).
     this.validateLane(job.getLane(), jobName)
+    checkAbortGraceMs(job.getAbortGraceMs(), `job "${jobName}" (JobMetadata)`)
     if (this.jobsByName.has(jobName)) {
       throw new Error(`Job with name "${jobName}" is already registered`)
     }
@@ -956,6 +1308,7 @@ export class RedisJM extends Hookable<RedisJMHooks> {
     this.registeredJobs.add(job)
     this.jobsByName.set(jobName, job)
     this.ownLanes = undefined
+    this.presenceBase = undefined
     // Discover the new job's old lanes on the next poll, not up to OLD_LANE_REFRESH_MS later.
     this.lastOldLaneRefresh = 0
 
@@ -1125,11 +1478,14 @@ export class RedisJM extends Hookable<RedisJMHooks> {
       // its progress/attrs, and a `stale`-but-ours record is resurrected so a pinned-then-recovered
       // handler's final setProgress/setAttrs land instead of being silently dropped. A superseded
       // run's late update still can't leak into the successor's record (executionId mismatch).
-      await updateOwned(payload, (record) => {
+      const { outcome } = await updateOwned(payload, (record) => {
         if (payload.progress !== undefined) record.progress = payload.progress
         // Merge, not replace: successive setAttrs calls accumulate keys instead of clobbering.
         if (payload.attrs !== undefined) record.attrs = { ...record.attrs, ...payload.attrs }
       }, true)
+      // A fenced (superseded / terminal / unqueued) write changed nothing, so it is not an `update`. No
+      // abort here — the heartbeat owns ownership-loss detection.
+      if (outcome !== 'written') return
       await this.emit('update', payload as unknown as JobUpdateEventPayload)
     })
 
@@ -1167,6 +1523,7 @@ export class RedisJM extends Hookable<RedisJMHooks> {
     this.jobsByName.delete(job.getName())
     this.registeredJobs.delete(job)
     this.ownLanes = undefined
+    this.presenceBase = undefined
     // The old-lane allow-lists name the job too: drop them and re-read on the next poll, or for up to
     // OLD_LANE_REFRESH_MS this instance would keep taking its entries off old lanes as unknown jobs
     // (burning their requeue budget, or failing them).
@@ -1325,6 +1682,8 @@ export class RedisJM extends Hookable<RedisJMHooks> {
     const { inputs } = logRecord
     const attempt = nextAttempt(logRecord)
     const timeoutMs = job.getTimeoutMs() ?? this.options.jobTimeout
+    // The job's own value wins, `false` included (an explicit opt-out of the manager default).
+    const abortGraceMs = job.getAbortGraceMs() ?? this.options.abortGraceMs
     return async () => {
       const controller = new AbortController()
       this.abortControllers.add(controller)
@@ -1336,6 +1695,9 @@ export class RedisJM extends Hookable<RedisJMHooks> {
           // Resolved execution timeout (job value wins; 0 = none). On expiry execute() settles with a
           // JobTimeoutError even if the handler never does, so this slot frees.
           timeoutMs,
+          // Resolved abort grace: after `ctx.signal` aborts (not by the timeout), a handler still pending
+          // this long is abandoned and execute() settles with a JobAbortedError (default: wait for it).
+          abortGraceMs,
           attempt,
           // Identify this manager as the driver (so only its hooks act) and route infra errors here.
           manager: this,
@@ -1409,13 +1771,9 @@ export class RedisJM extends Hookable<RedisJMHooks> {
       return
     }
     try {
-      const pipeline = this.redis.pipeline()
-      for (const name of jobs) pipeline.smembers(this.getJobLanesKey(name))
-      const results = (await pipeline.exec()) ?? []
       const allow = new Map<string, Set<string>>()
-      results.forEach(([err, keys], i) => {
-        if (err || !Array.isArray(keys)) return
-        for (const key of keys as string[]) {
+      ;(await this.readJobLaneSets(jobs)).forEach((keys, i) => {
+        for (const key of keys) {
           if (ownKeys.has(key)) continue
           if (!allow.has(key)) allow.set(key, new Set())
           allow.get(key)!.add(jobs[i])
@@ -1728,6 +2086,15 @@ export class RedisJM extends Hookable<RedisJMHooks> {
       this.maintenanceTick()
     }
 
+    if (this.options.presence && this.options.heartbeatInterval > 0) {
+      // Fleet presence (see `fleet()`): a lease refreshed on its own timer — outside the poll loop and the
+      // concurrency slots — so a full set of busy slots never lapses the instance.
+      this.startedAt = Date.now()
+      this.presenceBase = undefined
+      this.presenceTimer = setInterval(() => this.schedulePresenceRefresh(), this.options.heartbeatInterval)
+      this.schedulePresenceRefresh()
+    }
+
     const concurrency = this.options.concurrency
     const laneConcurrency = this.laneConcurrencyByKey
     // Schedules the next poll. `delay > 0` is the idle wait — the only wait `wake()` may cut short.
@@ -1834,7 +2201,10 @@ export class RedisJM extends Hookable<RedisJMHooks> {
    * it additionally aborts every in-flight run's `ctx.signal` (reason `'manager stopped'`) so
    * cooperative handlers can bail out of wasted work early; `stop()` still awaits them to settle
    * (abort is cooperative — nothing forcibly kills a handler). A handler that ignores its signal is only
-   * awaited until its execution timeout (`jobTimeout` / `JobMetadata.timeoutMs`) when one is set.
+   * awaited until its execution timeout (`jobTimeout` / `JobMetadata.timeoutMs`) when one is set — or,
+   * with `abortGraceMs`, until that many ms after the abort: then it is abandoned, its attempt fails with
+   * a `JobAbortedError` (consuming an attempt: with the default `attempts: 1` the run ends `error`) and
+   * `stop()` resolves. This instance also leaves the fleet registry (see {@link fleet}) first thing.
    * The maintenance timer and `every()` timers are cleared too, an in-flight maintenance pass is
    * awaited, in-flight `popAndExecute()` calls are drained, and `popAndExecute()` refuses to pop
    * (returns `false`) until the next `start()`.
@@ -1861,6 +2231,12 @@ export class RedisJM extends Hookable<RedisJMHooks> {
       clearInterval(this.maintenanceTimer)
       this.maintenanceTimer = undefined
     }
+    // Leave the fleet registry right away (this instance stops popping now); awaited by the drain below.
+    if (this.presenceTimer) {
+      clearInterval(this.presenceTimer)
+      this.presenceTimer = undefined
+      void this.queuePresence(() => this.deregisterPresence())
+    }
     const abortAll = () => {
       for (const controller of this.abortControllers) controller.abort('manager stopped')
     }
@@ -1872,6 +2248,7 @@ export class RedisJM extends Hookable<RedisJMHooks> {
       abortAll()
     }
     const drain = async () => {
+      await this.presenceTail
       // A maintenance pass in flight finishes on its own (it is short and bounded by the log size);
       // awaiting it keeps `stop()`'s promise meaning "nothing of this manager is touching Redis".
       await Promise.resolve(this.maintenancePass)
@@ -1935,6 +2312,7 @@ export class RedisJM extends Hookable<RedisJMHooks> {
    * ```
    */
   async runMaintenance(): Promise<MaintenanceResult | null> {
+    const startedAt = Date.now()
     const interval = this.options.maintenanceInterval
     const ttl = interval > 0
       // Margin: the lock is set a few ms AFTER this instance's tick fires, so a TTL of exactly one
@@ -1951,10 +2329,37 @@ export class RedisJM extends Hookable<RedisJMHooks> {
         return this.performEmergencyMaintenance()
       }
       this.logger(`maintenance lock could not be acquired (${reason}); skipping this pass`, toError(err))
+      await this.emitMaintenanceFailure(err, startedAt)
       return null
     }
     if (acquired !== 'OK') return null
     return this.performMaintenance()
+  }
+
+  /**
+   * Fires the `maintenance` observers for a pass that did not complete (`result: null`): it threw, or its
+   * lock could not be acquired. `durationMs` is the wall-clock since `startedAt` (the pass start; for a
+   * lock failure, the start of the attempt).
+   */
+  private async emitMaintenanceFailure(err: unknown, startedAt: number, failedOps = 0): Promise<void> {
+    await this.emit('maintenance', {
+      result: null,
+      failedOps,
+      error: toError(err),
+      reason: classifyRedisError(err),
+      durationMs: Date.now() - startedAt,
+    })
+  }
+
+  /** Fires the `maintenance` observers for a completed pass (see `RedisJMHooks.maintenance`); `durationMs` runs from `startedAt`. */
+  private async emitMaintenance(result: MaintenanceResult, ops: OpGuard, startedAt: number): Promise<void> {
+    const { failures, firstError } = ops.summary()
+    const payload: MaintenanceEventPayload = { result, failedOps: failures, durationMs: Date.now() - startedAt }
+    if (failures > 0) {
+      payload.error = toError(firstError)
+      payload.reason = classifyRedisError(firstError)
+    }
+    await this.emit('maintenance', payload)
   }
 
   /**
@@ -1992,6 +2397,8 @@ export class RedisJM extends Hookable<RedisJMHooks> {
    *  - jobs batch: per-job bookkeeping upkeep — job-lock-set members whose lock is gone, lanes whose
    *    list is empty, and jobs with nothing left are pruned.
    *
+   * Fires the manager-level `maintenance` event when the pass completes.
+   *
    * @returns Counts of stale, cleaned and requeued records (orphaned locks count toward `staleCount`), `mode: 'full'`
    *
    * @example
@@ -2000,7 +2407,18 @@ export class RedisJM extends Hookable<RedisJMHooks> {
    * ```
    */
   async performMaintenance(): Promise<MaintenanceResult> {
-    const now = Date.now()
+    const startedAt = Date.now()
+    try {
+      return await this.runFullPass(startedAt)
+    } catch (err) {
+      // A pass that THROWS is observed too (`result: null`), then rethrown for the caller to log.
+      await this.emitMaintenanceFailure(err, startedAt)
+      throw err
+    }
+  }
+
+  /** The body of {@link performMaintenance}; `now` is the pass start. Emits `maintenance` on completion. */
+  private async runFullPass(now: number): Promise<MaintenanceResult> {
     const ops = this.createOpGuard()
     const cursorKeys = [
       this.getMaintenanceCursorKey(),
@@ -2059,7 +2477,9 @@ export class RedisJM extends Hookable<RedisJMHooks> {
     await this.pipelined(cursorKeys, (p, key, i) => p.set(key, nextCursors[i]), ops)
 
     ops.report('maintenance pass')
-    return { staleCount, cleanedCount, requeuedCount, mode: 'full' }
+    const result: MaintenanceResult = { staleCount, cleanedCount, requeuedCount, mode: 'full' }
+    await this.emitMaintenance(result, ops, now)
+    return result
   }
 
   /**
@@ -2277,12 +2697,20 @@ export class RedisJM extends Hookable<RedisJMHooks> {
    * the shared cursor can't be written under OOM, so it resumes from a per-instance cursor instead.
    */
   private async performEmergencyMaintenance(): Promise<MaintenanceResult> {
-    const ops = this.createOpGuard()
-    const batch = await this.readLogBatch(this.emergencyCursor, Date.now())
-    this.emergencyCursor = batch.cursor
-    const cleanedCount = await this.cleanLogBatch(batch, ops)
-    ops.report('emergency maintenance pass')
-    return { staleCount: 0, cleanedCount, requeuedCount: 0, mode: 'emergency' }
+    const startedAt = Date.now()
+    try {
+      const ops = this.createOpGuard()
+      const batch = await this.readLogBatch(this.emergencyCursor, startedAt)
+      this.emergencyCursor = batch.cursor
+      const cleanedCount = await this.cleanLogBatch(batch, ops)
+      ops.report('emergency maintenance pass')
+      const result: MaintenanceResult = { staleCount: 0, cleanedCount, requeuedCount: 0, mode: 'emergency' }
+      await this.emitMaintenance(result, ops, startedAt)
+      return result
+    } catch (err) {
+      await this.emitMaintenanceFailure(err, startedAt)
+      throw err
+    }
   }
 
   /**
@@ -2528,6 +2956,7 @@ export class RedisJM extends Hookable<RedisJMHooks> {
           toError(firstError),
         )
       },
+      summary: () => ({ failures, firstError }),
     }
   }
 
@@ -2660,7 +3089,11 @@ export class RedisJM extends Hookable<RedisJMHooks> {
 
   /** Fetches and parses a single log record by `jobId`; `null` if absent or unparseable. */
   private async readRecord(jobId: string): Promise<JobLogRecord | null> {
-    const json = await this.redis.hget(this.getLogKey(), jobId)
+    return this.decodeRecord(await this.redis.hget(this.getLogKey(), jobId), jobId)
+  }
+
+  /** {@link parseRecord} of a possibly absent stored value: `null` when there is none or it is unreadable. */
+  private decodeRecord(json: string | null | undefined, jobId: string): JobLogRecord | null {
     return json ? this.parseRecord(json, jobId) : null
   }
 
@@ -2940,6 +3373,15 @@ export class RedisJM extends Hookable<RedisJMHooks> {
     return `redisjm:${this.targetGroup}:lane:${lane}:queue`
   }
 
+  /** Inverse of {@link getQueueKey}: the lane label of a lane list key, `undefined` for a foreign key. */
+  private laneLabelOfKey(key: string): string | undefined {
+    if (key === this.getQueueKey()) return 'default'
+    const prefix = `redisjm:${this.targetGroup}:lane:`
+    return key.startsWith(prefix) && key.endsWith(':queue') && key.length > prefix.length + ':queue'.length
+      ? key.slice(prefix.length, -':queue'.length)
+      : undefined
+  }
+
   /**
    * Display label for a lane, mirroring the default-lane rule in {@link getQueueKey}: the default
    * lane (`undefined` or `'default'`) reports as `'default'`; a named lane reports under its own name.
@@ -3012,6 +3454,16 @@ export class RedisJM extends Hookable<RedisJMHooks> {
    */
   private getJobLanesKey(jobName: string): string {
     return `redisjm:${this.targetGroup}:jobs:${jobName}:lanes`
+  }
+
+  /** Sorted set of the live consumer instances: member = instanceId, score = lease expiry (Redis server ms). */
+  private getInstancesKey(): string {
+    return `redisjm:${this.targetGroup}:instances`
+  }
+
+  /** Hash instanceId → the instance's info JSON (capacity, lanes, label…), the companion of `instances`. */
+  private getInstanceInfoKey(): string {
+    return `redisjm:${this.targetGroup}:instance-info`
   }
 
   /** String key (with a TTL) marking that a pre-0.2 instance was recently seen in this group. */

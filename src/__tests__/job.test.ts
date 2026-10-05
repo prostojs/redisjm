@@ -1,9 +1,10 @@
 import { afterEach, describe, it, expect, vi } from 'vitest'
-import { JobTimeoutError } from '../errors'
+import { JobAbortedError, JobTimeoutError } from '../errors'
 import { getStartPhasePayload, Job } from '../job'
 import { RedisJM } from '../redisjm'
 import type { JobContext } from '../types'
 import { createMockRedis } from './mock-redis'
+import { hung } from './unit-helpers'
 
 describe('Job', () => {
   const metadata = { jobName: 'testJob', description: 'A test job' }
@@ -446,7 +447,6 @@ describe('Job', () => {
   describe('execution timeout', () => {
     afterEach(() => { vi.useRealTimers() })
 
-    const hung = () => new Promise<void>(() => {})
 
     // WHY: a hung handler used to hold execute() (and the manager's concurrency slot) forever. With a
     // timeout, execute() must settle on its own: abort ctx.signal('timeout'), fire the error hook with
@@ -550,6 +550,237 @@ describe('Job', () => {
       expect(new Job({ jobName: 'a', timeoutMs: 250 }, vi.fn()).getTimeoutMs()).toBe(250)
       expect(new Job({ jobName: 'a', timeoutMs: 0 }, vi.fn()).getTimeoutMs()).toBe(0)
       expect(new Job({ jobName: 'a', timeoutMs: -1 }, vi.fn()).getTimeoutMs()).toBe(0)
+    })
+  })
+
+  describe('abort grace (abortGraceMs)', () => {
+    afterEach(() => { vi.useRealTimers() })
+
+
+    // WHY: with `timeoutMs` 0 a bare `await handler` meant an aborted run (ownership loss, shutdown) held
+    // execute() — and the poll-loop slot, and stop()'s drain — until the handler chose to return.
+    it('rejects with JobAbortedError once the grace after an abort elapses, even with no timeout', async () => {
+      vi.useFakeTimers()
+      const logger = vi.fn()
+      let ctxRef!: JobContext
+      let settleLate!: () => void
+      const job = new Job<string>(metadata, (_i, ctx) => {
+        ctxRef = ctx
+        return new Promise<void>((r) => { settleLate = r })
+      })
+      const onError = vi.fn()
+      const onFinish = vi.fn()
+      const onHeartbeat = vi.fn()
+      job.hook('error', onError)
+      job.hook('finish', onFinish)
+      job.hook('heartbeat', onHeartbeat)
+      const external = new AbortController()
+
+      const exec = job.execute('x', { targetGroup: 'g', signal: external.signal, abortGraceMs: 50, heartbeatInterval: 20, logger })
+      const settled = expect(exec).rejects.toBeInstanceOf(JobAbortedError)
+      await vi.advanceTimersByTimeAsync(100)
+      external.abort('manager stopped')
+      await vi.advanceTimersByTimeAsync(49)
+      expect(onError).not.toHaveBeenCalled() // still inside the grace
+      await vi.advanceTimersByTimeAsync(1)
+      await settled
+
+      expect(ctxRef.signal.reason).toBe('manager stopped')
+      expect(onError).toHaveBeenCalledTimes(1)
+      const err = onError.mock.calls[0][0].error as JobAbortedError
+      expect(err).toBeInstanceOf(JobAbortedError)
+      expect(err.reason).toBe('manager stopped')
+      expect(err.graceMs).toBe(50)
+      expect(err.message).toBe('job "testJob#x" aborted (manager stopped) and did not settle within 50ms')
+      expect(onFinish).not.toHaveBeenCalled()
+      // The heartbeat timer died with the attempt, although the handler is still pending.
+      const beats = onHeartbeat.mock.calls.length
+      await vi.advanceTimersByTimeAsync(200)
+      expect(onHeartbeat.mock.calls.length).toBe(beats)
+
+      // The late outcome of the detached handler is logged exactly once and never reaches the hooks.
+      expect(logger).not.toHaveBeenCalled()
+      settleLate()
+      await vi.advanceTimersByTimeAsync(0)
+      expect(logger).toHaveBeenCalledTimes(1)
+      expect(logger.mock.calls[0][0]).toMatch(/testJob#x.*settled after its abort \(manager stopped\)/)
+      expect(onError).toHaveBeenCalledTimes(1)
+      expect(onFinish).not.toHaveBeenCalled()
+    })
+
+    it('abortGraceMs 0 settles on the next timer tick; a payload.abort() reason is carried', async () => {
+      vi.useFakeTimers()
+      const job = new Job<string>(metadata, hung)
+      let abort!: (reason?: string) => void
+      job.hook('start', (payload) => { abort = payload.abort })
+      const exec = job.execute('x', { targetGroup: 'g', abortGraceMs: 0 })
+      const settled = expect(exec).rejects.toMatchObject({ name: 'JobAbortedError', reason: 'custom stop', graceMs: 0 })
+      await vi.advanceTimersByTimeAsync(0)
+      abort('custom stop')
+      await vi.advanceTimersByTimeAsync(0)
+      await settled
+    })
+
+    it('an Error abort reason is reported by its message; a missing one as "aborted"', async () => {
+      vi.useFakeTimers()
+      const job = new Job<string>(metadata, hung)
+      const external = new AbortController()
+      const exec = job.execute('x', { targetGroup: 'g', signal: external.signal, abortGraceMs: 10 })
+      const settled = expect(exec).rejects.toMatchObject({ reason: 'disk gone' })
+      external.abort(new Error('disk gone'))
+      await vi.advanceTimersByTimeAsync(10)
+      await settled
+    })
+
+    it('a signal that was already aborted when the handler starts begins the grace immediately', async () => {
+      vi.useFakeTimers()
+      const external = new AbortController()
+      external.abort('early')
+      const job = new Job<string>(metadata, hung)
+      const exec = job.execute('x', { targetGroup: 'g', signal: external.signal, abortGraceMs: 20 })
+      const settled = expect(exec).rejects.toMatchObject({ reason: 'early', graceMs: 20 })
+      await vi.advanceTimersByTimeAsync(20)
+      await settled
+    })
+
+    // WHY: the grace is a window for a COOPERATIVE handler — if it settles on its own inside it, its own
+    // outcome is the attempt's outcome, not a JobAbortedError.
+    it('a handler rejecting inside the grace keeps its own error; one resolving inside it finishes', async () => {
+      vi.useFakeTimers()
+      const failing = new Job<string>({ jobName: 'fail' }, (_i, ctx) => new Promise<void>((_, reject) => {
+        ctx.signal.addEventListener('abort', () => setTimeout(() => reject(new Error('cooperative bail-out')), 10))
+      }))
+      const finishing = new Job<string>({ jobName: 'done' }, (_i, ctx) => new Promise<void>((resolve) => {
+        ctx.signal.addEventListener('abort', () => setTimeout(resolve, 10))
+      }))
+      const onFinish = vi.fn()
+      finishing.hook('finish', onFinish)
+      const external = new AbortController()
+      const a = failing.execute('x', { targetGroup: 'g', signal: external.signal, abortGraceMs: 50 })
+      const b = finishing.execute('x', { targetGroup: 'g', signal: external.signal, abortGraceMs: 50 })
+      const settled = Promise.all([
+        expect(a).rejects.toThrow('cooperative bail-out'),
+        expect(b).resolves.toBeUndefined(),
+      ])
+      await vi.advanceTimersByTimeAsync(0) // both handlers are running and listening
+      external.abort('stop')
+      await vi.advanceTimersByTimeAsync(10)
+      await settled
+      expect(onFinish).toHaveBeenCalledTimes(1)
+      expect(vi.getTimerCount()).toBe(0) // the grace timers were cleared
+    })
+
+    it('a timeout shorter than the grace wins: one JobTimeoutError, one error hook, no abort timer left', async () => {
+      vi.useFakeTimers()
+      const job = new Job<string>(metadata, hung)
+      const onError = vi.fn()
+      job.hook('error', onError)
+      const external = new AbortController()
+      const exec = job.execute('x', { targetGroup: 'g', signal: external.signal, timeoutMs: 30, abortGraceMs: 100 })
+      const settled = expect(exec).rejects.toBeInstanceOf(JobTimeoutError)
+      await vi.advanceTimersByTimeAsync(30)
+      await settled
+      await vi.advanceTimersByTimeAsync(500)
+      expect(onError).toHaveBeenCalledTimes(1)
+      expect(onError.mock.calls[0][0].error).toBeInstanceOf(JobTimeoutError)
+      expect(vi.getTimerCount()).toBe(0)
+    })
+
+    it('a timeout aborting the signal does not start a second (grace) countdown', async () => {
+      vi.useFakeTimers()
+      const job = new Job<string>(metadata, hung)
+      const onError = vi.fn()
+      job.hook('error', onError)
+      const exec = job.execute('x', { targetGroup: 'g', timeoutMs: 30, abortGraceMs: 0 })
+      const settled = expect(exec).rejects.toBeInstanceOf(JobTimeoutError)
+      await vi.advanceTimersByTimeAsync(30)
+      await settled
+      expect(onError).toHaveBeenCalledTimes(1)
+    })
+
+    it('removes its abort listener from the run signal when the handler settles in time', async () => {
+      const job = new Job<string>(metadata, async () => {})
+      const spy = vi.fn()
+      const original = AbortSignal.prototype.removeEventListener
+      const patched = vi.spyOn(AbortSignal.prototype, 'removeEventListener').mockImplementation(function (this: AbortSignal, ...args: Parameters<typeof original>) {
+        spy(args[0])
+        return original.apply(this, args)
+      })
+      try {
+        await job.execute('x', { targetGroup: 'g', abortGraceMs: 50 })
+      } finally {
+        patched.mockRestore()
+      }
+      expect(spy).toHaveBeenCalledWith('abort')
+    })
+
+    it('unset / false abortGraceMs keeps today\'s contract: execute() waits for the handler', async () => {
+      vi.useFakeTimers()
+      for (const abortGraceMs of [undefined, false] as const) {
+        let release!: () => void
+        const job = new Job<string>(metadata, () => new Promise<void>((r) => { release = r }))
+        const external = new AbortController()
+        let settled = false
+        const exec = job.execute('x', { targetGroup: 'g', signal: external.signal, abortGraceMs }).then(() => { settled = true })
+        external.abort('stop')
+        await vi.advanceTimersByTimeAsync(10_000)
+        expect(settled).toBe(false)
+        release()
+        await vi.advanceTimersByTimeAsync(0)
+        await exec
+        expect(settled).toBe(true)
+      }
+    })
+
+    // WHY: an abandoned handler keeps running; its ctx writes must reach neither Redis nor the observers.
+    it('ctx.setProgress / setAttrs are inert once the attempt was abandoned (abort or timeout)', async () => {
+      vi.useFakeTimers()
+      for (const via of ['abort', 'timeout'] as const) {
+        let ctxRef!: JobContext
+        const job = new Job<string>(metadata, (_i, ctx) => { ctxRef = ctx; return hung() })
+        const onUpdate = vi.fn()
+        job.hook('update', onUpdate)
+        const external = new AbortController()
+        const exec = job.execute('x', { targetGroup: 'g', signal: external.signal, abortGraceMs: via === 'abort' ? 10 : false, timeoutMs: via === 'timeout' ? 10 : 0 })
+        const settled = expect(exec).rejects.toBeInstanceOf(via === 'abort' ? JobAbortedError : JobTimeoutError)
+        await vi.advanceTimersByTimeAsync(0)
+        // Before the abandonment the context writes as usual.
+        await ctxRef.setProgress(0.25)
+        expect(onUpdate).toHaveBeenCalledTimes(1)
+        if (via === 'abort') external.abort('stop')
+        await vi.advanceTimersByTimeAsync(10)
+        await settled
+
+        await expect(ctxRef.setProgress(0.5)).resolves.toBeUndefined()
+        await expect(ctxRef.setAttrs({ a: 1 })).resolves.toBeUndefined()
+        expect(onUpdate).toHaveBeenCalledTimes(1)
+        // Argument validation is unchanged.
+        expect(() => ctxRef.setProgress(Number.NaN)).toThrow(TypeError)
+      }
+    })
+
+    it('a run that was never abandoned keeps a live ctx', async () => {
+      const job = new Job<string>(metadata, async (_i, ctx) => { await ctx.setProgress(0.5) })
+      const onUpdate = vi.fn()
+      job.hook('update', onUpdate)
+      await job.execute('x', { targetGroup: 'g', abortGraceMs: 50 })
+      expect(onUpdate).toHaveBeenCalledTimes(1)
+    })
+
+    it('rejects an invalid abortGraceMs with a TypeError (before anything runs)', async () => {
+      const fn = vi.fn()
+      const job = new Job<string>(metadata, fn)
+      for (const bad of [-1, Number.NaN, Number.POSITIVE_INFINITY, true, '5', null]) {
+        await expect(job.execute('x', { targetGroup: 'g', abortGraceMs: bad as never })).rejects.toThrow(TypeError)
+      }
+      expect(fn).not.toHaveBeenCalled()
+    })
+
+    it('getAbortGraceMs returns the metadata value as given (number, false, or undefined)', () => {
+      expect(new Job({ jobName: 'a' }, vi.fn()).getAbortGraceMs()).toBeUndefined()
+      expect(new Job({ jobName: 'a', abortGraceMs: 250 }, vi.fn()).getAbortGraceMs()).toBe(250)
+      expect(new Job({ jobName: 'a', abortGraceMs: 0 }, vi.fn()).getAbortGraceMs()).toBe(0)
+      expect(new Job({ jobName: 'a', abortGraceMs: false }, vi.fn()).getAbortGraceMs()).toBe(false)
     })
   })
 

@@ -14,15 +14,17 @@ When running multiple instances of the same application, `@prostojs/redisjm` ens
 - Execution timeouts (`jobTimeout` / `timeoutMs`) and a hung-handler backstop (`maxRunMs`)
 - Backpressure — per-lane queue caps (`maxQueued` / `laneCaps`) and per-job in-flight limits (`maxInFlight`)
 - Execution fencing & self-heal — a staled-but-alive run resurrects on its next write (keeping its progress/attrs and lock); a genuinely superseded one can't clobber its successor's record
-- Cooperative cancellation via `ctx.signal` (ownership loss, timeout, or `stop({ abort: true })`)
+- Cooperative cancellation via `ctx.signal` (ownership loss, timeout, or `stop({ abort: true })`) — and, with `abortGraceMs`, a handler that ignores an abort is abandoned after a grace period (`JobAbortedError`) so it can't hold a slot or a shutdown hostage
 - Per-instance concurrency (`concurrency`) and per-lane concurrency (`laneConcurrency`)
 - Automatic heartbeat monitoring to detect stale/abandoned jobs
 - Progress tracking (0-1) and custom attributes per job
-- Event system (start, finish, error, retry, timeout, heartbeat, update, enqueueFailed, startFailed, memoryPressure) built on [hookable](https://github.com/unjs/hookable)
+- Event system (start, finish, error, retry, timeout, heartbeat, update, enqueueFailed, startFailed, memoryPressure, maintenance) built on [hookable](https://github.com/unjs/hookable)
 - Maintenance on its own timer — bounded, lock-guarded, compare-and-set, and still able to free memory when Redis is full
 - Memory guardrails — eviction-policy check, `health()` snapshot, `memoryPressure` alarm, per-record history TTL (Redis ≥ 7.4), inputs-size limit
 - Polling-based job execution with `start` / awaitable `stop` (graceful drain or fast abort) and `wake()` for push-style doorbells
-- Introspection — `stats()`, `health()`, `inFlight()`, `listPage()`, `queueSize()`, and terminal records observable for 60s by default
+- Introspection — `stats()`, `health()`, `inFlight()` / `inFlightCount()`, `listPage()`, `queueSize()`, and terminal records observable for 60s by default
+- Queue listing in pop order (`listQueued()`) and batch record reads (`getMany()`) — no private key names needed
+- Worker fleet registry — `fleet()` reports the live consumer instances and their capacity (`presence`, `instanceLabel`)
 - Failures visible by default — handler errors, timeouts, and start failures are logged (configurable / silenceable)
 - Rolling-deploy resilient — a job whose handler isn't registered yet is re-queued for a sibling instance instead of dropped; queued runs survive a job's lane change
 - Target group isolation — multiple app groups can share the same Redis instance
@@ -35,7 +37,7 @@ When running multiple instances of the same application, `@prostojs/redisjm` ens
 |---|---|
 | **Redis ≥ 7.0** | Enqueue, pop, and every record transition are `#!lua` shebang scripts (`EVALSHA` with an `EVAL` fallback). A flag-less shebang script is refused *up front* when Redis is at `maxmemory`, which is what guarantees that a full Redis neither half-writes an enqueue nor pops (and loses) a run. Older servers are not supported. |
 | **Redis ≥ 7.4** (recommended) | Terminal records get a hash-field TTL (`HPEXPIRE`), so history expires even when maintenance can't run. Below 7.4 this is silently skipped and maintenance's sweep reclaims expired records instead. |
-| **No Redis Cluster** | Keys are not hash-tagged and the scripts touch several keys of a group (one of them accesses lane keys it reads from a set instead of declaring them), so they can't be routed to one slot. Use a single primary (replication / failover is fine). |
+| **No Redis Cluster** | Keys are not hash-tagged and the scripts touch several keys of a group (one of them accesses lane keys it reads from a set instead of declaring them), so they can't be routed to one slot. Use a single primary (replication / failover is fine). The 0.3 scripts (fleet presence, queue listing) keep this constraint. |
 | **`maxmemory-policy noeviction`** | `allkeys-*` policies may evict queue, lock, and log keys under pressure → lost or duplicated jobs. `volatile-*` policies can't free redisjm keys (they carry no key TTL), so Redis ends up refusing writes anyway while evicting your other volatile keys. `start()` reads the policy from `INFO memory` and logs a warning for both. See [Memory & eviction](#memory--eviction). |
 
 The client is [ioredis](https://github.com/redis/ioredis) (v5).
@@ -108,6 +110,8 @@ Redis structures per target group:
 | `redisjm:{tg}:jobs:{jobName}:lanes` | Set | Lane list keys (`redisjm:{tg}:queue`, `redisjm:{tg}:lane:{lane}:queue`) this job has queue entries on — lets consumers drain a job's old lane after a lane change |
 | `redisjm:{tg}:maintenance-lock` | String (PX TTL) | Group-wide maintenance lock. Never deleted — its expiry spaces passes about one `maintenanceInterval` apart across the fleet |
 | `redisjm:{tg}:maintenance-cursor`, `…:maintenance-locks-cursor`, `…:maintenance-jobs-cursor` | String | Persisted scan cursors, so consecutive maintenance passes (on any instance) continue where the last one stopped |
+| `redisjm:{tg}:instances` | Sorted Set | instanceId -> lease expiry (Redis server ms): the live consumer instances (see [`fleet()`](#fleet-promiseredisjmfleet)). Written by every started instance with `presence` on |
+| `redisjm:{tg}:instance-info` | Hash | instanceId -> JSON `{ label?, concurrency, lanes, laneConcurrency, busy, startedAt, ttlMs }`, companion of `instances` |
 | `redisjm:{tg}:legacy-seen` | String (PX TTL) | Set while a pre-0.2 instance was recently seen in the group (mixed rolling deploy, see [Upgrading](#upgrading-from-01x)) |
 
 > A job with **no lane** keeps the exact legacy key `redisjm:{tg}:queue`; only a named lane gets its own `:lane:{lane}:queue` list. Everything else stays **group-wide** across all lanes — one lock namespace and a single monitoring pane for every worker type.
@@ -135,6 +139,9 @@ new RedisJM(redis: Redis, targetGroup: string, options?: RedisJMOptions)
 | `keepFinishedInterval` | `60000` | Milliseconds to keep finished/error/stale records in the log so `get()`/`list()` can observe the outcome. Costs memory — see [Memory & eviction](#memory--eviction). `0` opts into the legacy write-only behavior (a finished/error record is deleted in the same atomic step that ends the run; `stale` records stay until maintenance's next pass) |
 | `maintenanceInterval` | `heartbeatInterval * roundsToStale` | Milliseconds between maintenance passes on the manager's own timer while `start()` is running (`0` disables). See [Maintenance](#maintenance) |
 | `jobTimeout` | `0` (none) | Default execution timeout (ms) per attempt for every job; a job's own `timeoutMs` wins. See [Timeouts](#timeouts) |
+| `abortGraceMs` | `false` (wait) | After a run's `ctx.signal` aborts for a reason other than its timeout (ownership loss, `stop({ abort: true })`, `payload.abort()`), wait at most this many ms for the handler, then abandon it and fail the attempt with a `JobAbortedError`. `false` = wait for the handler; `0` = settle on the next tick. A job's own `abortGraceMs` wins (`false` opts a job out). `TypeError` unless `false` or a finite number `>= 0`. See [Settling aborted runs](#settling-aborted-runs) |
+| `presence` | `true` | While `start()` runs, register this instance in the group's fleet registry so `fleet()` can report live consumers and their capacity. **Costs one small Redis write (a `ZADD`) per instance per `heartbeatInterval`** — the info is rewritten only when it changes — and two small keys per group; `false` opts out. See [`fleet()`](#fleet-promiseredisjmfleet) |
+| `instanceLabel` | `''` | Free-text label stored with this instance's fleet entry (e.g. a pod name); a string of at most 200 characters, else `TypeError` |
 | `maxRunMs` | `0` (off) | Maintenance marks a `running` record `stale` once it has run longer than this, regardless of its heartbeat — a backstop for hung handlers without a timeout. See [Timeouts](#timeouts) |
 | `concurrency` | `1` | Max runs a single instance executes simultaneously (maintenance is not affected — it has its own timer). Must be a positive integer — the constructor floors it and throws `TypeError` if `< 1` or non-finite. See [Concurrency](#concurrency) |
 | `laneConcurrency` | `{}` | Per-lane cap on this instance's simultaneous poll-loop runs (`'default'` key = default lane), within `concurrency`. See [Concurrency](#concurrency) |
@@ -288,7 +295,17 @@ In-flight runs of one job name: `{ total, queued, delayed, running }` (popped-no
 const { total, running } = await manager.inFlight('send-email')
 ```
 
-> `total` can be **lower** than the lock-set size that `maxInFlight` is enforced against while that set holds drift (e.g. a lock released by a pre-0.2 instance, until maintenance prunes it) — so an enqueue can briefly report `'busy'` with `total < maxInFlight`.
+> `total` can be **lower** than the lock-set size that `maxInFlight` is enforced against while that set holds drift (e.g. a lock released by a pre-0.2 instance, until maintenance prunes it) — so an enqueue can briefly report `'busy'` with `total < maxInFlight`. For hot paths that only need the number, use [`inFlightCount()`](#inflightcountjobname-promisenumber).
+
+##### `inFlightCount(jobName): Promise<number>`
+
+The number of runs of one job holding a lock — queued (including popped-not-yet-claimed), delayed and running — as **one O(1) `SCARD`** of the job's lock set; no records are read. It is exactly what `maxInFlight` is enforced against: an enqueue answers `'busy'` iff this is `>= maxInFlight` at that instant. Use it instead of `inFlight()` to gate work on a hot path; call it for several jobs with `Promise.all`.
+
+```typescript
+if (await manager.inFlightCount('send-email') >= 10) return // shed load
+```
+
+> In a group where a pre-0.2 instance still writes, the count drifts — see [Upgrading to 0.3](#upgrading-to-03).
 
 ##### `queueSize(lane?): Promise<number>`
 
@@ -320,6 +337,33 @@ do {
 ```
 
 > Filters are applied to the scanned records, and one call keeps scanning until it has about `limit` matches or reaches the end — a very selective filter can make a single call scan much of the log. `HSCAN` semantics apply: a record may appear on two pages if the log changes meanwhile.
+
+##### `listQueued(options?): Promise<QueuedPage>`
+
+The runs waiting to run, **in the order they leave the queue**, from one atomic read-only snapshot (a single script; works under `maxmemory` and on replicas). Inputs never leave Redis. Options: `lane` (`'default'` = default lane; omitted → every lane the group has entries on), `jobName`, `limit` (default `100`, max `1000`), `offset` (default `0`; cost grows with it). Returns `{ entries, nextOffset?, complete }`; `nextOffset` is absent once the sequence is exhausted.
+
+The order is: runs **popped but not yet claimed** (by pop time), then the **lane lists head to tail** (a `queueFirst` insert is at the head), then the **delayed** set by `readyAt` (each is pushed to the tail of its lane when it falls due). With a `lane` this is the order in which the current entries leave that lane (absent new head inserts); **across lanes there is no global pop order** — consumers interleave lanes per `laneStrategy`. Without `lane`: `default` first, then the other lanes alphabetically; the reserved `__maintenance` lane only when asked for explicitly.
+
+```typescript
+let page = await manager.listQueued({ lane: 'images', limit: 50 })
+while (page.nextOffset !== undefined) {
+  render(page.entries) // { jobId, jobName, runId, lane?, status: 'queued' | 'delayed', poppedAt?, readyAt? }
+  page = await manager.listQueued({ lane: 'images', limit: 50, offset: page.nextOffset })
+}
+```
+
+- The lane of a delayed or popped entry lives only in its record, so a `lane` filter (and the `lane` of each returned delayed/popped entry) is resolved **inside the script** with `cjson` — at most 500 record decodes and 10 000 walked entries per call, on the Redis thread (decode cost grows with record size; keep inputs small or pointer-sized). Hitting a bound stops the listing early with **`complete: false`** — narrow it with `lane` / `jobName`. Expect it when a page needs more than 500 decodes (no `lane` filter, many delayed or popped entries inside the page). An entry whose record is missing or unreadable has no `lane` and is excluded by a lane filter.
+- Without `lane`, the lanes to read are discovered client-side first — from this instance's registered jobs and the per-job lane sets (a registry `SMEMBERS`, then one pipelined read; with `jobName`, only that job's set): two small round trips before the script. A lane written only by a pre-0.2 producer is listed only when you pass it as `lane`.
+- Pre-0.2 consumers pop without a `claiming` entry, so runs they popped are invisible until claimed (then `running`, not listed).
+- Same exposure as `listPage()` / `get()`: runIds can carry entity ids — gate any admin endpoint built on it.
+
+##### `getMany(jobIds): Promise<Array<JobLogRecord | undefined>>`
+
+Records for many jobIds in **one round trip** (a pipeline of `HMGET`s, 500 fields per command), in input order — duplicates included; `undefined` for a missing or unparseable record. Inputs are included, as with `get()`. `[]` makes no Redis call; a Redis error rejects.
+
+```typescript
+const records = await manager.getMany(page.entries.map((e) => e.jobId))
+```
 
 ##### `get(jobId): Promise<JobLogRecord | undefined>`
 
@@ -376,10 +420,10 @@ await publisher.publish('jobs:doorbell', '1')
 
 ##### `stop(options?): Promise<void>`
 
-Stops the polling loop, the maintenance timer, and every `every()` timer, and resolves once **all** in-flight runs have settled — so a shutdown handler can `await` a drain before exiting. It also awaits an in-flight maintenance pass and in-flight `popAndExecute()` calls, and makes `popAndExecute()` return `false` until the next `start()`. Two modes:
+Stops the polling loop, the maintenance timer, and every `every()` timer, and resolves once **all** in-flight runs have settled — so a shutdown handler can `await` a drain before exiting. It also awaits an in-flight maintenance pass and in-flight `popAndExecute()` calls, and makes `popAndExecute()` return `false` until the next `start()`. This instance also leaves the [fleet registry](#fleet-promiseredisjmfleet) first thing. Two modes:
 
 - **Graceful (default)** — `stop()` stops popping new work and awaits the runs already in flight to finish on their own.
-- **Fast (`stop({ abort: true })`)** — additionally aborts every in-flight run's `ctx.signal` (reason `'manager stopped'`) so cooperative handlers can bail out early. Abort is cooperative: nothing forcibly kills a handler; `stop()` still awaits every run to settle. A handler that ignores its signal is awaited only until its [execution timeout](#timeouts), when one is set. See [Cancellation](#cancellation).
+- **Fast (`stop({ abort: true })`)** — additionally aborts every in-flight run's `ctx.signal` (reason `'manager stopped'`) so cooperative handlers can bail out early. Abort is cooperative: nothing forcibly kills a handler; `stop()` still awaits every run to settle. A handler that ignores its signal is awaited only until its [execution timeout](#timeouts), when one is set — or, with [`abortGraceMs`](#settling-aborted-runs), only until that many ms after the abort: it is then abandoned, its attempt fails with a `JobAbortedError` and `stop()` resolves (see [Settling aborted runs](#settling-aborted-runs) for what that does to the run). See [Cancellation](#cancellation).
 
 For locks to release cleanly, prefer graceful shutdown (`stop()` on `SIGTERM`); a hard `SIGKILL` leaves locks that maintenance reclaims after the stale threshold.
 
@@ -400,6 +444,29 @@ setInterval(() => { manager.runMaintenance().catch(() => {}) }, 10_000)
 ##### `performMaintenance(): Promise<MaintenanceResult>`
 
 One full, **unguarded** maintenance pass (no lock). Kept for manual/one-off use (scripts, tests); on a timer, prefer `runMaintenance()` so the fleet runs about one pass per interval instead of one per instance. The pass itself is safe to overlap (every write is compare-and-set), just redundant. Returns `{ staleCount, cleanedCount, requeuedCount, mode: 'full' }` — see [Maintenance](#maintenance) for what each stage does.
+
+##### `fleet(): Promise<RedisJMFleet>`
+
+The live **consumer instances** of the group — those running `start()` with `presence` on — and their capacity, from one read-only script (O(instances); works under `maxmemory` and on replicas):
+
+```typescript
+const { instances, slots, busy, lanes } = await manager.fleet()
+const wave = lanes['images']?.slots ?? 0   // how many image runs the fleet can execute at once
+```
+
+| Field | Meaning |
+|---|---|
+| `instances[]` | `{ instanceId, label?, concurrency, lanes, laneConcurrency, busy, startedAt, seenAt, expiresAt }`, sorted by `instanceId`. `lanes` = the lane labels it consumes (`'default'` for the default lane); `busy` = its poll-loop runs in flight at its last refresh; `seenAt` / `expiresAt` are Redis **server** ms |
+| `slots`, `busy` | Σ `concurrency`, Σ `busy` |
+| `lanes` | Per lane `{ instances, slots }` where `slots` = Σ `min(concurrency, laneConcurrency[lane] ?? concurrency)`. Lanes **share** each instance's `concurrency`, so lane slots do not add up across lanes |
+
+Liveness is a lease: a started instance refreshes its entry every `heartbeatInterval` and it lapses after `heartbeatInterval × roundsToStale` — **on Redis server time**, so client clock skew is irrelevant — exactly like its runs go stale. (An instance whose event loop is pinned lapses too; raise `roundsToStale` for CPU-heavy work and both widen.) `stop()` removes the entry at its start; the refresh also prunes lapsed entries. The entry is rebuilt on every refresh, so jobs registered after `start()` show up on the next one. A refresh refused under `maxmemory` is logged once per episode and the instance lapses after its ttl — truthful, since a full Redis refuses every pop anyway.
+
+**Not counted:** drain workers that only call `popAndExecute()`, producer-only processes, instances with `presence: false`, and **instances older than 0.3.0** — during a rolling deploy `fleet()` under-counts until the rollout completes.
+
+##### `getInstanceId(): string`
+
+This manager's id in the fleet registry: a random UUID, fixed for the manager's lifetime (it survives `stop()` / `start()`), for tying a log line or a `fleet()` entry back to a process. Pair it with the `instanceLabel` option (e.g. the pod name).
 
 ##### `registerJob(job): void`
 
@@ -444,6 +511,7 @@ new Job<TInputs, TAttrs>(metadata: JobMetadata, fn: JobFunction<TInputs, TAttrs>
 | `attempts` | `1` | Total attempts including the first; floored, clamped ≥ 1. See [Retries](#retries) |
 | `backoff` | `0` | Ms before the next retry: a number or `(failedAttempt) => ms`; negatives/non-finite → `0` |
 | `timeoutMs` | manager `jobTimeout` | Execution timeout per attempt; `0` disables the manager default for this job. See [Timeouts](#timeouts) |
+| `abortGraceMs` | manager `abortGraceMs` | Grace after an abort (not a timeout) before the attempt is abandoned with a `JobAbortedError`; `false` opts this job out of the manager default. See [Settling aborted runs](#settling-aborted-runs) |
 | `maxQueued` | — | Enqueue cap on this job's lane list (combined with `laneCaps`; the smaller wins) → `'full'`. See [Backpressure](#backpressure) |
 | `maxInFlight` | unlimited | Max runs of this job holding a lock at once (queued + delayed + running, any runId, all instances) → `'busy'`. `1` = single-flight |
 | `maxInputsBytes` | manager `maxInputsBytes` | Max JSON-serialized inputs size; `0` disables the manager default for this job |
@@ -464,6 +532,7 @@ type JobFunction<TInputs, TAttrs> = (
 - `setProgress` throws a `TypeError` on a non-finite value and clamps the result into `[0, 1]`.
 - `setAttrs` **merges** into the record's existing attributes (successive calls accumulate keys); it does not replace them.
 - `signal` aborts on ownership loss, execution timeout (reason `'timeout'`), or `stop({ abort: true })` — see [Cancellation](#cancellation).
+- Once an attempt was **abandoned** (its timeout or `abortGraceMs` elapsed), the detached handler's `setProgress` / `setAttrs` no longer reach the record or the `update` event — see [Timeouts](#timeouts).
 
 #### Methods
 
@@ -480,11 +549,12 @@ interface JobExecuteOptions {
   logger?: RedisJMLogger      // sink for infra errors (failed heartbeat write, throwing error hook, late handler settle)
   signal?: AbortSignal        // external abort plumbed into ctx.signal (e.g. shutdown)
   timeoutMs?: number          // execution timeout; rejects with JobTimeoutError on expiry
+  abortGraceMs?: number | false // after an abort (not the timeout): rejects with JobAbortedError once the handler is still pending after this many ms
   attempt?: number            // 1-based attempt stamped on every event payload (default 1)
 }
 ```
 
-All of these are wired automatically when a run is dispatched by `start()`/`popAndExecute()` (`timeoutMs` = the job's `timeoutMs` ?? the manager's `jobTimeout`); you set them only when calling `execute()` directly.
+All of these are wired automatically when a run is dispatched by `start()`/`popAndExecute()` (`timeoutMs` = the job's `timeoutMs` ?? the manager's `jobTimeout`, `abortGraceMs` likewise); you set them only when calling `execute()` directly.
 
 ##### `enqueue(runId, inputs, manager?, options?): Promise<EnqueueResult>`
 
@@ -538,6 +608,10 @@ Thrown by `enqueue` / `enqueueMany` / `queue` / `queueFirst` (and their `Job` co
 
 The error an attempt fails with when it exceeds its execution timeout (`name === 'JobTimeoutError'`, field `timeoutMs`). It is an ordinary failure: it reaches the `error` hooks and `attempts`/`backoff` apply. See [Timeouts](#timeouts).
 
+#### `JobAbortedError`
+
+The error an attempt fails with when its `ctx.signal` aborted — for a reason other than its execution timeout — and the handler did not settle within `abortGraceMs` (`name === 'JobAbortedError'`, fields `reason` = the abort reason, e.g. `'manager stopped'`, and `graceMs`). An ordinary failure: it reaches the `error` hooks, `attempts`/`backoff` apply, and the attempt **is consumed**. A handler that settles on its own inside the grace decides the outcome itself. See [Settling aborted runs](#settling-aborted-runs).
+
 #### `RunSupersededError`
 
 Thrown out of an execution whose popped entry no longer owns its log record (a successor or concurrent claimant claimed it first). The manager treats it as a benign skip.
@@ -580,6 +654,7 @@ Both `Job` and `RedisJM` emit events via [hookable](https://github.com/unjs/hook
 | `enqueueFailed` | `{ jobId, jobName, runId, reason, error }` | **manager only** | An enqueue threw `RedisJMEnqueueError` (fired right before it is thrown) |
 | `startFailed` | `{ jobId, jobName, runId, reason, action, error, attempt? }` | **manager only** | A popped run failed to start; `action` says how it was recovered — see [Start-failure recovery](#start-failure-recovery) |
 | `memoryPressure` | a `health()` snapshot | **manager only** | Redis memory crossed `memoryWarnRatio` (from the maintenance timer; once per crossing) |
+| `maintenance` | `{ result, failedOps, error?, reason?, durationMs }` | **manager only** | A maintenance pass THIS instance ran finished (timer, `runMaintenance()`, `performMaintenance()`, the legacy job), or could not run because of an error. Not fired when another instance holds the lock. On the timer it fires before `memoryPressure` — see [Maintenance](#maintenance-hook) |
 
 `RedisJM` re-dispatches run events only when `targetGroup` matches (and, when a `manager` is stamped, only on the manager that drove the run) and updates the Redis log accordingly.
 
@@ -590,7 +665,7 @@ Both `Job` and `RedisJM` emit events via [hookable](https://github.com/unjs/hook
 
 **`error` vs `retry` (retry semantics):**
 
-- The **job-level** `error` hook (`job.hook('error', …)`) fires on **every** failed attempt (handler throw, execution timeout, or a job-level `start` hook that threw after the claim), including ones that will be retried.
+- The **job-level** `error` hook (`job.hook('error', …)`) fires on **every** failed attempt (handler throw, execution timeout, an abandoned abort — `JobAbortedError` — or a job-level `start` hook that threw after the claim), including ones that will be retried.
 - The **manager-level** `error` event (`manager.hook('error', …)`) fires only on **final** failure — the last attempt exhausted the `attempts` budget.
 - The **manager-level** `retry` event fires once per scheduled retry in between (payload adds `error`, the 1-based `attempt` that failed, and `nextAttemptAt` — epoch-ms the retry becomes poppable). See [Retries & delayed runs](#retries--delayed-runs).
 
@@ -676,7 +751,9 @@ manager.hook('timeout', ({ runId, timeoutMs }) => console.warn(`sync ${runId} ti
 
 - On expiry the run's `ctx.signal` aborts with reason `'timeout'` and the attempt fails with a `JobTimeoutError` — an ordinary failure, so `attempts`/`backoff` apply. The manager fires `timeout`, then `retry` or `error` for that attempt.
 - The slot frees **immediately**, even if the handler never settles.
-- **The handler is not killed** — JavaScript can't. An abandoned attempt keeps running detached; its record writes (`setProgress`/`setAttrs`) are fenced out, and if it later settles or rejects that is logged once (never an unhandled rejection). A **retry can overlap the abandoned attempt**, so handlers must observe `ctx.signal` (pass it to `fetch`, DB drivers, …) and be idempotent.
+- **The handler is not killed** — JavaScript can't. An abandoned attempt keeps running detached; its record writes (`setProgress`/`setAttrs`) are fenced out — a rejected write changes nothing and fires no `update` event; if it later settles or rejects that is logged once (never an unhandled rejection). A **retry can overlap the abandoned attempt**, so handlers must observe `ctx.signal` (pass it to `fetch`, DB drivers, …) and be idempotent.
+
+The same settle-and-abandon mechanism can be applied to every *other* abort reason — see [Settling aborted runs](#settling-aborted-runs).
 
 **`maxRunMs` backstop** (off by default): maintenance marks a `running` record `stale` (`staleReason: 'maxRunMs'`, lock released) once `now - startedAt > maxRunMs`, **regardless of its heartbeat**. Unlike a heartbeat stale, the run cannot resurrect itself: its heartbeats and updates are rejected and its `ctx.signal` aborts on its next heartbeat. Its own outcome still lands, as for any stale-but-owned run — a later finish records `finished`, and a throw schedules a retry when attempts remain (else `error`). Pick a value comfortably above your slowest healthy run; it measures a single attempt (from that attempt's `startedAt`), so it doesn't need to cover retries. Detection happens when maintenance's scan reaches the record (see [Maintenance](#maintenance)).
 
@@ -734,6 +811,10 @@ const manager = new RedisJM(redis, 'my-app', {
 
 The poll loop doesn't pop from a lane at its cap; when one of its runs settles, the loop re-polls right away. Lanes without an entry are limited only by `concurrency`. Runs started by `popAndExecute()` are not counted.
 
+### Fleet capacity
+
+Concurrency and lane caps are per instance; to size work against the whole group (how many runs of a lane can execute at once across every pod) read [`fleet()`](#fleet-promiseredisjmfleet) — it knows each live instance's real `concurrency` and `laneConcurrency` and the lanes it actually consumes, which an environment constant times a pod count does not.
+
 ## Backpressure
 
 Without limits, a producer that outruns its consumers grows the queue until Redis runs out of memory. Two atomic, reject-only limits are enforced **inside the enqueue script**, so concurrent producers can't race past them:
@@ -761,7 +842,7 @@ if (status === 'full') return reply(503, 'queue is full, try later')
 
 **`maxInFlight`** (per job): an enqueue while the job already has `>= maxInFlight` runs holding a lock — queued, delayed, or running, across all runIds and instances — returns `'busy'` and writes nothing. It applies to every producer (timers, `every()`, manual triggers). `every()`'s `skipIfInFlight` is the per-`runId` equivalent.
 
-**Watching it:** `inFlight(jobName)` for per-job counts (O(runs of that job) — fine for dashboards and occasional gating, not for every enqueue on a hot path; the enqueue already enforces the limits atomically), `health()` for lane lengths and memory.
+**Watching it:** `inFlightCount(jobName)` for the exact number `maxInFlight` is enforced against (one O(1) `SCARD` — fine on a hot path), `inFlight(jobName)` for the per-status split (O(runs of that job) — dashboards and occasional use), `listQueued()` for what is waiting and in which order, `health()` for lane lengths and memory.
 
 ## Cancellation
 
@@ -783,6 +864,32 @@ manager.createJob({ jobName: 'export' }, async (inputs: { rows: Row[] }, ctx) =>
 ```
 
 User hooks can also trigger this signal via `payload.abort(reason?)` as a custom kill-switch.
+
+### Settling aborted runs
+
+By default an abort only flips `ctx.signal`: `execute()` keeps waiting for the handler, so a handler that ignores its signal holds its concurrency slot — and `stop()`'s drain — until it returns (or until its timeout). Set `abortGraceMs` (manager default, per job, or on `execute()`) to bound that:
+
+```typescript
+const manager = new RedisJM(redis, 'my-app', { abortGraceMs: 5_000 })
+manager.hook('error', ({ error }) => {
+  if (error instanceof JobAbortedError) console.warn(`aborted (${error.reason}), gave up after ${error.graceMs}ms`)
+})
+```
+
+- When the signal aborts for any reason **other than the run's own timeout** — ownership loss, `stop({ abort: true })`, `payload.abort()`, an external `signal` — the handler gets `abortGraceMs` ms to settle on its own. A handler that rejects inside the grace (e.g. a cooperative `AbortError`) has **its own error** as the attempt's error; one that resolves inside it finishes normally. Only a handler still pending at the end of the grace is **abandoned**: `execute()` rejects with a [`JobAbortedError`](#jobabortederror), the slot frees, `stop()` can resolve.
+- `0` settles on the next timer tick. A timeout shorter than the grace wins (`JobTimeoutError`).
+- Like a timed-out attempt, the abandoned handler **keeps running detached** — see [Timeouts](#timeouts); its heartbeat is stopped and nothing it does can overwrite the record. A retry (or successor) may overlap it: [Delivery guarantees](#delivery-guarantees).
+- **An abandoned attempt consumes an attempt**, exactly like a handler that throws on abort or a timeout. With the default `attempts: 1`, a run abandoned by `stop({ abort: true })` ends `error` and is **not** re-run; set `attempts > 1` (with a `backoff`) if an aborted run must be re-run elsewhere.
+
+What happens to the state of an abandoned run (the existing failure path, fenced on the run's `executionId`):
+
+| Abort cause | Record | Lock | Manager events |
+|---|---|---|---|
+| `stop({ abort: true })`, record still ours | attempts left → `delayed` (`readyAt = now + backoff`, delayed-set entry); else `error` | retry: kept; final: released | `retry` or `error` |
+| Superseded (re-enqueued and re-claimed elsewhere) | untouched | untouched (the successor's) | none |
+| `maxRunMs` stale (still our run) | like a handler throw on a stale-but-owned run: retry → `delayed`, else `error` | as left | `retry` or `error` |
+| Unqueued mid-run | nothing to write; the lock nothing backs is released | released | `error` |
+| `payload.abort()` / direct `execute({ signal })` | as the first row when owned; a direct `execute()` writes nothing | — | job `error` hook |
 
 ## Failure handling
 
@@ -842,7 +949,7 @@ redisjm is **not exactly-once**. Write handlers to be **idempotent** and to obse
 
 When a run can execute **more than once**:
 
-- A timed-out attempt keeps running detached while its retry starts.
+- A timed-out attempt — or one abandoned by [`abortGraceMs`](#settling-aborted-runs) — keeps running detached while its retry (or a successor) starts; detached handlers don't count against `concurrency`.
 - A handler that pinned the event loop past the stale threshold was staled; a producer re-enqueued the same `runId` and a successor ran while the original was still going (its record writes are fenced, its side effects are not).
 
 When a run can **end without completing**:
@@ -896,6 +1003,25 @@ Any other lock error (connection, timeout, read-only replica) is logged and the 
 | `mode` | `'full'` or `'emergency'` |
 
 After each timer pass the manager also checks memory pressure (see below).
+
+### `maintenance` hook
+
+`manager.hook('maintenance', …)` fires after every pass **this instance ran** — the timer, `runMaintenance()`, `performMaintenance()`, the legacy maintenance job — or when a pass **could not run because of an error**. It does **not** fire for the normal "another instance holds the lock" skip (that would fire on every instance every tick). On the timer it fires before `memoryPressure`. Like every manager hook it is an isolated observer.
+
+| Payload field | Meaning |
+|---|---|
+| `result` | The `MaintenanceResult` (`mode: 'full' \| 'emergency'`); `null` when the lock read failed or the pass threw |
+| `failedOps` | Redis operations that failed and were skipped inside the pass (the pass still completed) |
+| `error`, `reason` | The first failure — the thrown error, the lock error, or the first failed operation — and its classified `RedisErrorReason` |
+| `durationMs` | Wall-clock ms of the pass itself (lock acquisition excluded); for a lock failure, of the failed lock attempt |
+
+```typescript
+manager.hook('maintenance', ({ result, failedOps, reason, durationMs }) => {
+  metrics.gauge('redisjm.maintenance.last_pass_ts', Date.now())     // alarm on staleness of this metric
+  if (!result || failedOps > 0) metrics.increment('redisjm.maintenance.failures', 1, { reason })
+  if (result) metrics.timing('redisjm.maintenance.duration_ms', durationMs)
+})
+```
 
 ## Memory & eviction
 
@@ -1017,8 +1143,10 @@ Roll a lane-aware version out to **every** instance in the group **before** any 
 - [ ] Redis ≥ 7.0 (≥ 7.4 for history TTLs), standalone primary — not Cluster.
 - [ ] `maxmemory` set, `maxmemory-policy noeviction`, ideally a dedicated instance; no startup warning from redisjm about the policy.
 - [ ] Memory alarm wired: `memoryPressure` hook and/or `health()` in your metrics (`usedRatio`, `oomRefusals`, `claiming`, queue lengths).
+- [ ] `maintenance` hook wired to metrics / run history: alarm when no pass has been seen for a few intervals or `failedOps > 0`.
 - [ ] `jobTimeout` (or per-job `timeoutMs`) set for every job that does I/O; handlers pass `ctx.signal` to their I/O and are idempotent.
 - [ ] `maxRunMs` set above your slowest healthy run, as a backstop.
+- [ ] `abortGraceMs` set if shutdown must be bounded against handlers that ignore `ctx.signal` (and `attempts > 1` for runs that must survive an abort).
 - [ ] Producers handle every enqueue outcome: `deduped`/`busy`/`full` vs `RedisJMEnqueueError` — never report an error as "already running". `enqueueFailed` wired to metrics.
 - [ ] Queue growth bounded: `laneCaps`/`maxQueued` for lanes fed by external traffic; `maxInputsBytes` set.
 - [ ] `keepFinishedInterval` sized for throughput (lower it for high-volume jobs observed via hooks).
@@ -1026,6 +1154,20 @@ Roll a lane-aware version out to **every** instance in the group **before** any 
 - [ ] Graceful shutdown: `await manager.stop()` on `SIGTERM` before closing Redis.
 - [ ] Clocks synced (NTP) across instances.
 - [ ] Lane changes shipped in a separate deploy from library upgrades.
+
+## Upgrading to 0.3
+
+0.3 adds features (`abortGraceMs`, `inFlightCount()`, `fleet()`, `listQueued()` / `getMany()`, the `maintenance` hook) and **no Redis format change to existing keys**; Redis ≥ 7.0 and standalone remain the requirements. What to know:
+
+| Change | What to do |
+|---|---|
+| **`presence` is on by default.** Every instance that calls `start()` now writes one small fleet entry per `heartbeatInterval` and adds two keys per group (`instances`, `instance-info`). | Nothing, if the cost is fine. `presence: false` opts out (and then `fleet()` doesn't see the instance). Set `instanceLabel` (e.g. the pod name) to make entries recognizable. |
+| **A fenced `ctx` write no longer emits `update`** — a detached (timed-out / abandoned) handler's `setProgress` / `setAttrs` used to fire the manager `update` event even though the write was rejected; now only a write that landed does. | Nothing; don't rely on `update` events from detached handlers. |
+| **`abortGraceMs` is opt-in** (an abort still waits for the handler unless you set it). An abandoned attempt consumes an attempt. | Set it where shutdown or slot-holding must be bounded; see [Settling aborted runs](#settling-aborted-runs). |
+| **[`fleet()`](#fleet-promiseredisjmfleet) under-counts during a rolling deploy:** instances older than 0.3.0 never register. | Keep any fallback capacity estimate until every consumer runs ≥ 0.3.0. |
+| **[`inFlightCount()`](#inflightcountjobname-promisenumber) drifts with 0.1.x instances** in the group (their enqueues/finishes don't maintain the per-job lock sets) — same as `maxInFlight` / `inFlight()`; exact in a pure ≥ 0.2 group. | Don't gate on it until no 0.1.x instance remains. |
+| **[`listQueued()`](#listqueuedoptions-promisequeuedpage) is blind to pre-0.2 consumers' pops** (no `claiming` entry) and to lanes only a pre-0.2 producer wrote, unless the lane is passed explicitly. | Pass `lane` explicitly for such lanes during a mixed deploy. |
+| **The `maintenance` hook** only fires on ≥ 0.3.0 instances (0.1.x maintenance, a queued job, never did). | Wire it on the 0.3 instances. |
 
 ## Upgrading from 0.1.x
 
@@ -1171,11 +1313,14 @@ interface StopOptions { abort?: boolean }
 | `EveryOptions` | `every()` options |
 | `InFlightCounts` | `inFlight()` result `{ total, queued, delayed, running }` |
 | `ListPageOptions`, `ListPage` | `listPage()` options / result |
+| `ListQueuedOptions`, `QueuedEntry`, `QueuedPage` | `listQueued()` options / entry `{ jobId, jobName, runId, lane?, status, poppedAt?, readyAt? }` / page `{ entries, nextOffset?, complete }` |
+| `FleetInstance`, `RedisJMFleet` | `fleet()` result — see [`fleet()`](#fleet-promiseredisjmfleet) |
+| `MaintenanceEventPayload` | `maintenance` hook payload `{ result, failedOps, error?, reason?, durationMs }` |
 | `RedisJMHealth` | `health()` result |
 | `RedisJMStats` | `stats()` result `{ queues, delayed, locks, statuses }` |
 | `MaintenanceResult` | `{ staleCount, cleanedCount, requeuedCount, mode }` |
 
-Exported classes, functions and values: `RedisJM`, `Job`, `RedisJMEnqueueError`, `JobTimeoutError`, `RunSupersededError`, `classifyRedisError`, `createMaintenanceJob`, `MAINTENANCE_JOB_NAME` (`'__redisjm_maintenance'`), and `MAINTENANCE_LANE` (`'__maintenance'`).
+Exported classes, functions and values: `RedisJM`, `Job`, `RedisJMEnqueueError`, `JobTimeoutError`, `JobAbortedError`, `RunSupersededError`, `classifyRedisError`, `createMaintenanceJob`, `MAINTENANCE_JOB_NAME` (`'__redisjm_maintenance'`), and `MAINTENANCE_LANE` (`'__maintenance'`).
 
 ## License
 

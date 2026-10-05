@@ -1,6 +1,6 @@
 export { RedisJM, RunSupersededError } from './redisjm'
 export { Job } from './job'
-export { classifyRedisError, JobTimeoutError, RedisJMEnqueueError } from './errors'
+export { classifyRedisError, JobAbortedError, JobTimeoutError, RedisJMEnqueueError } from './errors'
 export type { EnqueueErrorReason, RedisErrorReason } from './errors'
 export { createMaintenanceJob, MAINTENANCE_JOB_NAME, MAINTENANCE_LANE } from './maintenance'
 export type {
@@ -8,6 +8,7 @@ export type {
   EnqueueOptions,
   EnqueueResult,
   EveryOptions,
+  FleetInstance,
   InFlightCounts,
   JobAttrs,
   JobAttrValue,
@@ -26,8 +27,13 @@ export type {
   LaneStrategy,
   ListPage,
   ListPageOptions,
+  ListQueuedOptions,
+  MaintenanceEventPayload,
   MaintenanceResult,
+  QueuedEntry,
+  QueuedPage,
   QueueOptions,
+  RedisJMFleet,
   RedisJMHealth,
   RedisJMHooks,
   RedisJMLogger,

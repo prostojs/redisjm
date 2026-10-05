@@ -310,6 +310,199 @@ end
 return deleted
 `)
 
+/** Lua snippet shared by the fleet scripts: `now` = Redis SERVER time in ms (client clock skew is irrelevant). */
+const LUA_NOW_MS = `local t = redis.call('TIME')
+local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)`
+
+/**
+ * Fleet presence refresh: prunes instances whose lease lapsed (at most 100 per call, only when there are
+ * some) and renews the calling instance's lease — its expiry (`now + ttl`, Redis SERVER time) in the
+ * `instances` zset. The info JSON in the `instance-info` hash is written only when passed (ARGV 3
+ * non-empty); without it, an instance whose info is gone from the hash (lapsed and pruned, flushed) is NOT
+ * re-registered and the script returns `1` so the caller resends WITH its info. Flag-less shebang script:
+ * under maxmemory the whole refresh is refused up front (the instance then lapses after its ttl, which is
+ * truthful — a Redis at maxmemory refuses every pop anyway). Returns `0` on success.
+ *
+ * KEYS: 1 instances zset, 2 instance-info hash. ARGV: 1 instanceId, 2 ttlMs, 3 info JSON or ''.
+ */
+export const PRESENCE_SCRIPT = defineScript(`#!lua
+-- redisjm:presence v2
+${LUA_NOW_MS}
+local dead = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', now, 'LIMIT', 0, 100)
+if #dead > 0 then
+  for _, id in ipairs(dead) do
+    redis.call('HDEL', KEYS[2], id)
+    redis.call('ZREM', KEYS[1], id)
+  end
+end
+if ARGV[3] ~= '' then
+  redis.call('HSET', KEYS[2], ARGV[1], ARGV[3])
+elseif redis.call('HEXISTS', KEYS[2], ARGV[1]) == 0 then
+  return 1
+end
+redis.call('ZADD', KEYS[1], now + tonumber(ARGV[2]), ARGV[1])
+return 0
+`)
+
+/**
+ * Fleet read: the live instances (lease not yet lapsed on Redis SERVER time) with their info JSON.
+ * Read-only (`no-writes`: runs under maxmemory and on replicas); the lapsed entries are left for the next
+ * presence refresh to prune.
+ *
+ * KEYS: 1 instances zset, 2 instance-info hash.
+ * Returns `{ now, id1, expiresAt1, infoJson1, id2, … }` (`infoJson` is nil when the hash field is gone).
+ */
+export const FLEET_SCRIPT = defineScript(`#!lua flags=no-writes
+-- redisjm:fleet v1
+${LUA_NOW_MS}
+local live = redis.call('ZRANGEBYSCORE', KEYS[1], '(' .. now, '+inf', 'WITHSCORES')
+local out = { now }
+for i = 1, #live, 2 do
+  out[#out + 1] = live[i]
+  out[#out + 1] = live[i + 1]
+  out[#out + 1] = redis.call('HGET', KEYS[2], live[i])
+end
+return out
+`)
+
+/**
+ * Queue listing in pop order — one atomic, read-only snapshot (`no-writes`: runs under maxmemory and on
+ * replicas). The ordered sequence is: runs popped and not yet claimed (`claiming`, by pop time), then the
+ * lane lists in the given order (head → tail), then the delayed set (by `readyAt`). Entries are filtered
+ * by an optional job-name prefix and an optional lane label; `offset` matching entries are skipped and up
+ * to `limit` returned (plus one match of lookahead to know whether more exist).
+ *
+ * The delayed and claiming sets hold bare jobIds, so THEIR lane lives only in the record: it is resolved
+ * server-side with `cjson.decode` (never shipping records to the client; a string search for `"lane"`
+ * would be unsafe — 0.1.x records serialize `inputs` BEFORE `lane`, so nested input keys could match) —
+ * for every candidate under a lane filter, otherwise only for entries that land in the page. Records are
+ * decoded at most `decodeCap` times and at most `scanCap` entries are walked per call; hitting either stops
+ * the listing early (`complete = 0`). Without a job filter, list / zset prefixes are skipped
+ * arithmetically (`LLEN` / `ZCARD`), so only the window is read.
+ *
+ * KEYS: 1 claiming zset, 2 delayed zset, 3 log hash, 4.. lane lists in output order.
+ * ARGV: 1 lane filter label ('' = none), 2 job prefix (`'<name>#'` or ''), 3 offset, 4 limit, 5 decode cap,
+ *       6 scan cap, then one lane label per lane list (ARGV[6 + n] labels KEYS[3 + n]).
+ * Returns `{ complete, more, kind, id, score, lane, kind, … }` — kind `'c'` claiming / `'l'` list /
+ * `'d'` delayed, score = pop time / '' / readyAt, lane = label ('' when unknown).
+ */
+export const LIST_QUEUED_SCRIPT = defineScript(`#!lua flags=no-writes
+-- redisjm:list-queued v1
+local LIST_CHUNK = 500
+local ZSET_CHUNK = 100
+local filterLane = ARGV[1]
+local prefix = ARGV[2]
+local offset = tonumber(ARGV[3])
+local limit = tonumber(ARGV[4])
+local decodeCap = tonumber(ARGV[5])
+local scanCap = tonumber(ARGV[6])
+local plain = prefix == '' and filterLane == ''
+local decodes = 0
+local scanned = 0
+local skipped = 0
+local count = 0
+local more = 0
+local complete = 1
+local out = {}
+
+-- A run's lane label from its record ('' = no record / unreadable); nil when the decode cap is spent.
+local function resolveLane(id)
+  if decodes >= decodeCap then return nil end
+  decodes = decodes + 1
+  local raw = redis.call('HGET', KEYS[3], id)
+  if not raw then return '' end
+  local ok, rec = pcall(cjson.decode, raw)
+  if not ok or type(rec) ~= 'table' then return '' end
+  local lane = rec['lane']
+  if type(lane) ~= 'string' or lane == '' or lane == 'default' then return 'default' end
+  return lane
+end
+
+-- Considers one entry; returns true when the listing is finished.
+local function visit(kind, id, score, label)
+  if prefix ~= '' and string.sub(id, 1, #prefix) ~= prefix then return false end
+  local lane = label
+  -- A delayed / claiming entry's lane lives in its record: resolved when it decides the lane filter or
+  -- when the entry lands in the page (never for the skipped prefix or past the page).
+  if kind ~= 'l' and (filterLane ~= '' or (skipped >= offset and count < limit)) then
+    lane = resolveLane(id)
+    if lane == nil then
+      if count >= limit then more = 1 else complete = 0 end
+      return true
+    end
+  end
+  if filterLane ~= '' and lane ~= filterLane then return false end
+  if skipped < offset then
+    skipped = skipped + 1
+    return false
+  end
+  if count >= limit then
+    more = 1
+    return true
+  end
+  count = count + 1
+  out[#out + 1] = kind
+  out[#out + 1] = id
+  out[#out + 1] = score
+  out[#out + 1] = lane
+  return false
+end
+
+-- Walks one source in chunks (kind 'l' = lane list, else a zset by score); returns true when the listing
+-- is finished. Without filters the skipped prefix is skipped arithmetically (LLEN / ZCARD) and only the
+-- page window (+1 lookahead) is read.
+local function walk(kind, key, label)
+  local isList = kind == 'l'
+  if isList and filterLane ~= '' and label ~= filterLane then return false end
+  local from = 0
+  if plain then
+    local size
+    if isList then size = redis.call('LLEN', key) else size = redis.call('ZCARD', key) end
+    if skipped + size <= offset then
+      skipped = skipped + size
+      return false
+    end
+    from = offset - skipped
+    skipped = offset
+  end
+  while true do
+    local n = isList and LIST_CHUNK or ZSET_CHUNK
+    if plain then n = math.min(n, limit - count + 1) end
+    local chunk, width
+    if isList then
+      chunk = redis.call('LRANGE', key, from, from + n - 1)
+      width = 1
+    else
+      chunk = redis.call('ZRANGE', key, from, from + n - 1, 'WITHSCORES')
+      width = 2
+    end
+    for j = 1, #chunk, width do
+      scanned = scanned + 1
+      if scanned > scanCap then
+        complete = 0
+        return true
+      end
+      if visit(kind, chunk[j], isList and '' or chunk[j + 1], label) then return true end
+    end
+    if #chunk < n * width then return false end
+    from = from + n
+  end
+end
+
+local function run()
+  if walk('c', KEYS[1], '') then return end
+  for i = 4, #KEYS do
+    if walk('l', KEYS[i], ARGV[i + 3]) then return end
+  end
+  walk('d', KEYS[2], '')
+end
+run()
+
+local res = { complete, more }
+for i = 1, #out do res[#res + 1] = out[i] end
+return res
+`)
+
 /**
  * Runs `script` via EVALSHA, falling back to EVAL (which also loads it into the server's cache) when
  * the server answers `NOSCRIPT`. Any other error propagates unchanged (e.g. an OOM refusal).

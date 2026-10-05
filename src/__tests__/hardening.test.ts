@@ -9,7 +9,7 @@ import { Job } from '../job'
 import { RedisJM } from '../redisjm'
 import type { JobContext } from '../types'
 import { connectionError, createMockRedis, oomError } from './mock-redis'
-import { CLAIMING, LOCKS, LOG, mockHelpers, QUEUE } from './unit-helpers'
+import { CLAIMING, hung, LOCKS, LOG, mockHelpers, QUEUE } from './unit-helpers'
 
 describe('hardening', () => {
   let redis: ReturnType<typeof createMockRedis>
@@ -22,7 +22,6 @@ describe('hardening', () => {
   })
 
   const { readRecord, seed } = mockHelpers(() => redis)
-  const hung = () => new Promise<void>(() => {})
 
   // ---------------------------------------------------------------------------------------------
   describe('execution timeout (manager)', () => {

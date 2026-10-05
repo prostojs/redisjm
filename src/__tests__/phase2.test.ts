@@ -21,9 +21,7 @@ describe('phase 2', () => {
     vi.useRealTimers()
   })
 
-  const { newManager, readRecord, seed } = mockHelpers(() => redis)
-  const list = (key: string) => redis._dump().lists.get(key) ?? []
-  const set = (key: string) => [...(redis._dump().sets.get(key) ?? [])].sort()
+  const { newManager, readRecord, seed, setOf, listOf } = mockHelpers(() => redis)
 
   // ---------------------------------------------------------------------------------------------
   describe('atomic enqueue', () => {
@@ -34,11 +32,11 @@ describe('phase 2', () => {
       vi.mocked(redis.eval).mockClear()
       expect(await m.enqueue(job, 'r1', { x: 1 })).toEqual({ status: 'queued', jobId: 'e#r1' })
       expect(vi.mocked(redis.evalsha).mock.calls.length + vi.mocked(redis.eval).mock.calls.length).toBe(2) // NOSCRIPT once, then EVAL
-      expect(list(laneKey('a'))).toEqual(['e#r1'])
-      expect(set(LOCKS)).toEqual(['e#r1'])
-      expect(set(jobLocks('e'))).toEqual(['e#r1'])
-      expect(set(jobLanes('e'))).toEqual([laneKey('a')])
-      expect(set('redisjm:g:jobs')).toEqual(['e'])
+      expect(listOf(laneKey('a'))).toEqual(['e#r1'])
+      expect(setOf(LOCKS)).toEqual(['e#r1'])
+      expect(setOf(jobLocks('e'))).toEqual(['e#r1'])
+      expect(setOf(jobLanes('e'))).toEqual([laneKey('a')])
+      expect(setOf('redisjm:g:jobs')).toEqual(['e'])
       const record = await readRecord('e#r1')
       expect(record?.status).toBe('queued')
       expect(record?.enqueuedAt).toBeTypeOf('number')
@@ -113,7 +111,7 @@ describe('phase 2', () => {
         { status: 'queued', jobId: 'm#r3' },
         { status: 'full', jobId: 'm#r4' }, // the cap counts the entries the batch itself added
       ])
-      expect(list(QUEUE)).toEqual(['m#r2', 'm#r1', 'm#r3'])
+      expect(listOf(QUEUE)).toEqual(['m#r2', 'm#r1', 'm#r3'])
     })
 
     it('first: true lands the batch at the head in its given order; earlier entries win the cap', async () => {
@@ -124,7 +122,7 @@ describe('phase 2', () => {
         { runId: 'a', inputs: 1 }, { runId: 'a', inputs: 1 }, { runId: 'b', inputs: 2 }, { runId: 'c', inputs: 3 },
       ], { first: true })
       expect(results.map((r) => r.status)).toEqual(['queued', 'deduped', 'queued', 'full'])
-      expect(list(QUEUE)).toEqual(['m#a', 'm#b', 'm#old'])
+      expect(listOf(QUEUE)).toEqual(['m#a', 'm#b', 'm#old'])
     })
 
     it('is all-or-nothing: OOM writes nothing; one oversized entry rejects the batch before any write', async () => {
@@ -136,8 +134,8 @@ describe('phase 2', () => {
       redis._setOom(true)
       await expect(m.enqueueMany(job, [{ runId: 'a', inputs: 1 }, { runId: 'c', inputs: 2 }]))
         .rejects.toMatchObject({ name: 'RedisJMEnqueueError', reason: 'oom' })
-      expect(set(LOCKS)).toEqual([])
-      expect(list(QUEUE)).toEqual([])
+      expect(setOf(LOCKS)).toEqual([])
+      expect(listOf(QUEUE)).toEqual([])
     })
   })
 
@@ -159,7 +157,7 @@ describe('phase 2', () => {
       release()
       await running
       expect((await m.inFlight('f')).total).toBe(2)
-      expect(set(jobLocks('f'))).toEqual(['f#d', 'f#q'])
+      expect(setOf(jobLocks('f'))).toEqual(['f#d', 'f#q'])
       expect(await m.inFlight('nobody')).toEqual({ total: 0, queued: 0, delayed: 0, running: 0 })
     })
 
@@ -169,13 +167,13 @@ describe('phase 2', () => {
       await m.queue(job, 'r1', null)
       await redis.sadd(jobLocks('p'), 'p#ghost') // drift: a member whose lock is gone
       await m.performMaintenance()
-      expect(set(jobLocks('p'))).toEqual(['p#r1'])
-      expect(set(jobLanes('p'))).toEqual([laneKey('a')]) // still holds an entry
+      expect(setOf(jobLocks('p'))).toEqual(['p#r1'])
+      expect(setOf(jobLanes('p'))).toEqual([laneKey('a')]) // still holds an entry
       await m.popAndExecute()
       await m.performMaintenance()
-      expect(set(jobLocks('p'))).toEqual([])
-      expect(set(jobLanes('p'))).toEqual([])
-      expect(set('redisjm:g:jobs')).toEqual([])
+      expect(setOf(jobLocks('p'))).toEqual([])
+      expect(setOf(jobLanes('p'))).toEqual([])
+      expect(setOf('redisjm:g:jobs')).toEqual([])
     })
   })
 
@@ -208,7 +206,7 @@ describe('phase 2', () => {
       await vi.advanceTimersByTimeAsync(300)
       const result = await m.performMaintenance()
       expect(result.requeuedCount).toBe(1)
-      expect(list(QUEUE)).toEqual(['c#parked', 'c#next'])
+      expect(listOf(QUEUE)).toEqual(['c#parked', 'c#next'])
       expect(redis._dump().zsets.get(CLAIMING)?.size).toBe(0)
       expect((await readRecord('c#parked'))?.status).toBe('queued')
       expect(await m.isLocked('c#parked')).toBe(true)
@@ -228,7 +226,7 @@ describe('phase 2', () => {
       expect(fn).toHaveBeenCalledTimes(1)
       expect((await readRecord('moved#m1'))?.status).toBe('finished')
       // `stay` was never popped, requeued, or charged an unknown-job requeue.
-      expect(list(laneKey('a'))).toEqual(['stay#s1'])
+      expect(listOf(laneKey('a'))).toEqual(['stay#s1'])
       expect((await readRecord('stay#s1'))?.requeueCount).toBeUndefined()
       expect(await m.popAndExecute()).toBe(false)
     })
@@ -409,17 +407,17 @@ describe('phase 2', () => {
       const job = new Job({ jobName: 'tick' }, vi.fn())
       const cancel = m.every(job, 1000, { inputs: { n: 1 }, immediate: true })
       await vi.advanceTimersByTimeAsync(0)
-      expect(list(QUEUE)).toEqual(['tick#every'])
+      expect(listOf(QUEUE)).toEqual(['tick#every'])
       await vi.advanceTimersByTimeAsync(3000)
-      expect(list(QUEUE)).toEqual(['tick#every']) // deduped while still queued
+      expect(listOf(QUEUE)).toEqual(['tick#every']) // deduped while still queued
       cancel()
       const other = m.every(new Job({ jobName: 'fresh' }, vi.fn()), 1000, { inputs: null, skipIfInFlight: false, runId: 'f' })
       void other
       await vi.advanceTimersByTimeAsync(2000)
-      expect(list(QUEUE).filter((id) => id.startsWith('fresh#f-'))).toHaveLength(2)
+      expect(listOf(QUEUE).filter((id) => id.startsWith('fresh#f-'))).toHaveLength(2)
       await m.stop()
       await vi.advanceTimersByTimeAsync(5000)
-      expect(list(QUEUE).filter((id) => id.startsWith('fresh#f-'))).toHaveLength(2)
+      expect(listOf(QUEUE).filter((id) => id.startsWith('fresh#f-'))).toHaveLength(2)
     })
 
     it('enqueue failures are logged, never thrown from the timer', async () => {
@@ -537,7 +535,7 @@ describe('phase 2', () => {
       await stopping
       expect(await run).toBe(true)
       expect(await m.popAndExecute()).toBe(false)
-      expect(list(QUEUE)).toEqual(['p#r2'])
+      expect(listOf(QUEUE)).toEqual(['p#r2'])
       await m.unqueue('p#r2')
       m.start(60_000) // a new start() re-enables it
       await m.stop()

@@ -130,3 +130,24 @@ export class JobTimeoutError extends Error {
     this.timeoutMs = timeoutMs
   }
 }
+
+/**
+ * Thrown out of `Job.execute()` (and passed to the `error` hooks) when a run's `ctx.signal` aborted — for
+ * a reason other than its execution timeout: ownership loss, `stop({ abort: true })`, `payload.abort()`,
+ * an external signal — and the handler did not settle within `abortGraceMs`. An ordinary attempt failure:
+ * `attempts`/`backoff` apply (so an attempt IS consumed). The handler keeps running detached; its writes
+ * are fenced.
+ */
+export class JobAbortedError extends Error {
+  /** The abort reason's text (a string as is, an `Error`'s `message`): `'manager stopped'`, the ownership-loss text, a custom one. */
+  readonly reason: string
+  /** The grace that elapsed, in ms. */
+  readonly graceMs: number
+
+  constructor(reason: string, graceMs: number, jobId?: string) {
+    super(`${jobId ? `job "${jobId}" ` : 'job '}aborted (${reason}) and did not settle within ${graceMs}ms`)
+    this.name = 'JobAbortedError'
+    this.reason = reason
+    this.graceMs = graceMs
+  }
+}

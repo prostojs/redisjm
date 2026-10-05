@@ -425,8 +425,9 @@ export function createMockRedis(): Redis & MockRedisExtras {
 
   /** Emulates redisjm's Lua scripts (identified by marker) with the mock's own commands. */
   async function runScript(source: string, keys: string[], argv: string[]): Promise<unknown> {
-    // A flag-less `#!lua` script is refused up front under OOM — nothing in it runs.
-    if (oom && source.startsWith('#!lua') && !/flags=[^\n]*allow-oom/.test(source)) throw oomError()
+    // A flag-less `#!lua` script is refused up front under OOM — nothing in it runs. `allow-oom` (deletion
+    // only) and `no-writes` (read-only) scripts are not.
+    if (oom && source.startsWith('#!lua') && !/flags=[^\n]*(allow-oom|no-writes)/.test(source)) throw oomError()
     if (source.includes('-- redisjm:enqueue')) {
       const [locks, log, delayed, lane, jobLocks, jobLanes, registry] = keys
       const [jobName, mode, capArg, maxArg] = argv
@@ -584,6 +585,65 @@ export function createMockRedis(): Redis & MockRedisExtras {
       }
       if ((await m.scard(jobLocks)) === 0 && (await m.scard(jobLanes)) === 0) await m.srem(registry, jobName)
       return pruned
+    }
+    if (source.includes('-- redisjm:presence')) {
+      const [instances, info] = keys
+      const [id, ttl, json] = argv
+      // Server time = the (possibly faked) client clock in the mock.
+      const now = Date.now()
+      for (const dead of await m.zrangebyscore(instances, '-inf', now, 'LIMIT', 0, 100)) {
+        await m.hdel(info, dead)
+        await m.zrem(instances, dead)
+      }
+      if (json !== '') await m.hset(info, id, json)
+      else if ((await m.hexists(info, id)) === 0) return 1
+      await m.zadd(instances, now + Number(ttl), id)
+      return 0
+    }
+    if (source.includes('-- redisjm:fleet')) {
+      const [instances, info] = keys
+      const now = Date.now()
+      const out: unknown[] = [now]
+      const live = [...(zsets.get(instances) ?? [])].filter(([, score]) => score > now).sort((x, y) => x[1] - y[1])
+      for (const [id, score] of live) out.push(id, String(score), await m.hget(info, id))
+      return out
+    }
+    if (source.includes('-- redisjm:list-queued')) {
+      // A simplified model of LIST_QUEUED_SCRIPT (the decode / scan caps and the chunked reads are
+      // covered by the integration tests): the ordered sequence, the filters, then the page slice.
+      const [claimingKey, delayedKey, logKey, ...laneKeys] = keys
+      const [filterLane, prefix] = argv
+      const offset = Number(argv[2])
+      const limit = Number(argv[3])
+      const ranked = (key: string) => [...(zsets.get(key) ?? [])]
+        .sort((x, y) => x[1] - y[1] || (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0))
+        .map(([id, score]) => [id, String(score)] as const)
+      // A run's lane label from its record ('' = no record / unreadable).
+      const recordLane = async (id: string): Promise<string> => {
+        const raw = await m.hget(logKey, id)
+        let rec: any
+        try {
+          rec = raw === null ? null : JSON.parse(raw)
+        } catch {
+          return ''
+        }
+        if (typeof rec !== 'object' || rec === null) return ''
+        return typeof rec.lane !== 'string' || rec.lane === '' || rec.lane === 'default' ? 'default' : rec.lane
+      }
+      const sequence: Array<[kind: string, id: string, score: string, label: string | null]> = [
+        ...ranked(claimingKey).map(([id, score]) => ['c', id, score, null] as [string, string, string, null]),
+        ...laneKeys.flatMap((key, i) => (lists.get(key) ?? []).map((id) => ['l', id, '', argv[6 + i]] as [string, string, string, string])),
+        ...ranked(delayedKey).map(([id, score]) => ['d', id, score, null] as [string, string, string, null]),
+      ]
+      const matches: string[][] = []
+      for (const [kind, id, score, label] of sequence) {
+        if (prefix !== '' && !id.startsWith(prefix)) continue
+        const lane = label ?? (await recordLane(id))
+        if (filterLane !== '' && lane !== filterLane) continue
+        matches.push([kind, id, score, lane])
+      }
+      const page = matches.slice(offset, offset + limit)
+      return [1, matches.length > offset + limit ? 1 : 0, ...page.flat()]
     }
     throw new Error('mock-redis: unknown script')
   }
