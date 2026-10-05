@@ -1,3 +1,12 @@
+# [0.3.0](https://github.com/prostojs/redisjm/compare/v0.2.1...v0.3.0) (2026-10-05)
+
+
+### Features
+
+* abortGraceMs, inFlightCount, fleet presence, listQueued/getMany, maintenance hook ([3de3c4b](https://github.com/prostojs/redisjm/commit/3de3c4bdae5dde120dcc33cfb088a15314527e6f))
+
+
+
 ## [0.2.1](https://github.com/prostojs/redisjm/compare/v0.2.0...v0.2.1) (2026-10-03)
 
 
