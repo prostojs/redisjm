@@ -3,7 +3,19 @@
 
 ### Features
 
-* abortGraceMs, inFlightCount, fleet presence, listQueued/getMany, maintenance hook ([3de3c4b](https://github.com/prostojs/redisjm/commit/3de3c4bdae5dde120dcc33cfb088a15314527e6f))
+* settle a run when its signal aborts: `abortGraceMs` (manager default, per job, or `execute()` option) abandons a handler still pending that long after an abort (ownership loss, `stop({ abort: true })`, `payload.abort()`) and fails the attempt with the new `JobAbortedError`, freeing the slot and letting `stop()` resolve. Opt-in (default `false` keeps waiting for the handler); an abandoned attempt consumes an attempt
+* `inFlightCount(jobName)`: O(1) `SCARD` of the job's lock set, exactly what `maxInFlight` is enforced against
+* worker fleet registry: started instances register a TTL lease on Redis server time (`presence`, default on; `instanceLabel`), `fleet()` reports live consumers and their capacity (slots, busy, per-lane consumers), `getInstanceId()`
+* `listQueued()`: runs waiting to run in pop order (popped-not-claimed, lane lists head to tail, delayed by `readyAt`) from one read-only script, with `lane` / `jobName` filters, `offset` / `limit` paging and bounded work per call; `getMany(jobIds)`: records for many jobIds in one pipelined round trip
+* `maintenance` manager hook: the outcome of every maintenance pass an instance ran (`result`, `failedOps`, first `error` / `reason`, `durationMs`), or the error that kept a pass from running
+
+
+### BREAKING CHANGES
+
+* `presence` is on by default: every started instance writes a small fleet entry per `heartbeatInterval` (`presence: false` opts out)
+* a fenced `ctx.setProgress` / `ctx.setAttrs` write no longer emits the manager `update` event
+
+Caveats for mixed 0.1.x / 0.2.x / 0.3 groups: see "Upgrading to 0.3" in the README.
 
 
 
