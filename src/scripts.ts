@@ -323,10 +323,13 @@ local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)`
  * under maxmemory the whole refresh is refused up front (the instance then lapses after its ttl, which is
  * truthful — a Redis at maxmemory refuses every pop anyway). Returns `0` on success.
  *
- * KEYS: 1 instances zset, 2 instance-info hash. ARGV: 1 instanceId, 2 ttlMs, 3 info JSON or ''.
+ * KEYS: 1 instances zset, 2 instance-info hash. ARGV: 1 instanceId, 2 ttlMs, 3 info JSON or '', 4 key ttlMs.
+ *
+ * Both keys also get a key-level `PEXPIRE` (ARGV 4), refreshed on every successful write, so a group whose
+ * instances all died does not keep them forever. The caller passes a multiple of the lease ttl.
  */
 export const PRESENCE_SCRIPT = defineScript(`#!lua
--- redisjm:presence v2
+-- redisjm:presence v3
 ${LUA_NOW_MS}
 local dead = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', now, 'LIMIT', 0, 100)
 if #dead > 0 then
@@ -341,6 +344,8 @@ elseif redis.call('HEXISTS', KEYS[2], ARGV[1]) == 0 then
   return 1
 end
 redis.call('ZADD', KEYS[1], now + tonumber(ARGV[2]), ARGV[1])
+redis.call('PEXPIRE', KEYS[1], ARGV[4])
+redis.call('PEXPIRE', KEYS[2], ARGV[4])
 return 0
 `)
 

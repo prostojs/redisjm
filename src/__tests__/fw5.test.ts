@@ -411,6 +411,39 @@ describe('0.3.0 features', () => {
       await crashed.stop()
     })
 
+    it('presence refresh sets a key-level expiry well beyond the lease, renewed on each write', async () => {
+      vi.useFakeTimers()
+      const m = newManager({ heartbeatInterval: 1000, roundsToStale: 3 })
+      await startAndSettle(m)
+      const ttls = redis._dump().keyTtls
+      const first = ttls.get(INSTANCES)!
+      expect(ttls.get(INSTANCE_INFO)).toBe(first)
+      expect(first - Date.now()).toBeGreaterThanOrEqual(3000 * 3)
+      await vi.advanceTimersByTimeAsync(2000)
+      expect(ttls.get(INSTANCES)!).toBeGreaterThan(first)
+      await m.stop()
+    })
+
+    // WHY: roundsToStale 1 is valid for runs, but a presence lease equal to the refresh interval would flicker.
+    it('clamps the presence lease to two refresh intervals when roundsToStale <= 1', async () => {
+      vi.useFakeTimers()
+      const m = newManager({ heartbeatInterval: 1000, roundsToStale: 1 })
+      await startAndSettle(m)
+      const [entry] = (await m.fleet()).instances
+      expect(entry.expiresAt - entry.seenAt).toBe(2000)
+      await vi.advanceTimersByTimeAsync(1500)
+      expect((await m.fleet()).instances).toHaveLength(1)
+      await m.stop()
+    })
+
+    it('logs that presence is inactive when heartbeatInterval is 0 with presence on', async () => {
+      const logger = vi.fn()
+      const m = newManager({ heartbeatInterval: 0, logger })
+      m.start(20)
+      expect(logger.mock.calls.some(([msg]) => /needs heartbeatInterval > 0/.test(String(msg)))).toBe(true)
+      await m.stop()
+    })
+
     it('presence: false writes no fleet keys', async () => {
       vi.useFakeTimers()
       const m = newManager({ heartbeatInterval: 1000, presence: false })

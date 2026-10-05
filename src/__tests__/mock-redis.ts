@@ -29,6 +29,7 @@ export interface MockRedisExtras {
     lists: Map<string, string[]>
     zsets: Map<string, Map<string, number>>
     fieldTtls: Map<string, Map<string, number>>
+    keyTtls: Map<string, number>
   }
   /** Simulates `maxmemory` + `noeviction`: while on, DENYOOM commands and shebang scripts reject with `oomError()`. */
   _setOom: (on: boolean) => void
@@ -53,6 +54,8 @@ export function createMockRedis(): Redis & MockRedisExtras {
   const sets = new Map<string, Set<string>>()
   const hashes = new Map<string, Map<string, string>>()
   const fieldTtls = new Map<string, Map<string, number>>()
+  /** Key-level PEXPIRE deadlines recorded by the presence script (not enforced). */
+  const keyTtls = new Map<string, number>()
   const lists = new Map<string, string[]>()
   // Sorted sets: key → Map<member, score>. Ordering is derived on read (zrangebyscore) by score asc.
   const zsets = new Map<string, Map<string, number>>()
@@ -377,7 +380,7 @@ export function createMockRedis(): Redis & MockRedisExtras {
     multi: vi.fn(() => queueChain(true)),
     pipeline: vi.fn(() => queueChain(false)),
 
-    _dump: () => ({ store, sets, hashes, lists, zsets, fieldTtls }),
+    _dump: () => ({ store, sets, hashes, lists, zsets, fieldTtls, keyTtls }),
     _setOom: (on: boolean) => {
       oom = on
     },
@@ -588,7 +591,7 @@ export function createMockRedis(): Redis & MockRedisExtras {
     }
     if (source.includes('-- redisjm:presence')) {
       const [instances, info] = keys
-      const [id, ttl, json] = argv
+      const [id, ttl, json, keyTtl] = argv
       // Server time = the (possibly faked) client clock in the mock.
       const now = Date.now()
       for (const dead of await m.zrangebyscore(instances, '-inf', now, 'LIMIT', 0, 100)) {
@@ -598,6 +601,8 @@ export function createMockRedis(): Redis & MockRedisExtras {
       if (json !== '') await m.hset(info, id, json)
       else if ((await m.hexists(info, id)) === 0) return 1
       await m.zadd(instances, now + Number(ttl), id)
+      keyTtls.set(instances, now + Number(keyTtl))
+      keyTtls.set(info, now + Number(keyTtl))
       return 0
     }
     if (source.includes('-- redisjm:fleet')) {

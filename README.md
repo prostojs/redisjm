@@ -135,12 +135,12 @@ new RedisJM(redis: Redis, targetGroup: string, options?: RedisJMOptions)
 | Option | Default | Description |
 |---|---|---|
 | `heartbeatInterval` | `5000` | Milliseconds between heartbeat updates during job execution |
-| `roundsToStale` | `2` | Number of missed heartbeat intervals before a job is considered stale. The **stale threshold** used throughout is `heartbeatInterval * roundsToStale` |
+| `roundsToStale` | `2` | Number of missed heartbeat intervals before a job is considered stale (the fleet presence lease is clamped to at least two refresh intervals, so `1` never makes an instance flicker in `fleet()`). The **stale threshold** used throughout is `heartbeatInterval * roundsToStale` |
 | `keepFinishedInterval` | `60000` | Milliseconds to keep finished/error/stale records in the log so `get()`/`list()` can observe the outcome. Costs memory — see [Memory & eviction](#memory--eviction). `0` opts into the legacy write-only behavior (a finished/error record is deleted in the same atomic step that ends the run; `stale` records stay until maintenance's next pass) |
 | `maintenanceInterval` | `heartbeatInterval * roundsToStale` | Milliseconds between maintenance passes on the manager's own timer while `start()` is running (`0` disables). See [Maintenance](#maintenance) |
 | `jobTimeout` | `0` (none) | Default execution timeout (ms) per attempt for every job; a job's own `timeoutMs` wins. See [Timeouts](#timeouts) |
 | `abortGraceMs` | `false` (wait) | After a run's `ctx.signal` aborts for a reason other than its timeout (ownership loss, `stop({ abort: true })`, `payload.abort()`), wait at most this many ms for the handler, then abandon it and fail the attempt with a `JobAbortedError`. `false` = wait for the handler; `0` = settle on the next tick. A job's own `abortGraceMs` wins (`false` opts a job out). `TypeError` unless `false` or a finite number `>= 0`. See [Settling aborted runs](#settling-aborted-runs) |
-| `presence` | `true` | While `start()` runs, register this instance in the group's fleet registry so `fleet()` can report live consumers and their capacity. **Costs one small Redis write (a `ZADD`) per instance per `heartbeatInterval`** — the info is rewritten only when it changes — and two small keys per group; `false` opts out. See [`fleet()`](#fleet-promiseredisjmfleet) |
+| `presence` | `true` | While `start()` runs, register this instance in the group's fleet registry so `fleet()` can report live consumers and their capacity. **Costs one small Redis write (a `ZADD`) per instance per `heartbeatInterval`** — the info is rewritten only when it changes — and two small keys per group that expire on their own (a key-level TTL of `max(3 × lease, 60s)`, renewed on every refresh) once no instance is left; `false` opts out. Presence needs `heartbeatInterval > 0`; with `0`, `start()` logs that presence is inactive. See [`fleet()`](#fleet-promiseredisjmfleet) |
 | `instanceLabel` | `''` | Free-text label stored with this instance's fleet entry (e.g. a pod name); a string of at most 200 characters, else `TypeError` |
 | `maxRunMs` | `0` (off) | Maintenance marks a `running` record `stale` once it has run longer than this, regardless of its heartbeat — a backstop for hung handlers without a timeout. See [Timeouts](#timeouts) |
 | `concurrency` | `1` | Max runs a single instance executes simultaneously (maintenance is not affected — it has its own timer). Must be a positive integer — the constructor floors it and throws `TypeError` if `< 1` or non-finite. See [Concurrency](#concurrency) |
@@ -345,10 +345,12 @@ The runs waiting to run, **in the order they leave the queue**, from one atomic 
 The order is: runs **popped but not yet claimed** (by pop time), then the **lane lists head to tail** (a `queueFirst` insert is at the head), then the **delayed** set by `readyAt` (each is pushed to the tail of its lane when it falls due). With a `lane` this is the order in which the current entries leave that lane (absent new head inserts); **across lanes there is no global pop order** — consumers interleave lanes per `laneStrategy`. Without `lane`: `default` first, then the other lanes alphabetically; the reserved `__maintenance` lane only when asked for explicitly.
 
 ```typescript
-let page = await manager.listQueued({ lane: 'images', limit: 50 })
-while (page.nextOffset !== undefined) {
+let offset: number | undefined = 0
+while (offset !== undefined) {
+  const page = await manager.listQueued({ lane: 'images', limit: 50, offset })
   render(page.entries) // { jobId, jobName, runId, lane?, status: 'queued' | 'delayed', poppedAt?, readyAt? }
-  page = await manager.listQueued({ lane: 'images', limit: 50, offset: page.nextOffset })
+  if (!page.complete) console.warn('page cut short by a scan bound; narrow with lane / jobName')
+  offset = page.nextOffset // absent once the sequence is exhausted
 }
 ```
 

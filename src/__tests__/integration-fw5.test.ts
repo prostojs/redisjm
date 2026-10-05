@@ -137,7 +137,7 @@ describe.skipIf(!REDIS_URL)('0.3.0 integration (shared Redis)', () => {
     it('the presence script renews the lease without info only while the info is stored; otherwise it asks for it', async () => {
       const group = newGroup()
       const keys = [`redisjm:${group}:instances`, `redisjm:${group}:instance-info`]
-      const beat = (info: string) => runScript(h.redis, PRESENCE_SCRIPT, keys, ['x', 60_000, info])
+      const beat = (info: string) => runScript(h.redis, PRESENCE_SCRIPT, keys, ['x', 60_000, info, 180_000])
       expect(await beat('')).toBe(1) // no info stored, none sent: nothing registered
       expect(await h.redis.zscore(keys[0], 'x')).toBeNull()
       expect(await beat('{"v":1}')).toBe(0)
@@ -146,6 +146,12 @@ describe.skipIf(!REDIS_URL)('0.3.0 integration (shared Redis)', () => {
       expect(await beat('')).toBe(0) // lease renewed, info untouched
       expect(Number(await h.redis.zscore(keys[0], 'x'))).toBeGreaterThan(first)
       expect(await h.redis.hget(keys[1], 'x')).toBe('{"v":1}')
+      // Both keys carry a key-level expiry so an abandoned group cleans up.
+      for (const key of keys) {
+        const ttl = await h.redis.pttl(key)
+        expect(ttl).toBeGreaterThan(170_000)
+        expect(ttl).toBeLessThanOrEqual(180_000)
+      }
     })
 
     it('presence: false registers nothing', async () => {

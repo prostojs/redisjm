@@ -990,8 +990,13 @@ export class RedisJM extends Hookable<RedisJMHooks> {
         .sort(),
       laneConcurrency: this.options.laneConcurrency,
       startedAt: this.startedAt,
-      ttlMs: this.getStaleThreshold(),
+      ttlMs: this.getPresenceLease(),
     })
+  }
+
+  /** Fleet lease length: the stale threshold, but at least two refresh intervals (no flicker at `roundsToStale <= 1`). */
+  private getPresenceLease(): number {
+    return this.options.heartbeatInterval * Math.max(this.options.roundsToStale, 2)
   }
 
   /**
@@ -1005,12 +1010,16 @@ export class RedisJM extends Hookable<RedisJMHooks> {
     if (!this.presenceTimer) return
     const info = JSON.stringify({ ...this.presenceBaseInfo(), busy: this.inFlightRuns.size })
     const keys = [this.getInstancesKey(), this.getInstanceInfoKey()]
-    const ttlMs = this.getStaleThreshold()
+    // The lease is at least two refresh intervals: `roundsToStale <= 1` (valid for run staleness) would
+    // otherwise lapse the entry between refreshes and make it flicker in `fleet()`.
+    const ttlMs = this.getPresenceLease()
+    // Key-level expiry so an abandoned group's presence keys clean up: well beyond any live lease.
+    const keyTtlMs = Math.max(ttlMs * 3, 60_000)
     try {
       const unchanged = info === this.presenceSent
       // `1` = no info was sent and Redis holds none for this instance (lapsed, flushed): send it now.
-      const needInfo = await runScript(this.redis, PRESENCE_SCRIPT, keys, [this.instanceId, ttlMs, unchanged ? '' : info])
-      if (needInfo === 1) await runScript(this.redis, PRESENCE_SCRIPT, keys, [this.instanceId, ttlMs, info])
+      const needInfo = await runScript(this.redis, PRESENCE_SCRIPT, keys, [this.instanceId, ttlMs, unchanged ? '' : info, keyTtlMs])
+      if (needInfo === 1) await runScript(this.redis, PRESENCE_SCRIPT, keys, [this.instanceId, ttlMs, info, keyTtlMs])
       this.presenceSent = info
       this.presenceFailLogged = false
     } catch (err) {
@@ -2086,6 +2095,9 @@ export class RedisJM extends Hookable<RedisJMHooks> {
       this.maintenanceTick()
     }
 
+    if (this.options.presence && !(this.options.heartbeatInterval > 0)) {
+      this.logger('fleet presence is off for this instance: it needs heartbeatInterval > 0 (set presence: false to silence this)')
+    }
     if (this.options.presence && this.options.heartbeatInterval > 0) {
       // Fleet presence (see `fleet()`): a lease refreshed on its own timer — outside the poll loop and the
       // concurrency slots — so a full set of busy slots never lapses the instance.
