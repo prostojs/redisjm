@@ -1,3 +1,12 @@
+## [0.3.2](https://github.com/prostojs/redisjm/compare/v0.3.1...v0.3.2) (2026-10-06)
+
+
+### Bug Fixes
+
+* monotonic presence key TTL (PEXPIRE GT) and cap abortGraceMs at the Node timer limit ([0d5fc6f](https://github.com/prostojs/redisjm/commit/0d5fc6f71c6568f934a9e1f155d84725e963f57e))
+
+
+
 ## [0.3.1](https://github.com/prostojs/redisjm/compare/v0.3.0...v0.3.1) (2026-10-05)
 
 
