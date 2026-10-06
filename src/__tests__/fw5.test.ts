@@ -220,7 +220,7 @@ describe('0.3.0 features', () => {
     })
 
     it('validates abortGraceMs: constructor, registerJob and getOptions', () => {
-      for (const bad of [-1, Number.NaN, Number.POSITIVE_INFINITY, true, '5']) {
+      for (const bad of [-1, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 31, true, '5']) {
         expect(() => new RedisJM(redis, 'g', { abortGraceMs: bad as never })).toThrow(TypeError)
         expect(() => newManager().createJob({ jobName: 'v', abortGraceMs: bad as never }, vi.fn())).toThrow(TypeError)
       }
@@ -409,6 +409,19 @@ describe('0.3.0 features', () => {
       expect([...(redis._dump().hashes.get(INSTANCE_INFO) ?? new Map()).keys()]).toEqual([alive.getInstanceId()])
       await alive.stop()
       await crashed.stop()
+    })
+
+    it('the presence key TTL is monotonic: a shorter heartbeat interval never shortens a longer one', async () => {
+      vi.useFakeTimers()
+      const slow = newManager({ heartbeatInterval: 10_000, roundsToStale: 3 })
+      await startAndSettle(slow)
+      const long = redis._dump().keyTtls.get(INSTANCES)!
+      const fast = newManager({ heartbeatInterval: 100, roundsToStale: 3 })
+      await startAndSettle(fast)
+      expect(redis._dump().keyTtls.get(INSTANCES)!).toBeGreaterThanOrEqual(long)
+      expect(redis._dump().keyTtls.get(INSTANCE_INFO)!).toBeGreaterThanOrEqual(long)
+      await fast.stop()
+      await slow.stop()
     })
 
     it('presence refresh sets a key-level expiry well beyond the lease, renewed on each write', async () => {

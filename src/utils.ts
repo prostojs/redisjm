@@ -25,12 +25,15 @@ export function nonNegativeInt(value: number | undefined): number | undefined {
   return value !== undefined && Number.isFinite(value) && value >= 0 ? Math.floor(value) : undefined
 }
 
+/** Node's timer limit (2^31 - 1 ms); a longer delay fires after 1 ms. */
+const MAX_TIMER_MS = 2_147_483_647
+
 /**
- * Validates an `abortGraceMs` value (`false` / `undefined` = none, else a finite number `>= 0`) and returns
+ * Validates an `abortGraceMs` value (`false` / `undefined` = none, else a finite number in `0..2^31-1`) and returns
  * it; anything else throws a `TypeError` naming `label`.
  */
 export function checkAbortGraceMs(value: unknown, label: string): number | false | undefined {
   if (value === undefined || value === false) return value
-  if (typeof value === 'number' && Number.isFinite(value) && value >= 0) return value
-  throw new TypeError(`${label}: abortGraceMs must be false or a finite number >= 0, got ${String(value)}`)
+  if (typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= MAX_TIMER_MS) return value
+  throw new TypeError(`${label}: abortGraceMs must be false or a finite number in 0..${MAX_TIMER_MS}, got ${String(value)}`)
 }

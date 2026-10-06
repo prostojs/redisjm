@@ -165,7 +165,7 @@ export interface RedisJMOptions {
    * most this many ms for the handler to settle, then abandon it and fail the attempt with a
    * `JobAbortedError` — so a handler that ignores its signal can't hold its concurrency slot, or
    * `stop()`, hostage. `false`/unset (default) = wait for the handler. A job's own
-   * `JobMetadata.abortGraceMs` wins. Must be `false` or a finite number `>= 0` (else `TypeError`). An
+   * `JobMetadata.abortGraceMs` wins. Must be `false` or a finite number `0..2147483647` (else `TypeError`). An
    * abandoned attempt goes through the normal failure path, so with the default `attempts: 1` it ends
    * `error`; set `attempts > 1` if an aborted run must be re-run elsewhere.
    */

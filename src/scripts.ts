@@ -326,10 +326,11 @@ local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)`
  * KEYS: 1 instances zset, 2 instance-info hash. ARGV: 1 instanceId, 2 ttlMs, 3 info JSON or '', 4 key ttlMs.
  *
  * Both keys also get a key-level `PEXPIRE` (ARGV 4), refreshed on every successful write, so a group whose
- * instances all died does not keep them forever. The caller passes a multiple of the lease ttl.
+ * instances all died does not keep them forever. The caller passes a multiple of the lease ttl. `GT` (Redis >= 7)
+ * keeps the TTL monotonic: instances with different heartbeat intervals never shorten each other's.
  */
 export const PRESENCE_SCRIPT = defineScript(`#!lua
--- redisjm:presence v3
+-- redisjm:presence v4
 ${LUA_NOW_MS}
 local dead = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', now, 'LIMIT', 0, 100)
 if #dead > 0 then
@@ -344,8 +345,14 @@ elseif redis.call('HEXISTS', KEYS[2], ARGV[1]) == 0 then
   return 1
 end
 redis.call('ZADD', KEYS[1], now + tonumber(ARGV[2]), ARGV[1])
-redis.call('PEXPIRE', KEYS[1], ARGV[4])
-redis.call('PEXPIRE', KEYS[2], ARGV[4])
+for k = 1, 2 do
+  -- GT never sets a TTL on a key that has none (no TTL counts as infinite), so a fresh key needs a plain PEXPIRE.
+  if redis.call('PTTL', KEYS[k]) < 0 then
+    redis.call('PEXPIRE', KEYS[k], ARGV[4])
+  else
+    redis.call('PEXPIRE', KEYS[k], ARGV[4], 'GT')
+  end
+end
 return 0
 `)
 

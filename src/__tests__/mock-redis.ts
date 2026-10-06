@@ -601,8 +601,8 @@ export function createMockRedis(): Redis & MockRedisExtras {
       if (json !== '') await m.hset(info, id, json)
       else if ((await m.hexists(info, id)) === 0) return 1
       await m.zadd(instances, now + Number(ttl), id)
-      keyTtls.set(instances, now + Number(keyTtl))
-      keyTtls.set(info, now + Number(keyTtl))
+      // PEXPIRE … GT: the deadline only ever moves later.
+      for (const k of [instances, info]) keyTtls.set(k, Math.max(keyTtls.get(k) ?? 0, now + Number(keyTtl)))
       return 0
     }
     if (source.includes('-- redisjm:fleet')) {
