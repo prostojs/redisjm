@@ -125,17 +125,172 @@ describe('phase 2', () => {
       expect(listOf(QUEUE)).toEqual(['m#a', 'm#b', 'm#old'])
     })
 
-    it('is all-or-nothing: OOM writes nothing; one oversized entry rejects the batch before any write', async () => {
+    it('is all-or-nothing on a Redis failure: OOM writes nothing and throws for the whole call', async () => {
       const m = newManager({ maxInputsBytes: 20 })
       const job = new Job({ jobName: 'm' }, vi.fn())
-      await expect(m.enqueueMany(job, [{ runId: 'a', inputs: 1 }, { runId: 'b', inputs: 'x'.repeat(50) }]))
-        .rejects.toMatchObject({ reason: 'inputs-too-large', jobId: 'm#b' })
-      expect(await readRecord('m#a')).toBeNull()
+      const failed = vi.fn()
+      m.hook('enqueueFailed', failed)
       redis._setOom(true)
-      await expect(m.enqueueMany(job, [{ runId: 'a', inputs: 1 }, { runId: 'c', inputs: 2 }]))
-        .rejects.toMatchObject({ name: 'RedisJMEnqueueError', reason: 'oom' })
+      // The oversized first entry is reported, not sent — the error names the first entry that was sent.
+      await expect(m.enqueueMany(job, [
+        { runId: 'big', inputs: 'x'.repeat(50) }, { runId: 'a', inputs: 1 }, { runId: 'c', inputs: 2 },
+      ])).rejects.toMatchObject({ name: 'RedisJMEnqueueError', reason: 'oom', jobId: 'm#a' })
+      expect(failed).toHaveBeenCalledOnce()
+      expect(failed).toHaveBeenCalledWith(expect.objectContaining({ reason: 'oom', jobId: 'm#a' }))
       expect(setOf(LOCKS)).toEqual([])
       expect(listOf(QUEUE)).toEqual([])
+    })
+
+    describe('entries rejected before Redis (oversized / unserializable)', () => {
+      const big = 'x'.repeat(50) // '"xxx…"' = 52 bytes
+      const scriptCalls = () => vi.mocked(redis.evalsha).mock.calls.length + vi.mocked(redis.eval).mock.calls.length
+
+      it('reports an oversized entry per entry; the others enqueue', async () => {
+        const m = newManager({ maxInputsBytes: 20 })
+        const job = new Job({ jobName: 'm' }, vi.fn())
+        const results = await m.enqueueMany(job, [
+          { runId: 'a', inputs: 1 }, { runId: 'b', inputs: big }, { runId: 'c', inputs: 3 },
+        ])
+        expect(results).toEqual([
+          { status: 'queued', jobId: 'm#a' },
+          { status: 'inputs-too-large', jobId: 'm#b', size: 52, limit: 20 },
+          { status: 'queued', jobId: 'm#c' },
+        ])
+        expect(listOf(QUEUE)).toEqual(['m#a', 'm#c'])
+        expect(setOf(LOCKS)).toEqual(['m#a', 'm#c'])
+        expect(setOf(jobLocks('m'))).toEqual(['m#a', 'm#c'])
+        expect(await readRecord('m#b')).toBeNull()
+        expect((await readRecord('m#c'))?.inputs).toBe(3) // statuses and records line up by entry, not by position sent
+      })
+
+      it('the job-level maxInputsBytes is the reported limit', async () => {
+        const m = newManager({ maxInputsBytes: 1000 })
+        const job = new Job({ jobName: 'm', maxInputsBytes: 10 }, vi.fn())
+        expect(await m.enqueueMany(job, [{ runId: 'b', inputs: big }]))
+          .toEqual([{ status: 'inputs-too-large', jobId: 'm#b', size: 52, limit: 10 }])
+      })
+
+      it('all entries rejected: no script call at all', async () => {
+        const m = newManager({ maxInputsBytes: 20 })
+        const job = new Job({ jobName: 'm' }, vi.fn())
+        const circular: Record<string, unknown> = {}
+        circular.self = circular
+        vi.mocked(redis.evalsha).mockClear()
+        vi.mocked(redis.eval).mockClear()
+        const results = await m.enqueueMany(job, [
+          { runId: 'a', inputs: big }, { runId: 'b', inputs: circular }, { runId: 'c', inputs: big },
+        ])
+        expect(results.map((r) => r.status)).toEqual(['inputs-too-large', 'inputs-unserializable', 'inputs-too-large'])
+        expect(scriptCalls()).toBe(0)
+        expect(setOf(LOCKS)).toEqual([])
+      })
+
+      it('a rejected entry takes no lane-cap slot', async () => {
+        const m = newManager({ maxInputsBytes: 20 })
+        const job = new Job({ jobName: 'm', maxQueued: 2 }, vi.fn())
+        const results = await m.enqueueMany(job, [
+          { runId: 'a', inputs: 1 }, { runId: 'big', inputs: big }, { runId: 'b', inputs: 2 }, { runId: 'c', inputs: 3 },
+        ])
+        expect(results.map((r) => r.status)).toEqual(['queued', 'inputs-too-large', 'queued', 'full'])
+        expect(listOf(QUEUE)).toEqual(['m#a', 'm#b'])
+      })
+
+      it('a rejected entry takes no maxInFlight slot', async () => {
+        const m = newManager({ maxInputsBytes: 20 })
+        const job = new Job({ jobName: 'm', maxInFlight: 2 }, vi.fn())
+        const results = await m.enqueueMany(job, [
+          { runId: 'big', inputs: big }, { runId: 'a', inputs: 1 }, { runId: 'b', inputs: 2 }, { runId: 'c', inputs: 3 },
+        ])
+        expect(results.map((r) => r.status)).toEqual(['inputs-too-large', 'queued', 'queued', 'busy'])
+        expect(await m.inFlightCount('m')).toBe(2)
+      })
+
+      it('a rejected copy of a runId does not dedupe a later copy; a rejected later copy is reported, not deduped', async () => {
+        const m = newManager({ maxInputsBytes: 20 })
+        const job = new Job({ jobName: 'm' }, vi.fn())
+        const results = await m.enqueueMany(job, [
+          { runId: 'a', inputs: big }, { runId: 'a', inputs: 1 }, { runId: 'a', inputs: 2 }, { runId: 'a', inputs: big },
+        ])
+        expect(results.map((r) => r.status)).toEqual(['inputs-too-large', 'queued', 'deduped', 'inputs-too-large'])
+        expect(listOf(QUEUE)).toEqual(['m#a'])
+        expect((await readRecord('m#a'))?.inputs).toBe(1)
+      })
+
+      it('first: true keeps the given order of the accepted entries at the head', async () => {
+        const m = newManager({ maxInputsBytes: 20 })
+        const job = new Job({ jobName: 'm' }, vi.fn())
+        await m.queue(job, 'old', null)
+        const results = await m.enqueueMany(job, [
+          { runId: 'a', inputs: 1 }, { runId: 'big', inputs: big }, { runId: 'b', inputs: 2 },
+        ], { first: true })
+        expect(results.map((r) => r.status)).toEqual(['queued', 'inputs-too-large', 'queued'])
+        expect(listOf(QUEUE)).toEqual(['m#a', 'm#b', 'm#old'])
+      })
+
+      it('delayed batches skip rejected entries the same way', async () => {
+        const m = newManager({ maxInputsBytes: 20 })
+        const job = new Job({ jobName: 'm' }, vi.fn())
+        const results = await m.enqueueMany(job, [{ runId: 'big', inputs: big }, { runId: 'a', inputs: 1 }], { delay: 60_000 })
+        expect(results.map((r) => r.status)).toEqual(['inputs-too-large', 'queued'])
+        expect((await readRecord('m#a'))?.status).toBe('delayed')
+        expect(await readRecord('m#big')).toBeNull()
+      })
+
+      it('reports unserializable inputs (BigInt, circular) per entry with the stringify error, with or without a size limit', async () => {
+        const m = newManager()
+        const job = new Job({ jobName: 'm' }, vi.fn())
+        const circular: Record<string, unknown> = {}
+        circular.self = circular
+        const results = await m.enqueueMany(job, [
+          { runId: 'n', inputs: { n: 1n } }, { runId: 'ok', inputs: 1 }, { runId: 'c', inputs: circular },
+        ])
+        expect(results).toEqual([
+          { status: 'inputs-unserializable', jobId: 'm#n', error: expect.any(TypeError) },
+          { status: 'queued', jobId: 'm#ok' },
+          { status: 'inputs-unserializable', jobId: 'm#c', error: expect.any(TypeError) },
+        ])
+        expect(listOf(QUEUE)).toEqual(['m#ok'])
+      })
+
+      it('enqueueFailed does not fire for per-entry reports (like busy / full)', async () => {
+        const m = newManager({ maxInputsBytes: 20 })
+        const job = new Job({ jobName: 'm' }, vi.fn())
+        const failed = vi.fn()
+        m.hook('enqueueFailed', failed)
+        await m.enqueueMany(job, [{ runId: 'big', inputs: big }, { runId: 'n', inputs: 1n }, { runId: 'a', inputs: 1 }])
+        await m.enqueueMany(job, [{ runId: 'big', inputs: big }])
+        expect(failed).not.toHaveBeenCalled()
+      })
+
+      it('Job.enqueueMany reports the same way', async () => {
+        const m = newManager({ maxInputsBytes: 20 })
+        const job = m.createJob<unknown>({ jobName: 'm' }, vi.fn())
+        const results = await job.enqueueMany([{ runId: 'a', inputs: 1 }, { runId: 'b', inputs: big }])
+        expect(results.map((r) => r.status)).toEqual(['queued', 'inputs-too-large'])
+        const rejected = results[1]
+        if (rejected.status !== 'inputs-too-large') throw new Error('expected inputs-too-large')
+        expect([rejected.size, rejected.limit]).toEqual([52, 20])
+      })
+
+      it('single enqueue / queue / queueFirst still throw RedisJMEnqueueError (and fire enqueueFailed)', async () => {
+        const m = newManager({ maxInputsBytes: 20 })
+        const job = new Job({ jobName: 'm' }, vi.fn())
+        const failed = vi.fn()
+        m.hook('enqueueFailed', failed)
+        vi.mocked(redis.evalsha).mockClear()
+        vi.mocked(redis.eval).mockClear()
+        await expect(m.enqueue(job, 'a', big)).rejects.toMatchObject({ name: 'RedisJMEnqueueError', reason: 'inputs-too-large', jobId: 'm#a' })
+        await expect(m.queueFirst(job, 'b', big)).rejects.toMatchObject({ reason: 'inputs-too-large', jobId: 'm#b' })
+        const err = await m.queue(job, 'n', 1n).catch((e) => e)
+        expect(err).toBeInstanceOf(RedisJMEnqueueError)
+        expect(err).toMatchObject({ reason: 'inputs-unserializable', jobId: 'm#n' })
+        expect(err.cause).toBeInstanceOf(TypeError)
+        await expect(job.enqueue('c', { n: 2n }, m))
+          .rejects.toMatchObject({ reason: 'inputs-unserializable' })
+        expect(failed.mock.calls.map(([p]) => p.reason))
+          .toEqual(['inputs-too-large', 'inputs-too-large', 'inputs-unserializable', 'inputs-unserializable'])
+        expect(scriptCalls()).toBe(0)
+      })
     })
   })
 

@@ -37,6 +37,30 @@ describe.skipIf(!REDIS_URL)('phase-2 integration (shared Redis)', () => {
     expect(await h.redis.sismember(`redisjm:${group}:locks`, 'capped#3')).toBe(0)
   })
 
+  it('enqueueMany reports oversized / unserializable entries per entry; the rest enqueue through the real script', async () => {
+    const group = newGroup()
+    const m = newManager({ maintenanceInterval: 0, maxInputsBytes: 20 }, group)
+    const job = new Job<unknown>({ jobName: 'mixed', maxQueued: 2 }, async () => {})
+    const results = await m.enqueueMany(job, [
+      { runId: 'a', inputs: 1 },
+      { runId: 'big', inputs: 'x'.repeat(50) },
+      { runId: 'n', inputs: { n: 1n } },
+      { runId: 'b', inputs: 2 },
+      { runId: 'c', inputs: 3 },
+    ])
+    expect(results).toEqual([
+      { status: 'queued', jobId: 'mixed#a' },
+      { status: 'inputs-too-large', jobId: 'mixed#big', size: 52, limit: 20 },
+      { status: 'inputs-unserializable', jobId: 'mixed#n', error: expect.any(TypeError) },
+      { status: 'queued', jobId: 'mixed#b' },
+      { status: 'full', jobId: 'mixed#c' }, // rejected entries took no cap slot
+    ])
+    expect(await h.redis.lrange(`redisjm:${group}:queue`, 0, -1)).toEqual(['mixed#a', 'mixed#b'])
+    expect((await h.redis.smembers(`redisjm:${group}:locks`)).sort()).toEqual(['mixed#a', 'mixed#b'])
+    expect(await h.redis.hexists(`redisjm:${group}:log`, 'mixed#big')).toBe(0)
+    expect((await m.get('mixed#b'))?.inputs).toBe(2)
+  })
+
   it('drains an old lane after a lane change without popping or charging other jobs queued there', async () => {
     const group = newGroup()
     const producer = newManager({ maintenanceInterval: 0 }, group)

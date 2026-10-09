@@ -146,7 +146,7 @@ new RedisJM(redis: Redis, targetGroup: string, options?: RedisJMOptions)
 | `concurrency` | `1` | Max runs a single instance executes simultaneously (maintenance is not affected — it has its own timer). Must be a positive integer — the constructor floors it and throws `TypeError` if `< 1` or non-finite. See [Concurrency](#concurrency) |
 | `laneConcurrency` | `{}` | Per-lane cap on this instance's simultaneous poll-loop runs (`'default'` key = default lane), within `concurrency`. See [Concurrency](#concurrency) |
 | `laneCaps` | `{}` | Per-lane enqueue caps (`'default'` key = default lane): an enqueue onto a lane whose list already holds `>= cap` entries returns `'full'`. See [Backpressure](#backpressure) |
-| `maxInputsBytes` | `0` (unlimited) | Max size of a run's JSON-serialized inputs; a larger enqueue throws `RedisJMEnqueueError` with reason `'inputs-too-large'` before anything is written. A job's own `maxInputsBytes` wins |
+| `maxInputsBytes` | `0` (unlimited) | Max size of a run's JSON-serialized inputs; a larger single enqueue throws `RedisJMEnqueueError` with reason `'inputs-too-large'` before anything is written (`enqueueMany` reports such an entry per entry instead). A job's own `maxInputsBytes` wins |
 | `maxRecordsPerPass` | `1000` | Upper bound on the items each maintenance stage examines per pass. See [Maintenance](#maintenance) |
 | `memoryWarnRatio` | `0.8` | `used_memory / maxmemory` ratio at which the maintenance timer fires `memoryPressure` and logs a warning (once per crossing). `0` disables; ignored when Redis has no `maxmemory` |
 | `unknownJobRequeueLimit` | `5` | Times a job whose name isn't registered on the popping instance is re-queued (lock held) for a sibling instance before being dropped as an error. `0` restores the legacy drop-on-first-pop behavior |
@@ -188,7 +188,7 @@ Options:
 | `'busy'` | The job already has `>= maxInFlight` runs holding a lock. Nothing was written. | Skip this trigger, or try again later. See [Backpressure](#backpressure). |
 | `'full'` | The lane's queue is at its cap (`maxQueued` / `laneCaps`). Nothing was written. | Shed load upstream (e.g. respond 429/503) and retry later with backoff. |
 
-Redis failures are **not** a status: they throw [`RedisJMEnqueueError`](#redisjmenqueueerror) (and fire the manager-level `enqueueFailed` hook). Validation errors (bad lane, bad delay, `first` + `delay`) throw a plain `TypeError`/`Error`. See [Failure handling](#failure-handling).
+Redis failures are **not** a status: they throw [`RedisJMEnqueueError`](#redisjmenqueueerror) (and fire the manager-level `enqueueFailed` hook). So do inputs over `maxInputsBytes` (`'inputs-too-large'`) and inputs `JSON.stringify` can't serialize — a BigInt, a circular reference (`'inputs-unserializable'`) — both before any Redis traffic. Validation errors (bad lane, bad delay, `first` + `delay`) throw a plain `TypeError`/`Error`. See [Failure handling](#failure-handling).
 
 ```typescript
 const { status } = await manager.enqueue(job, 'order-123', { orderId: '123' })
@@ -196,15 +196,27 @@ await manager.enqueue(job, 'urgent', { orderId: '9' }, { first: true })
 await manager.enqueue(job, 'later', { orderId: '10' }, { delay: 30_000 })
 ```
 
-##### `enqueueMany<TInputs>(job, entries, options?): Promise<EnqueueResult[]>`
+##### `enqueueMany<TInputs>(job, entries, options?): Promise<EnqueueManyResult[]>`
 
-Enqueues many runs of **one** job in a single atomic script call and returns one `EnqueueResult` per entry, in entry order — batch producers don't pay one round trip per run. Each entry is checked like a single `enqueue` (dedupe — including duplicates within the batch — `maxInFlight`, and the lane cap as the batch fills the lane); earlier entries win a cap/`maxInFlight` slot. With `first: true` the batch lands at the head of the lane **in its given order**.
+Enqueues many runs of **one** job in a single atomic script call and returns one result per entry, in entry order — batch producers don't pay one round trip per run. Each entry is checked like a single `enqueue` (dedupe — including duplicates within the batch — `maxInFlight`, and the lane cap as the batch fills the lane); earlier entries win a cap/`maxInFlight` slot. With `first: true` the batch lands at the head of the lane **in its given order**.
 
-All-or-nothing on failure: a Redis failure throws one `RedisJMEnqueueError` (its `jobId` is the first entry's) and nothing was written; one entry with oversized inputs rejects the whole batch before any write.
+An entry whose inputs a single `enqueue` would reject before any Redis traffic is **reported per entry** instead of failing the batch, and left out of the script call:
+
+| `status` | Extra fields | Meaning |
+|---|---|---|
+| `'inputs-too-large'` | `size`, `limit` | Its serialized inputs are `size` bytes (UTF-8), over `limit` (the effective `maxInputsBytes`). |
+| `'inputs-unserializable'` | `error` | `JSON.stringify` of its inputs threw (a BigInt, a circular reference, a throwing `toJSON`). |
+
+The other entries enqueue as usual. A reported entry takes no lane-cap or `maxInFlight` slot and doesn't dedupe a later copy of its `runId` in the same batch (that copy can still be `'queued'`); when every entry is reported, Redis isn't called. Like `'busy'` / `'full'`, these are results: `enqueueFailed` doesn't fire for them — count them from the returned array.
+
+All-or-nothing on a Redis failure: it throws one `RedisJMEnqueueError` (its `jobId` is the first entry sent to Redis) and nothing was written.
 
 ```typescript
 const results = await manager.enqueueMany(job, orders.map((o) => ({ runId: o.id, inputs: o })))
 const notQueued = results.filter((r) => r.status !== 'queued')
+for (const r of results) {
+  if (r.status === 'inputs-too-large') log.warn(`${r.jobId}: ${r.size} bytes > ${r.limit}`)
+}
 ```
 
 > Keep batches to hundreds — at most a few thousand — entries: the script blocks Redis for its duration.
@@ -567,9 +579,9 @@ const { status } = await job.enqueue('order-123', { orderId: '123' })
 if (status === 'deduped') console.log('already in flight')
 ```
 
-##### `enqueueMany(entries, manager?, options?): Promise<EnqueueResult[]>`
+##### `enqueueMany(entries, manager?, options?): Promise<EnqueueManyResult[]>`
 
-Delegates to [`RedisJM.enqueueMany`](#enqueuemanytinputsjob-entries-options-promiseenqueueresult).
+Delegates to [`RedisJM.enqueueMany`](#enqueuemanytinputsjob-entries-options-promiseenqueuemanyresult).
 
 ##### `queue(runId, inputs, manager?, options?): Promise<boolean>` / `queueFirst(runId, inputs, manager?, options?): Promise<boolean>`
 
@@ -595,7 +607,7 @@ Returns `"jobName#runId"`.
 
 #### `RedisJMEnqueueError`
 
-Thrown by `enqueue` / `enqueueMany` / `queue` / `queueFirst` (and their `Job` counterparts) when Redis refuses or fails the enqueue, or before any write when the inputs are too large. Fields: `reason`, `jobId` (`"jobName#runId"`; the first entry's for a batch), `cause` (the underlying error).
+Thrown by `enqueue` / `enqueueMany` / `queue` / `queueFirst` (and their `Job` counterparts) when Redis refuses or fails the enqueue, or — by the single-run calls — before any write when the inputs are too large or can't be serialized (`enqueueMany` reports those per entry). Fields: `reason`, `jobId` (`"jobName#runId"`; for a batch, the first entry sent to Redis), `cause` (the underlying error).
 
 | `reason` | Meaning | Was anything written? |
 |---|---|---|
@@ -603,7 +615,8 @@ Thrown by `enqueue` / `enqueueMany` / `queue` / `queueFirst` (and their `Job` co
 | `'readonly'` | The client is talking to a read-only replica (e.g. mid-failover) | No |
 | `'connection'` | The connection is gone or never came up | **Unknown** — the script may still have run. Retrying the same `runId` is safe (it may come back `'deduped'`) |
 | `'timeout'` | The client gave up waiting (ioredis `MaxRetriesPerRequestError`, `commandTimeout`) | **Unknown** — as above |
-| `'inputs-too-large'` | Serialized inputs exceed `maxInputsBytes` | No — rejected before any Redis traffic |
+| `'inputs-too-large'` | Serialized inputs exceed `maxInputsBytes` (single-run calls only) | No — rejected before any Redis traffic |
+| `'inputs-unserializable'` | `JSON.stringify` of the inputs threw — a BigInt, a circular reference (single-run calls only; `cause` is the stringify error) | No — rejected before any Redis traffic |
 | `'unknown'` | Anything else | Treat as unknown |
 
 #### `JobTimeoutError`
@@ -653,7 +666,7 @@ Both `Job` and `RedisJM` emit events via [hookable](https://github.com/unjs/hook
 | `timeout` | `error, timeoutMs` | **manager only** | An attempt exceeded its execution timeout; fires before that attempt's `retry`/`error` |
 | `heartbeat` | — | Job + manager | Periodic heartbeat tick |
 | `update` | `progress?, attrs?` | Job + manager | On setProgress/setAttrs |
-| `enqueueFailed` | `{ jobId, jobName, runId, reason, error }` | **manager only** | An enqueue threw `RedisJMEnqueueError` (fired right before it is thrown) |
+| `enqueueFailed` | `{ jobId, jobName, runId, reason, error }` | **manager only** | An enqueue threw `RedisJMEnqueueError` (fired right before it is thrown). Not for entries `enqueueMany` reports per entry |
 | `startFailed` | `{ jobId, jobName, runId, reason, action, error, attempt? }` | **manager only** | A popped run failed to start; `action` says how it was recovered — see [Start-failure recovery](#start-failure-recovery) |
 | `memoryPressure` | a `health()` snapshot | **manager only** | Redis memory crossed `memoryWarnRatio` (from the maintenance timer; once per crossing) |
 | `maintenance` | `{ result, failedOps, error?, reason?, durationMs }` | **manager only** | A maintenance pass THIS instance ran finished (timer, `runMaintenance()`, `performMaintenance()`, the legacy job), or could not run because of an error. Not fired when another instance holds the lock. On the timer it fires before `memoryPressure` — see [Maintenance](#maintenance-hook) |
@@ -917,6 +930,7 @@ async function trigger(runId: string, inputs: Inputs) {
       case 'timeout':          // ambiguous: retrying with the SAME runId is safe (may return 'deduped')
         return (await job.enqueue(runId, inputs)).status
       case 'inputs-too-large': // store the payload elsewhere and enqueue a reference
+      case 'inputs-unserializable': // a BigInt / circular reference in the inputs: a producer bug
         throw err
       default:
         throw err
@@ -925,7 +939,7 @@ async function trigger(runId: string, inputs: Inputs) {
 }
 ```
 
-Every `RedisJMEnqueueError` also fires the manager-level `enqueueFailed` hook (wire it to metrics), and OOM refusals are counted in `health().oomRefusals`.
+Every `RedisJMEnqueueError` also fires the manager-level `enqueueFailed` hook (wire it to metrics), and OOM refusals are counted in `health().oomRefusals`. `enqueueMany` reports `'inputs-too-large'` / `'inputs-unserializable'` entries in its results instead (no throw, no hook).
 
 ### Start-failure recovery
 
@@ -1157,6 +1171,18 @@ Roll a lane-aware version out to **every** instance in the group **before** any 
 - [ ] Clocks synced (NTP) across instances.
 - [ ] Lane changes shipped in a separate deploy from library upgrades.
 
+## Upgrading to 0.4
+
+0.4 changes how enqueues handle inputs rejected before any Redis traffic — mainly in `enqueueMany` — and nothing else; no Redis format change.
+
+| Change | What to do |
+|---|---|
+| **`enqueueMany` reports an oversized entry per entry** (`{ status: 'inputs-too-large', jobId, size, limit }`) instead of throwing `RedisJMEnqueueError('inputs-too-large')` for the whole batch. The other entries are now enqueued; the reported one takes no cap / `maxInFlight` slot and doesn't dedupe a later copy of its `runId`. | A caller that relied on the throw to abort the batch now gets a resolved array: check for `'inputs-too-large'` in the results. |
+| **Inputs `JSON.stringify` can't serialize** (a BigInt, a circular reference) no longer escape as a raw `TypeError`: `enqueueMany` reports `{ status: 'inputs-unserializable', jobId, error }` per entry, single `enqueue` / `queue` / `queueFirst` throw `RedisJMEnqueueError` with the new reason `'inputs-unserializable'` (the `TypeError` is its `cause`) and fire `enqueueFailed`. | Catch `RedisJMEnqueueError` instead of `TypeError`. An exhaustive `switch` over `EnqueueErrorReason` needs the new case. |
+| **`enqueueFailed` no longer fires for those `enqueueMany` entries** — it fires only for an enqueue that throws (single-run calls, and a Redis failure of a batch). | If `enqueue_failed{reason="inputs-too-large"}` metrics must keep counting batch entries, count them from the `enqueueMany` results. |
+| **`enqueueMany` / `Job.enqueueMany` return `EnqueueManyResult[]`** (`EnqueueResult` plus the two statuses above). `enqueue` / `queue` / `every()` and `EnqueueResult` are unchanged. | An exhaustive `switch` over `enqueueMany` statuses needs the two new cases. |
+| A batch's Redis-failure `RedisJMEnqueueError.jobId` is the first entry **sent** to Redis (reported entries aren't sent). | Nothing, unless you matched it against `entries[0]`. |
+
 ## Upgrading to 0.3
 
 0.3 adds features (`abortGraceMs`, `inFlightCount()`, `fleet()`, `listQueued()` / `getMany()`, the `maintenance` hook) and **no Redis format change to existing keys**; Redis ≥ 7.0 and standalone remain the requirements. What to know:
@@ -1295,9 +1321,13 @@ type JobStatus = 'queued' | 'running' | 'finished' | 'error' | 'stale' | 'delaye
 type LaneStrategy = 'roundRobin' | 'priority'
 type RedisJMLogger = (message: string, error?: Error) => void
 type RedisErrorReason = 'oom' | 'readonly' | 'connection' | 'timeout' | 'unknown'
-type EnqueueErrorReason = RedisErrorReason | 'inputs-too-large'
+type EnqueueErrorReason = RedisErrorReason | 'inputs-too-large' | 'inputs-unserializable'
 
 interface EnqueueResult { status: 'queued' | 'deduped' | 'busy' | 'full'; jobId: string }
+type EnqueueManyResult =
+  | EnqueueResult
+  | { status: 'inputs-too-large'; jobId: string; size: number; limit: number }
+  | { status: 'inputs-unserializable'; jobId: string; error: Error }
 interface QueueOptions { delay?: number }
 interface EnqueueOptions extends QueueOptions { first?: boolean }
 interface StopOptions { abort?: boolean }

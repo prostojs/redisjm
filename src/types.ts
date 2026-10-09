@@ -78,8 +78,9 @@ export interface JobMetadata {
    */
   maxQueued?: number
   /**
-   * Max size in bytes of the JSON-serialized `inputs` of one run; a larger enqueue throws
-   * `RedisJMEnqueueError` with reason `'inputs-too-large'` before anything is written. Overrides
+   * Max size in bytes of the JSON-serialized `inputs` of one run; a larger single enqueue throws
+   * `RedisJMEnqueueError` with reason `'inputs-too-large'` before anything is written (`enqueueMany`
+   * reports such an entry as `{ status: 'inputs-too-large' }` instead). Overrides
    * `RedisJMOptions.maxInputsBytes`; `0` disables the manager default for this job.
    */
   maxInputsBytes?: number
@@ -126,6 +127,21 @@ export interface EnqueueResult {
   /** The `"jobName#runId"` the enqueue addressed. */
   jobId: string
 }
+
+/**
+ * Outcome of one `RedisJM.enqueueMany` / `Job.enqueueMany` entry: an {@link EnqueueResult}, or an entry
+ * rejected before any Redis traffic (nothing written for it; the other entries are enqueued as usual):
+ * - `'inputs-too-large'`      — its serialized inputs (`size` bytes, UTF-8) exceed `limit` (the effective
+ *                               `maxInputsBytes`).
+ * - `'inputs-unserializable'` — `JSON.stringify` of its inputs threw (`error`: a BigInt, a circular
+ *                               reference, a throwing `toJSON`).
+ *
+ * A single `enqueue` / `queue` / `queueFirst` throws `RedisJMEnqueueError` with the same `reason` instead.
+ */
+export type EnqueueManyResult =
+  | EnqueueResult
+  | { status: 'inputs-too-large'; jobId: string; size: number; limit: number }
+  | { status: 'inputs-unserializable'; jobId: string; error: Error }
 
 /** Optional configuration for `RedisJM`. All fields have defaults. */
 export interface RedisJMOptions {
@@ -473,7 +489,10 @@ export interface JobTimeoutEventPayload<TInputs = unknown> extends JobErrorEvent
   timeoutMs: number
 }
 
-/** Payload for the manager-level `enqueueFailed` event (an enqueue that threw `RedisJMEnqueueError`). */
+/**
+ * Payload for the manager-level `enqueueFailed` event (an enqueue that threw `RedisJMEnqueueError`). Entries
+ * `enqueueMany` reports per entry (`'inputs-too-large'` / `'inputs-unserializable'`) don't fire it.
+ */
 export interface EnqueueFailedEventPayload {
   jobId: string
   jobName: string
@@ -568,7 +587,11 @@ export interface RedisJMHooks {
    * same attempt (a timeout is an ordinary failure, so one of those follows).
    */
   timeout: (payload: JobTimeoutEventPayload) => void | Promise<void>
-  /** Fires when an enqueue failed with `RedisJMEnqueueError` (right before it is thrown to the caller). */
+  /**
+   * Fires when an enqueue failed with `RedisJMEnqueueError` (right before it is thrown to the caller). Not for
+   * the entries `enqueueMany` reports per entry (`'inputs-too-large'` / `'inputs-unserializable'`) —
+   * like `'busy'` / `'full'`, those are results, read them from the returned array.
+   */
   enqueueFailed: (payload: EnqueueFailedEventPayload) => void | Promise<void>
   /** Fires when a popped run failed to start and was requeued, deferred, or failed (see the payload). */
   startFailed: (payload: StartFailedEventPayload) => void | Promise<void>

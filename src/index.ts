@@ -5,6 +5,7 @@ export type { EnqueueErrorReason, RedisErrorReason } from './errors'
 export { createMaintenanceJob, MAINTENANCE_JOB_NAME, MAINTENANCE_LANE } from './maintenance'
 export type {
   EnqueueFailedEventPayload,
+  EnqueueManyResult,
   EnqueueOptions,
   EnqueueResult,
   EveryOptions,

@@ -145,7 +145,7 @@ RedisJM Methods:
  - `isLocked(jobId)` — checks if jobId is in the locks set
  - `isQueued(jobId)` — deprecated alias for isLocked
  - `enqueue(job, runId, inputs, options?)` — one enqueue-script call → `{ status: 'queued'|'deduped'|'busy'|'full', jobId }`. Redis failure → `RedisJMEnqueueError` + `enqueueFailed` hook; OOM counted for health().
- - `enqueueMany(job, entries, options?)` — same, many runs of one job in ONE script call → per-entry results. All-or-nothing on failure; an oversized entry rejects the batch before any write.
+ - `enqueueMany(job, entries, options?)` — same, many runs of one job in ONE script call → per-entry `EnqueueManyResult`. An entry over maxInputsBytes → `{ status: 'inputs-too-large', jobId, size, limit }`, unserializable inputs → `{ status: 'inputs-unserializable', jobId, error }`: reported per entry, left out of the script (no cap/maxInFlight slot, no in-batch dedupe), no enqueueFailed; all entries rejected → no Redis call. All-or-nothing on a Redis failure (throws; jobId = first sent entry).
  - `queue(job, runId, inputs, options?)` / `queueFirst(...)` — boolean shorthands (`true` iff queued).
  - `every(job, intervalMs, { inputs, runId?, immediate?, skipIfInFlight? })` — timer enqueue; returns a cancel fn; cleared by stop(). skipIfInFlight (default) = fixed runId (default 'every') so the lock dedupes across instances; false = `<runId>-<tickMs>`. Failures logged (+ enqueueFailed), never thrown.
  - `stats()` — best-effort snapshot: per-lane queue depths, delayed count, lock count, status histogram (full log scan). Non-transactional; lane visibility scoped to lanes this instance can name.
@@ -288,7 +288,7 @@ Self-heal (stale recovery): staleness detection can't tell a dead handler from o
 
 - Lane caps: effective cap = min(JobMetadata.maxQueued, laneCaps[laneLabel]) when either is defined; checked in the enqueue script against LLEN of the lane list (delayed entries don't count; a batch counts its own accepted non-delayed entries). Full → `full`, nothing written. Reject-only by design (no drop-oldest: silently dropping accepted work is the failure mode being prevented). Internal pushes (promotion, unknown-job requeue, start-failure requeue, maintenance requeue) bypass the cap.
 - maxInFlight: compared against SCARD of the job's lock set inside the enqueue script → `busy`. Drift (members whose lock is gone, e.g. released by a pre-0.2 instance) can over-count until pruned; pre-0.2 enqueues are not added, so it can under-count during a mixed deploy.
-- maxInputsBytes: Buffer.byteLength(JSON.stringify(inputs)) checked in JS before any Redis traffic → RedisJMEnqueueError('inputs-too-large') (+ enqueueFailed).
+- maxInputsBytes: Buffer.byteLength(JSON.stringify(inputs)) checked in JS before any Redis traffic → RedisJMEnqueueError('inputs-too-large') (+ enqueueFailed) for single enqueue/queue/queueFirst; a stringify throw → RedisJMEnqueueError('inputs-unserializable') (+ enqueueFailed). enqueueMany reports both per entry instead (no throw, no enqueueFailed).
 
 ### Lanes
 

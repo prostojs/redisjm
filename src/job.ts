@@ -5,6 +5,7 @@ import type { RedisJM } from './redisjm'
 import { checkAbortGraceMs, positiveOrZero, toError, toTaggable } from './utils'
 import type {
   EnqueueOptions,
+  EnqueueManyResult,
   EnqueueResult,
   JobAttrs,
   JobAttrValue,
@@ -351,7 +352,7 @@ export class Job<TInputs = unknown, TAttrs extends { [K in keyof TAttrs]: JobAtt
     entries: Array<{ runId: string; inputs: TInputs }>,
     manager?: RedisJM,
     options?: EnqueueOptions,
-  ): Promise<EnqueueResult[]> {
+  ): Promise<EnqueueManyResult[]> {
     return this.resolveManager(manager).enqueueMany(this as Job<any, any>, entries, options)
   }
 

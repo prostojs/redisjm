@@ -16,10 +16,11 @@ import { toError } from './utils'
 export type RedisErrorReason = 'oom' | 'readonly' | 'connection' | 'timeout' | 'unknown'
 
 /**
- * Reason carried by {@link RedisJMEnqueueError}: a classified Redis failure, or `'inputs-too-large'`
- * when the serialized inputs exceed a configured size limit (rejected before any Redis write).
+ * Reason carried by {@link RedisJMEnqueueError}: a classified Redis failure, `'inputs-too-large'` when the
+ * serialized inputs exceed a configured size limit, or `'inputs-unserializable'` when `JSON.stringify` of
+ * the inputs threw (a BigInt, a circular reference). The last two are rejected before any Redis write.
  */
-export type EnqueueErrorReason = RedisErrorReason | 'inputs-too-large'
+export type EnqueueErrorReason = RedisErrorReason | 'inputs-too-large' | 'inputs-unserializable'
 
 /** Socket-level error codes (Node `err.code`) that mean the connection itself is unusable. */
 const CONNECTION_ERROR_CODES = new Set([
@@ -77,9 +78,11 @@ export function classifyRedisError(err: unknown): RedisErrorReason {
 
 /**
  * Thrown by `queue()` / `queueFirst()` / `enqueue()` / `enqueueMany()` (and their `Job` counterparts)
- * when Redis refuses or fails an enqueue, or (reason `'inputs-too-large'`) before any write when the
- * serialized inputs exceed the size limit. The enqueue is one atomic script, so a refused one (e.g. OOM —
- * Redis refuses the script up front) wrote nothing and retrying the same runId is safe. A `connection` /
+ * when Redis refuses or fails an enqueue, or — by the single-run calls only — before any write when the
+ * inputs exceed the size limit (`'inputs-too-large'`) or can't be serialized (`'inputs-unserializable'`);
+ * `enqueueMany()` reports those two per entry instead (see `EnqueueManyResult`). The enqueue is one atomic
+ * script, so a refused one (e.g. OOM — Redis refuses the script up front) wrote nothing and retrying the
+ * same runId is safe. A `connection` /
  * `timeout` failure is ambiguous: the script may still have run on the server, so a retry can come back
  * `'deduped'`. Validation errors (bad lane, bad delay) are NOT wrapped — they stay plain `TypeError`/`Error`.
  *
@@ -95,11 +98,11 @@ export function classifyRedisError(err: unknown): RedisErrorReason {
  * ```
  */
 export class RedisJMEnqueueError extends Error {
-  /** Classified cause of the failure (see {@link RedisErrorReason}, plus `'inputs-too-large'`). */
+  /** Classified cause of the failure (see {@link RedisErrorReason}, plus `'inputs-too-large'` / `'inputs-unserializable'`). */
   readonly reason: EnqueueErrorReason
   /** The `"jobName#runId"` whose enqueue failed. */
   readonly jobId: string
-  /** The underlying error (the Redis reply / client error). */
+  /** The underlying error (the Redis reply / client error, or the `JSON.stringify` error). */
   override readonly cause: Error
 
   constructor(reason: EnqueueErrorReason, jobId: string, cause: unknown) {

@@ -20,6 +20,7 @@ import {
 } from './scripts'
 import { checkAbortGraceMs, nonNegativeInt, positiveOrZero, toError, toTaggable } from './utils'
 import type {
+  EnqueueManyResult,
   EnqueueOptions,
   EnqueueResult,
   EveryOptions,
@@ -1137,7 +1138,9 @@ export class RedisJM extends Hookable<RedisJMHooks> {
    *
    * Every Redis failure throws `RedisJMEnqueueError` (with a classified `reason`, e.g. `'oom'` when
    * Redis is at `maxmemory` — then nothing at all was written) and fires the manager-level
-   * `enqueueFailed` hook. Validation errors (bad lane / delay) throw a plain `TypeError`/`Error`.
+   * `enqueueFailed` hook; so do inputs over `maxInputsBytes` (`'inputs-too-large'`) and inputs
+   * `JSON.stringify` can't serialize (`'inputs-unserializable'`), both before any Redis call.
+   * Validation errors (bad lane / delay) throw a plain `TypeError`/`Error`.
    *
    * @example
    * ```ts
@@ -1146,8 +1149,7 @@ export class RedisJM extends Hookable<RedisJMHooks> {
    * ```
    */
   async enqueue<TInputs>(job: Job<TInputs, any>, runId: string, inputs: TInputs, options?: EnqueueOptions): Promise<EnqueueResult> {
-    const [result] = await this.enqueueRun(job, [{ runId, inputs }], options?.first ? 'lpush' : 'rpush', options)
-    return result
+    return this.enqueueOne(job, runId, inputs, options?.first ? 'lpush' : 'rpush', options)
   }
 
   /**
@@ -1156,10 +1158,16 @@ export class RedisJM extends Hookable<RedisJMHooks> {
    * single `enqueue` (dedupe, `maxInFlight`, lane cap — counted as the batch fills the lane). With
    * `first: true` the batch lands at the head of the lane in its given order.
    *
-   * All-or-nothing on failure: a Redis failure (e.g. OOM — Redis refuses the whole script) throws one
-   * `RedisJMEnqueueError` (its `jobId` is the first entry's) and NOTHING was written; an entry with
-   * oversized inputs rejects the whole batch before any write. Keep batches to a sensible size
-   * (hundreds to a few thousand): one script call blocks Redis for its duration.
+   * An entry whose inputs are over `maxInputsBytes` or can't be serialized is reported per entry
+   * (`'inputs-too-large'` with `size` / `limit`, `'inputs-unserializable'` with `error` — see
+   * {@link EnqueueManyResult}) and left out of the script call: the other entries enqueue as usual, and
+   * the rejected one takes no cap / `maxInFlight` slot and doesn't dedupe a later copy of its runId.
+   * Like `'busy'` / `'full'`, these are results: `enqueueFailed` doesn't fire for them. When every entry
+   * is rejected, Redis isn't called at all.
+   *
+   * All-or-nothing on a Redis failure (e.g. OOM — Redis refuses the whole script): it throws one
+   * `RedisJMEnqueueError` (its `jobId` is the first sent entry's) and NOTHING was written. Keep batches to
+   * a sensible size (hundreds to a few thousand): one script call blocks Redis for its duration.
    *
    * @example
    * ```ts
@@ -1171,8 +1179,8 @@ export class RedisJM extends Hookable<RedisJMHooks> {
     job: Job<TInputs, any>,
     entries: Array<{ runId: string; inputs: TInputs }>,
     options?: EnqueueOptions,
-  ): Promise<EnqueueResult[]> {
-    return this.enqueueRun(job, entries, options?.first ? 'lpush' : 'rpush', options)
+  ): Promise<EnqueueManyResult[]> {
+    return this.enqueueRun(job, entries, options?.first ? 'lpush' : 'rpush', options, true)
   }
 
   /**
@@ -1189,7 +1197,7 @@ export class RedisJM extends Hookable<RedisJMHooks> {
    * ```
    */
   async queue<TInputs>(job: Job<TInputs, any>, runId: string, inputs: TInputs, options?: QueueOptions): Promise<boolean> {
-    return (await this.enqueueRun(job, [{ runId, inputs }], 'rpush', options))[0].status === 'queued'
+    return (await this.enqueueOne(job, runId, inputs, 'rpush', options)).status === 'queued'
   }
 
   /**
@@ -1203,7 +1211,7 @@ export class RedisJM extends Hookable<RedisJMHooks> {
    * ```
    */
   async queueFirst<TInputs>(job: Job<TInputs, any>, runId: string, inputs: TInputs, options?: QueueOptions): Promise<boolean> {
-    return (await this.enqueueRun(job, [{ runId, inputs }], 'lpush', options))[0].status === 'queued'
+    return (await this.enqueueOne(job, runId, inputs, 'lpush', options)).status === 'queued'
   }
 
   /**
@@ -3110,8 +3118,24 @@ export class RedisJM extends Hookable<RedisJMHooks> {
   }
 
   /**
+   * {@link enqueueRun} of one entry (`enqueue` / `queue` / `queueFirst`). Not per-entry mode, so a
+   * rejected input throws and the one result is always an {@link EnqueueResult}.
+   */
+  private async enqueueOne<TInputs>(
+    job: Job<TInputs, any>,
+    runId: string,
+    inputs: TInputs,
+    pushCmd: 'rpush' | 'lpush',
+    options?: QueueOptions,
+  ): Promise<EnqueueResult> {
+    const [result] = await this.enqueueRun(job, [{ runId, inputs }], pushCmd, options)
+    return result as EnqueueResult
+  }
+
+  /**
    * The single enqueue implementation behind `enqueue` / `enqueueMany` / `queue` / `queueFirst`:
-   * validation and the inputs-size guard in JS, then ONE `ENQUEUE_SCRIPT` call for all entries (dedupe
+   * validation and the inputs serialize/size guard in JS (a rejected entry throws, or with `perEntry` —
+   * `enqueueMany` — is reported and left out), then ONE `ENQUEUE_SCRIPT` call for the remaining entries (dedupe
    * via the run lock, `maxInFlight` → `'busy'`, lane cap → `'full'`, record + queue/delayed entry +
    * bookkeeping sets). The script is atomic and, under maxmemory, refused before any write — so a failed
    * enqueue leaves nothing behind and there is nothing to roll back. A Redis failure throws
@@ -3122,7 +3146,8 @@ export class RedisJM extends Hookable<RedisJMHooks> {
     entries: Array<{ runId: string; inputs: TInputs }>,
     pushCmd: 'rpush' | 'lpush',
     options?: QueueOptions,
-  ): Promise<EnqueueResult[]> {
+    perEntry = false,
+  ): Promise<EnqueueManyResult[]> {
     // Authoritative lane validation: the producer path never goes through registerJob, so validate
     // here (before any Redis write) as well as at registration.
     this.validateLane(job.getLane(), job.getName())
@@ -3147,21 +3172,39 @@ export class RedisJM extends Hookable<RedisJMHooks> {
     // Effective max serialized inputs size: the job's value wins, `0` = unlimited.
     const maxInputsBytes = meta.maxInputsBytes !== undefined ? positiveOrZero(meta.maxInputsBytes) : this.options.maxInputsBytes
     const args: Array<string | number> = []
-    for (const { runId, inputs } of entries) {
+    // `results[i]` is set here for an entry rejected in JS (per-entry mode only); `sent` holds the indexes
+    // of the entries passed to the script, in entry order — the script's statuses map back through it.
+    const results: EnqueueManyResult[] = new Array(entries.length)
+    const sent: number[] = []
+    for (let i = 0; i < entries.length; i++) {
+      const { runId, inputs } = entries[i]
       const jobId = job.getJobId(runId)
-      const inputsJson = JSON.stringify(inputs) as string | undefined
-      // Size guard BEFORE any Redis traffic: one oversized payload must not be what fills Redis. In a
-      // batch, one oversized entry rejects the whole batch (nothing written).
+      // Serializability and size are checked BEFORE any Redis traffic (one oversized payload must not be
+      // what fills Redis). A single enqueue throws; `enqueueMany` reports the entry and leaves it out of
+      // the script call — so it takes no cap / maxInFlight slot and plays no part in in-batch dedupe.
+      let inputsJson: string | undefined
+      try {
+        inputsJson = JSON.stringify(inputs) as string | undefined
+      } catch (err) {
+        if (!perEntry) throw await this.enqueueFailure(jobName, runId, jobId, err, 'inputs-unserializable')
+        results[i] = { status: 'inputs-unserializable', jobId, error: toError(err) }
+        continue
+      }
       if (maxInputsBytes > 0) {
         const size = Buffer.byteLength(inputsJson ?? '', 'utf8')
         if (size > maxInputsBytes) {
-          throw await this.enqueueFailure(
-            jobName, runId, jobId,
-            new Error(`serialized inputs are ${size} bytes, limit is ${maxInputsBytes}`),
-            'inputs-too-large',
-          )
+          if (!perEntry) {
+            throw await this.enqueueFailure(
+              jobName, runId, jobId,
+              new Error(`serialized inputs are ${size} bytes, limit is ${maxInputsBytes}`),
+              'inputs-too-large',
+            )
+          }
+          results[i] = { status: 'inputs-too-large', jobId, size, limit: maxInputsBytes }
+          continue
         }
       }
+      sent.push(i)
       const record: Omit<JobLogRecord, 'inputs'> = {
         jobId,
         jobName,
@@ -3178,6 +3221,8 @@ export class RedisJM extends Hookable<RedisJMHooks> {
       else record.enqueuedAt = now
       args.push(jobId, serializeRecord(record, inputsJson), record.readyAt ?? 0)
     }
+    // Every entry was rejected in JS: nothing to send.
+    if (sent.length === 0) return results
 
     const keys = [
       this.getLocksKey(),
@@ -3198,15 +3243,15 @@ export class RedisJM extends Hookable<RedisJMHooks> {
     try {
       statuses = await runScript(this.redis, ENQUEUE_SCRIPT, keys, [...header, ...args])
     } catch (err) {
-      // One script call: nothing was written (OOM refuses it up front). Report it per the first entry.
-      const { runId } = entries[0]
+      // One script call: nothing was written (OOM refuses it up front). Report it per the first entry sent.
+      const { runId } = entries[sent[0]]
       throw await this.enqueueFailure(jobName, runId, job.getJobId(runId), err)
     }
     const list = Array.isArray(statuses) ? statuses : []
-    return entries.map(({ runId }, i) => ({
-      status: (list[i] ?? 'deduped') as EnqueueResult['status'],
-      jobId: job.getJobId(runId),
-    }))
+    sent.forEach((i, k) => {
+      results[i] = { status: (list[k] ?? 'deduped') as EnqueueResult['status'], jobId: job.getJobId(entries[i].runId) }
+    })
+    return results
   }
 
   /**
