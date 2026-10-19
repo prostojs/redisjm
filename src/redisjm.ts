@@ -13,6 +13,7 @@ import {
   POP_SCRIPT,
   PRESENCE_SCRIPT,
   PRUNE_JOB_SCRIPT,
+  PRUNE_RESOURCES_SCRIPT,
   PURGE_SCRIPT,
   runScript,
   sha1Hex,
@@ -51,6 +52,7 @@ import type {
   RedisJMOptions,
   RedisJMStats,
   ResolvedRedisJMOptions,
+  ResourceInFlightCounts,
   StartFailedEventPayload,
   StopOptions,
 } from './types'
@@ -73,6 +75,8 @@ const DEFAULT_OPTIONS: Omit<ResolvedRedisJMOptions, 'maintenanceInterval'> = {
   laneConcurrency: {},
   laneCaps: {},
   maxInputsBytes: 0,
+  maxRunIdBytes: 1024,
+  resourceCaps: {},
   maxRecordsPerPass: 1000,
   memoryWarnRatio: 0.8,
 }
@@ -103,6 +107,15 @@ const JOB_PRUNE_BATCH = 100
 
 /** Job-lock-set members sampled per prune call (drift self-heals over passes). */
 const JOB_LOCK_PRUNE_SAMPLE = 200
+
+/** Max resources whose sets one maintenance pass prunes (all in one script call). */
+const RESOURCE_PRUNE_BATCH = 100
+
+/** Lane and resource names: no `#` / `:` / empty (they become key infixes). */
+const NAME_RE = /^[A-Za-z0-9_-]+$/
+
+/** `EnqueueResult.limitedBy` of a job's own `maxInFlight` — so it is not a valid resource name. */
+const JOB_LIMIT = 'job'
 
 /**
  * How long one sighting of a pre-0.2 instance (see `noteLegacyInstance`) keeps maintenance's legacy
@@ -189,6 +202,55 @@ function normalizeLaneLimits(limits: Record<string, number> | undefined): Record
  * for long (each removal is O(1)).
  */
 const DELETE_BATCH_SIZE = 500
+
+/** Whether `name` is a valid lane name: matches `NAME_RE` (key-safe) and has no reserved `__` prefix. */
+function isLaneName(name: unknown): name is string {
+  return typeof name === 'string' && NAME_RE.test(name) && !name.startsWith('__')
+}
+
+/** Whether `name` is a valid resource name (see `JobMetadata.resources`): a lane name other than `'job'`. */
+function isResourceName(name: unknown): name is string {
+  return isLaneName(name) && name !== JOB_LIMIT
+}
+
+/** Throws a `TypeError` (prefixed with `context`) unless `name` is a valid resource name; returns it. */
+function assertResourceName(name: unknown, context: string): string {
+  if (!isResourceName(name)) {
+    throw new TypeError(`${context}: resource name "${String(name)}" is invalid — it must match ${String(NAME_RE)}, must not start with "__" and must not be "${JOB_LIMIT}"`)
+  }
+  return name
+}
+
+/**
+ * The resources a stored record holds (`JobLogRecord.resources`), keeping only well-formed names — a
+ * foreign or corrupt record can never make a lock path touch a key outside the resource namespace.
+ */
+function recordResources(record: JobLogRecord | null | undefined): string[] {
+  const list = record?.resources
+  return Array.isArray(list) ? list.filter(isResourceName) : []
+}
+
+/** Normalizes the `resourceCaps` option, throwing a `TypeError` on a bad name or cap. */
+function normalizeResourceCaps(caps: Record<string, number> | undefined): Record<string, number> {
+  const out: Record<string, number> = {}
+  for (const [name, value] of Object.entries(caps ?? {})) {
+    assertResourceName(name, 'resourceCaps')
+    const cap = nonNegativeInt(value)
+    if (cap === undefined) throw new TypeError(`resourceCaps["${name}"] must be a finite number >= 0, got ${String(value)}`)
+    out[name] = cap
+  }
+  return out
+}
+
+/** An effective size limit: the job's value wins over the manager's; `0` = unlimited. */
+function effectiveLimit(jobValue: number | undefined, managerValue: number): number {
+  return jobValue !== undefined ? positiveOrZero(jobValue) : managerValue
+}
+
+/** Whether `a` and `b` hold the same items in the same order. */
+function sameItems(a: readonly unknown[], b: readonly unknown[]): boolean {
+  return a.length === b.length && a.every((item, i) => item === b[i])
+}
 
 /** Splits `"jobName#runId"` on its FIRST '#'; a separator-less id yields `{ jobName: id, runId: '' }`. */
 function splitJobId(jobId: string): { jobName: string; runId: string } {
@@ -325,6 +387,13 @@ export class RedisJM extends Hookable<RedisJMHooks> {
   private readonly logger: RedisJMLogger
   private readonly registeredJobs = new Set<Job<any, any>>()
   private readonly jobsByName = new Map<string, Job<any, any>>()
+  /**
+   * `resolveResources` results per job name, with the declared array they were resolved from and a copy
+   * of its items (the array is the caller's and may be mutated in place; `resourceCaps` is fixed).
+   * Filled lazily on the enqueue path too, so producer-only instances that never call `registerJob` are
+   * covered.
+   */
+  private readonly resolvedResources = new Map<string, { declared: unknown; snapshot: unknown[]; resources: string[] }>()
   private readonly jobHookCleanups = new Map<Job<any, any>, () => void>()
 
   private pollTimer: ReturnType<typeof setTimeout> | undefined
@@ -493,6 +562,8 @@ export class RedisJM extends Hookable<RedisJMHooks> {
       laneConcurrency: normalizeLaneLimits(options?.laneConcurrency),
       laneCaps: normalizeLaneLimits(options?.laneCaps),
       maxInputsBytes: positiveOrZero(options?.maxInputsBytes),
+      maxRunIdBytes: options?.maxRunIdBytes === undefined ? DEFAULT_OPTIONS.maxRunIdBytes : positiveOrZero(options.maxRunIdBytes),
+      resourceCaps: normalizeResourceCaps(options?.resourceCaps),
       maxRecordsPerPass: Math.max(1, Math.floor(positiveOrZero(options?.maxRecordsPerPass) || DEFAULT_OPTIONS.maxRecordsPerPass)),
       memoryWarnRatio: options?.memoryWarnRatio === undefined
         ? DEFAULT_OPTIONS.memoryWarnRatio
@@ -616,12 +687,16 @@ export class RedisJM extends Hookable<RedisJMHooks> {
     const labels = this.knownLaneLabels()
     for (const lane of Object.keys(this.options.laneCaps)) labels.add(lane)
     for (const lane of Object.keys(this.options.laneConcurrency)) labels.add(lane)
-    const [delayed, claiming, locks, queues] = await Promise.all([
+    const resourceNames = Object.keys(this.options.resourceCaps)
+    const [delayed, claiming, locks, queues, resourceCounts] = await Promise.all([
       this.redis.zcard(this.getDelayedKey()),
       this.redis.zcard(this.getClaimingKey()),
       this.redis.scard(this.getLocksKey()),
       this.laneDepths(labels),
+      Promise.all(resourceNames.map((name) => this.redis.scard(this.getResourceKey(name)))),
     ])
+    const resources: RedisJMHealth['resources'] = Object.fromEntries(resourceNames.map((name, i) =>
+      [name, { inFlight: resourceCounts[i], cap: this.options.resourceCaps[name] }]))
     const queued = Object.values(queues).reduce((a, b) => a + b, 0)
     let running = Math.max(0, locks - queued - delayed - claiming)
     let stale: number | null = null
@@ -633,7 +708,7 @@ export class RedisJM extends Hookable<RedisJMHooks> {
         else if (status === 'stale') stale++
       }
     }
-    return { ...memory, oomRefusals: this.oomRefusals, queues, delayed, claiming, running, stale, locks }
+    return { ...memory, oomRefusals: this.oomRefusals, queues, delayed, claiming, running, stale, locks, resources }
   }
 
   /**
@@ -667,17 +742,7 @@ export class RedisJM extends Hookable<RedisJMHooks> {
    * ```
    */
   async inFlight(jobName: string): Promise<InFlightCounts> {
-    const ids = await this.redis.smembers(this.getJobLocksKey(jobName))
-    const counts: InFlightCounts = { total: 0, queued: 0, delayed: 0, running: 0 }
-    if (ids.length === 0) return counts
-    const values = await this.redis.hmget(this.getLogKey(), ...ids)
-    values.forEach((json, i) => {
-      const status = this.decodeRecord(json, ids[i])?.status
-      if (status === 'queued' || status === 'delayed' || status === 'running') {
-        counts[status]++
-        counts.total++
-      }
-    })
+    const { jobs: _, ...counts } = await this.countHolders(this.getJobLocksKey(jobName), false)
     return counts
   }
 
@@ -696,6 +761,60 @@ export class RedisJM extends Hookable<RedisJMHooks> {
    */
   async inFlightCount(jobName: string): Promise<number> {
     return this.redis.scard(this.getJobLocksKey(jobName))
+  }
+
+  /**
+   * Number of runs holding resource `name` (see `JobMetadata.resources`) — of every job declaring it,
+   * queued (including popped-not-yet-claimed), delayed and running — as ONE O(1) `SCARD`. It is exactly
+   * what the resource's cap is enforced against: an enqueue sees `'busy'` with `limitedBy: name` iff this
+   * is `>= resourceCaps[name]` at that instant.
+   *
+   * @example
+   * ```ts
+   * const writers = await manager.resourceInFlightCount('ticket-writes')
+   * ```
+   */
+  async resourceInFlightCount(name: string): Promise<number> {
+    return this.redis.scard(this.getResourceKey(assertResourceName(name, 'resource')))
+  }
+
+  /**
+   * In-flight runs holding resource `name`, by status and by job: one `SMEMBERS` of the resource set plus
+   * one `HMGET` of those records — O(runs holding it). See `ResourceInFlightCounts`; for the number alone
+   * use {@link resourceInFlightCount}.
+   *
+   * @example
+   * ```ts
+   * const { total, jobs } = await manager.resourceInFlight('ticket-writes')
+   * ```
+   */
+  async resourceInFlight(name: string): Promise<ResourceInFlightCounts> {
+    return this.countHolders(this.getResourceKey(assertResourceName(name, 'resource')), true)
+  }
+
+  /**
+   * The in-flight records among the members of semaphore set `setKey` (a job lock set or a resource set):
+   * one `SMEMBERS` + one `HMGET`, counted by status — and, with `byJob`, by job name. Members without a
+   * live (queued / delayed / running) record are drift and not counted.
+   */
+  private async countHolders(setKey: string, byJob: boolean): Promise<ResourceInFlightCounts> {
+    const ids = await this.redis.smembers(setKey)
+    const counts: ResourceInFlightCounts = { total: 0, queued: 0, delayed: 0, running: 0, jobs: {} }
+    if (ids.length === 0) return counts
+    const values = await this.redis.hmget(this.getLogKey(), ...ids)
+    values.forEach((json, i) => {
+      const record = this.decodeRecord(json, ids[i])
+      const status = record?.status
+      if (status === 'queued' || status === 'delayed' || status === 'running') {
+        counts[status]++
+        counts.total++
+        if (byJob) {
+          const jobName = record!.jobName ?? splitJobId(ids[i]).jobName
+          counts.jobs[jobName] = (counts.jobs[jobName] ?? 0) + 1
+        }
+      }
+    })
+    return counts
   }
 
   /**
@@ -1270,7 +1389,14 @@ export class RedisJM extends Hookable<RedisJMHooks> {
     // `delayed`/retry-scheduled run lives there), any `claiming` entry (popped, not yet claimed), and any
     // pending orphan-suspicion — a manually removed run must not leave a suspects entry that a later
     // maintenance pass would act on (e.g. re-SREM a re-added lock).
-    await this.purge(jobId, 'force', { lane: this.getQueueKey(record?.lane), claiming: true, delayed: true, suspects: true })
+    // The record also names the resource slots to free (without one, maintenance prunes them).
+    await this.purge(jobId, 'force', {
+      lane: this.getQueueKey(record?.lane),
+      claiming: true,
+      delayed: true,
+      suspects: true,
+      resources: recordResources(record),
+    })
   }
 
   /**
@@ -1317,6 +1443,7 @@ export class RedisJM extends Hookable<RedisJMHooks> {
     }
     // Early feedback for a bad lane declaration (enqueue re-validates on the producer path).
     this.validateLane(job.getLane(), jobName)
+    this.resolveResources(job.getMetadata())
     checkAbortGraceMs(job.getAbortGraceMs(), `job "${jobName}" (JobMetadata)`)
     if (this.jobsByName.has(jobName)) {
       throw new Error(`Job with name "${jobName}" is already registered`)
@@ -2455,11 +2582,13 @@ export class RedisJM extends Hookable<RedisJMHooks> {
       (p, key) => (key === legacyKey ? p.exists(key) : p.get(key)),
       ops,
     )
-    const [log, claims, locks, jobs] = await Promise.all([
+    const [log, claims, locks, jobs, resources] = await Promise.all([
       this.readLogStage(toCursor(logCursor), legacySeen === 1, now, ops),
       this.readClaimingStage(now, ops),
       this.readLockStage(toCursor(locksCursor), now, ops),
       this.scanSetBatch(this.getJobRegistryKey(), toCursor(jobsCursor), Math.min(this.options.maxRecordsPerPass, JOB_PRUNE_BATCH)),
+      // The resource registry is small (the configured resources): a random sample per pass covers it.
+      this.readResourceRegistry(ops),
     ])
 
     // ---- DELETE phase — before any write (deletions still succeed when Redis is at maxmemory) ------
@@ -2476,6 +2605,17 @@ export class RedisJM extends Hookable<RedisJMHooks> {
       [this.getLocksKey(), this.getJobLocksKey(jobName), this.getJobLanesKey(jobName), this.getJobRegistryKey()],
       [jobName, JOB_LOCK_PRUNE_SAMPLE],
     ))))
+    // Resource sets: drop members whose lock is gone — slots an orphan purge could not name (no record)
+    // or a pre-0.5 instance released without them — and resources with nothing left. One call for all.
+    const resourceNames = resources.filter(isResourceName)
+    if (resourceNames.length) {
+      await ops.run(() => runScript(
+        this.redis,
+        PRUNE_RESOURCES_SCRIPT,
+        [this.getLocksKey(), this.getResourceRegistryKey(), ...resourceNames.map((name) => this.getResourceKey(name))],
+        [JOB_LOCK_PRUNE_SAMPLE, ...resourceNames],
+      ))
+    }
 
     // ---- WRITE phase — compare-and-set per changed record, each guarded on its own ---------------
     staleCount += await this.reclaimLiveRecords(log, now, ops)
@@ -2923,6 +3063,19 @@ export class RedisJM extends Hookable<RedisJMHooks> {
   }
 
   /**
+   * Maintenance read of up to `RESOURCE_PRUNE_BATCH` registered resource names (a random sample; none on
+   * failure). Every path that adds to a resource set (enqueue, a resurrection's lock re-take) registers
+   * the resource in the same script, so the registry covers every set that can hold members.
+   */
+  private async readResourceRegistry(ops: OpGuard): Promise<string[]> {
+    let names: string[] = []
+    await ops.run(async () => {
+      names = await this.redis.srandmember(this.getResourceRegistryKey(), RESOURCE_PRUNE_BATCH)
+    })
+    return names
+  }
+
+  /**
    * Releases maintenance-reclaimed run locks (garbage records' and orphaned ones) in batches: per batch
    * ONE transaction SREMs them from the global locks set and from each job's lock set (deletions —
    * accepted under OOM). Returns how many global locks were removed.
@@ -3059,7 +3212,7 @@ export class RedisJM extends Hookable<RedisJMHooks> {
   private async purge(
     jobId: string,
     mode: 'force' | 'orphan',
-    also: { lane?: string; claiming?: boolean; delayed?: boolean; suspects?: boolean } = {},
+    also: { lane?: string; claiming?: boolean; delayed?: boolean; suspects?: boolean; resources?: string[] } = {},
   ): Promise<boolean> {
     const flags = (also.lane ? 'q' : '') + (also.claiming ? 'c' : '') + (also.delayed ? 'd' : '') + (also.suspects ? 's' : '')
     let witness = ''
@@ -3073,11 +3226,11 @@ export class RedisJM extends Hookable<RedisJMHooks> {
     const keys = [
       this.getLogKey(),
       this.getLocksKey(),
-      this.getJobLocksKey(splitJobId(jobId).jobName),
       this.getClaimingKey(),
       this.getDelayedKey(),
       this.getSuspectsKey(),
       also.lane ?? this.getLogKey(),
+      ...this.semaphoreKeys(splitJobId(jobId).jobName, also.resources ?? []),
     ]
     return Number(await runScript(this.redis, PURGE_SCRIPT, keys, [jobId, mode, flags, witness])) === 1
   }
@@ -3167,42 +3320,60 @@ export class RedisJM extends Hookable<RedisJMHooks> {
 
     const meta = job.getMetadata()
     const { jobName, lane } = meta
+    // Before any entry is judged: an undeclared resource is a configuration error, not a per-entry result.
+    const resources = this.resolveResources(meta)
     const isDelayed = delay !== undefined && delay > 0
     const now = Date.now()
-    // Effective max serialized inputs size: the job's value wins, `0` = unlimited.
-    const maxInputsBytes = meta.maxInputsBytes !== undefined ? positiveOrZero(meta.maxInputsBytes) : this.options.maxInputsBytes
+    const maxInputsBytes = effectiveLimit(meta.maxInputsBytes, this.options.maxInputsBytes)
+    const maxRunIdBytes = effectiveLimit(meta.maxRunIdBytes, this.options.maxRunIdBytes)
+    // Built once per entry (`getJobId` is the single source of the stored jobId; a numeric runId from a JS
+    // caller becomes its string form there) — the runId size is measured from it.
+    const jobIds = entries.map(({ runId }) => job.getJobId(runId))
+    const jobIdPrefixBytes = Buffer.byteLength(jobName, 'utf8') + 1
     const args: Array<string | number> = []
     // `results[i]` is set here for an entry rejected in JS (per-entry mode only); `sent` holds the indexes
     // of the entries passed to the script, in entry order — the script's statuses map back through it.
     const results: EnqueueManyResult[] = new Array(entries.length)
     const sent: number[] = []
+    // A refused entry: a single enqueue throws (`enqueueFailed` fires); `enqueueMany` records the result.
+    const refuse = async (i: number, result: Exclude<EnqueueManyResult, EnqueueResult>, cause: Error, detail?: string): Promise<void> => {
+      if (!perEntry) throw await this.enqueueFailure(jobName, entries[i].runId, jobIds[i], cause, result.status, detail)
+      results[i] = result
+    }
+    // Refuses entry `i` when `size` exceeds `limit`; resolves whether it did.
+    const tooLarge = async (
+      i: number, status: 'run-id-too-large' | 'inputs-too-large', what: string, size: number, limit: number,
+    ): Promise<boolean> => {
+      if (size <= limit) return false
+      await refuse(i, { status, jobId: jobIds[i], size, limit }, new Error(`${what} ${size} bytes, limit is ${limit}`))
+      return true
+    }
     for (let i = 0; i < entries.length; i++) {
       const { runId, inputs } = entries[i]
-      const jobId = job.getJobId(runId)
-      // Serializability and size are checked BEFORE any Redis traffic (one oversized payload must not be
-      // what fills Redis). A single enqueue throws; `enqueueMany` reports the entry and leaves it out of
-      // the script call — so it takes no cap / maxInFlight slot and plays no part in in-batch dedupe.
+      const jobId = jobIds[i]
+      // Every entry check runs BEFORE any Redis traffic (one oversized payload must not be what fills
+      // Redis). A single enqueue throws; `enqueueMany` reports the entry and leaves it out of the script
+      // call — so it takes no cap / maxInFlight / resource slot and plays no part in in-batch dedupe.
+      // The runId first, before serializing: it is stored ~6 times per live run, so its own bound. A UTF-16
+      // code unit is at most 3 UTF-8 bytes, so a runId short enough can't exceed it — no need to measure.
+      if (maxRunIdBytes > 0 && (jobId.length - jobName.length - 1) * 3 > maxRunIdBytes
+        && await tooLarge(i, 'run-id-too-large', 'runId is', Buffer.byteLength(jobId, 'utf8') - jobIdPrefixBytes, maxRunIdBytes)) continue
       let inputsJson: string | undefined
       try {
         inputsJson = JSON.stringify(inputs) as string | undefined
       } catch (err) {
-        if (!perEntry) throw await this.enqueueFailure(jobName, runId, jobId, err, 'inputs-unserializable')
-        results[i] = { status: 'inputs-unserializable', jobId, error: toError(err) }
+        const error = toError(err)
+        await refuse(i, { status: 'inputs-unserializable', jobId, error }, error)
         continue
       }
-      if (maxInputsBytes > 0) {
-        const size = Buffer.byteLength(inputsJson ?? '', 'utf8')
-        if (size > maxInputsBytes) {
-          if (!perEntry) {
-            throw await this.enqueueFailure(
-              jobName, runId, jobId,
-              new Error(`serialized inputs are ${size} bytes, limit is ${maxInputsBytes}`),
-              'inputs-too-large',
-            )
-          }
-          results[i] = { status: 'inputs-too-large', jobId, size, limit: maxInputsBytes }
-          continue
-        }
+      if (maxInputsBytes > 0
+        && await tooLarge(i, 'inputs-too-large', 'serialized inputs are', Buffer.byteLength(inputsJson ?? '', 'utf8'), maxInputsBytes)) continue
+      // The job's own payload contract, after the built-in checks: only a non-empty string refuses. A
+      // throwing validator propagates as is (a programmer error): nothing of this call has been written yet.
+      const invalid = meta.validate?.({ runId, inputs })
+      if (typeof invalid === 'string' && invalid !== '') {
+        await refuse(i, { status: 'invalid', jobId, reason: invalid }, new Error(`rejected by validate: ${invalid}`), invalid)
+        continue
       }
       sent.push(i)
       const record: Omit<JobLogRecord, 'inputs'> = {
@@ -3217,6 +3388,7 @@ export class RedisJM extends Hookable<RedisJMHooks> {
         status: isDelayed ? 'delayed' : 'queued',
         progress: 0,
       }
+      if (resources.length) record.resources = resources
       if (isDelayed) record.readyAt = now + delay!
       else record.enqueuedAt = now
       args.push(jobId, serializeRecord(record, inputsJson), record.readyAt ?? 0)
@@ -3229,29 +3401,62 @@ export class RedisJM extends Hookable<RedisJMHooks> {
       this.getLogKey(),
       this.getDelayedKey(),
       this.getQueueKey(lane),
-      this.getJobLocksKey(jobName),
       this.getJobLanesKey(jobName),
       this.getJobRegistryKey(),
+      this.getResourceRegistryKey(),
+      ...this.semaphoreKeys(jobName, resources),
     ]
     const header = [
       jobName,
       isDelayed ? 'D' : pushCmd === 'lpush' ? 'L' : 'R',
       this.resolveLaneCap(meta) ?? -1,
       nonNegativeInt(meta.maxInFlight) ?? -1,
+      resources.length,
+      ...resources.flatMap((name) => [name, this.options.resourceCaps[name]]),
     ]
     let statuses: unknown
     try {
       statuses = await runScript(this.redis, ENQUEUE_SCRIPT, keys, [...header, ...args])
     } catch (err) {
       // One script call: nothing was written (OOM refuses it up front). Report it per the first entry sent.
-      const { runId } = entries[sent[0]]
-      throw await this.enqueueFailure(jobName, runId, job.getJobId(runId), err)
+      throw await this.enqueueFailure(jobName, entries[sent[0]].runId, jobIds[sent[0]], err)
     }
     const list = Array.isArray(statuses) ? statuses : []
     sent.forEach((i, k) => {
-      results[i] = { status: (list[k] ?? 'deduped') as EnqueueResult['status'], jobId: job.getJobId(entries[i].runId) }
+      const jobId = jobIds[i]
+      const status = String(list[k] ?? 'deduped')
+      // 'busy:job' = the job's own maxInFlight; 'busy:<resource>' = that resource was at its cap.
+      if (status.startsWith('busy:')) {
+        results[i] = { status: 'busy', jobId, limitedBy: status.slice(5) }
+      } else {
+        results[i] = { status: status as EnqueueResult['status'], jobId }
+      }
     })
     return results
+  }
+
+  /**
+   * A job's declared resources (`JobMetadata.resources`), deduped in declaration order. Throws on a bad
+   * name or a resource without a cap in `resourceCaps` — a typo there would otherwise leave the cap
+   * silently unenforced.
+   */
+  private resolveResources(meta: JobMetadata): string[] {
+    const declared = meta.resources
+    if (declared === undefined) return []
+    // A hit needs the same array holding the same names (it may have been mutated in place since).
+    const cached = this.resolvedResources.get(meta.jobName)
+    if (cached && cached.declared === declared && sameItems(cached.snapshot, declared)) return cached.resources
+    if (!Array.isArray(declared)) throw new TypeError(`job "${meta.jobName}": resources must be an array of names`)
+    const out: string[] = []
+    for (const name of declared) {
+      assertResourceName(name, 'resource')
+      if (!(name in this.options.resourceCaps)) {
+        throw new Error(`job "${meta.jobName}" declares resource "${name}" but this manager's resourceCaps has no cap for it`)
+      }
+      if (!out.includes(name)) out.push(name)
+    }
+    this.resolvedResources.set(meta.jobName, { declared, snapshot: [...declared], resources: out })
+    return out
   }
 
   /**
@@ -3275,10 +3480,11 @@ export class RedisJM extends Hookable<RedisJMHooks> {
     jobId: string,
     err: unknown,
     forcedReason?: EnqueueErrorReason,
+    detail?: string,
   ): Promise<RedisJMEnqueueError> {
     const reason = forcedReason ?? classifyRedisError(err)
     if (reason === 'oom') this.oomRefusals++
-    const error = new RedisJMEnqueueError(reason, jobId, err)
+    const error = new RedisJMEnqueueError(reason, jobId, err, detail)
     await this.emit('enqueueFailed', { jobId, jobName, runId, reason, error })
     return error
   }
@@ -3405,16 +3611,24 @@ export class RedisJM extends Hookable<RedisJMHooks> {
     else if (before === 'stale' && (after === 'running' || after === 'delayed')) lock = 'take'
     const { jobName } = splitJobId(jobId)
     const pushKey = extra ? this.getQueueKey(record.lane) : this.getLogKey()
+    // The semaphore sets ride on the lock op. The resources come from the record, never from this
+    // instance's job definition (the releasing instance may run another deploy, or not register the job).
+    const resources = lock ? recordResources(record) : []
     const keys = [
       this.getLogKey(),
       this.getClaimingKey(),
       this.getLocksKey(),
       this.getDelayedKey(),
       pushKey,
-      this.getJobLocksKey(jobName),
       this.getJobLanesKey(jobName),
+      this.getJobRegistryKey(),
+      this.getResourceRegistryKey(),
+      ...(lock ? this.semaphoreKeys(jobName, resources) : []),
     ]
-    const args = [jobId, sha1Hex(expected), next, extra?.push ?? '', claiming, delayed, record.readyAt ?? 0, lock, keepFinished]
+    const args = [
+      jobId, sha1Hex(expected), next, extra?.push ?? '', claiming, delayed, record.readyAt ?? 0, lock, keepFinished,
+      jobName, ...resources,
+    ]
     return Number(await runScript(this.redis, TRANSITION_SCRIPT, keys, args))
   }
 
@@ -3456,11 +3670,8 @@ export class RedisJM extends Hookable<RedisJMHooks> {
   private validateLane(lane: string | undefined, jobName: string): void {
     if (lane === undefined) return
     if (jobName === MAINTENANCE_JOB_NAME) return
-    if (!/^[A-Za-z0-9_-]+$/.test(lane)) {
-      throw new Error(`Lane "${lane}" is invalid — lane names must match /^[A-Za-z0-9_-]+$/`)
-    }
-    if (lane.startsWith('__')) {
-      throw new Error(`Lane "${lane}" is invalid — the "__" prefix is reserved`)
+    if (!isLaneName(lane)) {
+      throw new Error(`Lane "${lane}" is invalid — lane names must match ${String(NAME_RE)} and must not start with "__" (reserved)`)
     }
   }
 
@@ -3511,6 +3722,25 @@ export class RedisJM extends Hookable<RedisJMHooks> {
    */
   private getJobLanesKey(jobName: string): string {
     return `redisjm:${this.targetGroup}:jobs:${jobName}:lanes`
+  }
+
+  /** Set of the jobIds holding resource `name` (see `JobMetadata.resources`) — its cap counts this set. */
+  private getResourceKey(name: string): string {
+    return `redisjm:${this.targetGroup}:res:${name}:locks`
+  }
+
+  /**
+   * The semaphore sets a run of `jobName` holding `resources` is a member of while it holds its lock —
+   * the job's lock set, then one set per resource — as the contiguous KEYS tail of the enqueue,
+   * transition and purge scripts.
+   */
+  private semaphoreKeys(jobName: string, resources: string[]): string[] {
+    return [this.getJobLocksKey(jobName), ...resources.map((name) => this.getResourceKey(name))]
+  }
+
+  /** Set of the resource names that have (or recently had) holders — maintenance's resource index. */
+  private getResourceRegistryKey(): string {
+    return `redisjm:${this.targetGroup}:resources`
   }
 
   /** Sorted set of the live consumer instances: member = instanceId, score = lease expiry (Redis server ms). */

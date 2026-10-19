@@ -41,6 +41,7 @@ export type {
   RedisJMOptions,
   RedisJMStats,
   ResolvedRedisJMOptions,
+  ResourceInFlightCounts,
   StartFailedEventPayload,
   StopOptions,
 } from './types'

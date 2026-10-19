@@ -426,40 +426,56 @@ export function createMockRedis(): Redis & MockRedisExtras {
     return chain
   }
 
+  /** The scripts' shared `pruneSemaphore`: SREMs a random sample of `key`'s members whose lock is gone. */
+  async function pruneSemaphore(locks: string, key: string, sample: number): Promise<number> {
+    const ids = await m.srandmember(key, sample)
+    const gone: string[] = []
+    for (const id of ids) if ((await m.sismember(locks, id)) === 0) gone.push(id)
+    if (gone.length) await m.srem(key, ...gone)
+    return gone.length
+  }
+
   /** Emulates redisjm's Lua scripts (identified by marker) with the mock's own commands. */
   async function runScript(source: string, keys: string[], argv: string[]): Promise<unknown> {
     // A flag-less `#!lua` script is refused up front under OOM — nothing in it runs. `allow-oom` (deletion
     // only) and `no-writes` (read-only) scripts are not.
     if (oom && source.startsWith('#!lua') && !/flags=[^\n]*(allow-oom|no-writes)/.test(source)) throw oomError()
     if (source.includes('-- redisjm:enqueue')) {
-      const [locks, log, delayed, lane, jobLocks, jobLanes, registry] = keys
-      const [jobName, mode, capArg, maxArg] = argv
+      const [locks, log, delayed, lane, jobLanes, registry, resourceRegistry, ...semKeys] = keys
+      const [jobName, mode, capArg, maxArg, countArg] = argv
       const cap = Number(capArg)
-      const maxInFlight = Number(maxArg)
-      const n = (argv.length - 4) / 3
+      const r = Number(countArg)
+      const base = 5 + r * 2
+      const n = (argv.length - base) / 3
+      // The job's own lock set (maxInFlight), then each resource set — the same counting semaphore.
+      const sems = [
+        { key: semKeys[0], cap: Number(maxArg), name: 'job', count: 0 },
+        ...Array.from({ length: r }, (_, j) => ({ key: semKeys[j + 1], cap: Number(argv[6 + j * 2]), name: argv[5 + j * 2], count: 0 })),
+      ]
+      for (const sem of sems) if (sem.cap >= 0) sem.count = await m.scard(sem.key)
       const out: string[] = []
       const accepted: number[] = []
       const acceptedIds = new Set<string>()
       let length = cap >= 0 ? await m.llen(lane) : 0
-      let inFlight = maxInFlight >= 0 ? await m.scard(jobLocks) : 0
       for (let i = 0; i < n; i++) {
-        const id = argv[4 + i * 3]
+        const id = argv[base + i * 3]
+        const full = sems.find((sem) => sem.cap >= 0 && sem.count >= sem.cap)
         if (acceptedIds.has(id) || (await m.sismember(locks, id)) === 1) out.push('deduped')
-        else if (maxInFlight >= 0 && inFlight >= maxInFlight) out.push('busy')
+        else if (full) out.push(`busy:${full.name}`)
         else if (cap >= 0 && length >= cap) out.push('full')
         else {
           out.push('queued')
           acceptedIds.add(id)
           accepted.push(i)
-          inFlight++
+          for (const sem of sems) sem.count++
           if (mode !== 'D') length++
         }
       }
       if (mode === 'L') accepted.reverse()
       for (const i of accepted) {
-        const [id, json, score] = argv.slice(4 + i * 3, 7 + i * 3)
+        const [id, json, score] = argv.slice(base + i * 3, base + 3 + i * 3)
         await m.sadd(locks, id)
-        await m.sadd(jobLocks, id)
+        for (const sem of sems) await m.sadd(sem.key, id)
         await m.hset(log, id, json)
         if (mode === 'D') await m.zadd(delayed, Number(score), id)
         else if (mode === 'L') await m.lpush(lane, id)
@@ -468,6 +484,7 @@ export function createMockRedis(): Redis & MockRedisExtras {
       if (accepted.length) {
         await m.sadd(jobLanes, lane)
         await m.sadd(registry, jobName)
+        for (const sem of sems.slice(1)) await m.sadd(resourceRegistry, sem.name)
       }
       return out
     }
@@ -498,8 +515,8 @@ export function createMockRedis(): Redis & MockRedisExtras {
       return null
     }
     if (source.includes('-- redisjm:transition')) {
-      const [logKey, claimingKey, locksKey, delayedKey, targetKey, jobLocks, jobLanes] = keys
-      const [id, expectedSha, next, side, claiming, delayed, delayedScore, lock, fieldTtl] = argv
+      const [logKey, claimingKey, locksKey, delayedKey, targetKey, jobLanes, registry, resourceRegistry, ...semKeys] = keys
+      const [id, expectedSha, next, side, claiming, delayed, delayedScore, lock, fieldTtl, jobName, ...resourceNames] = argv
       const cur = await m.hget(logKey, id)
       if (cur === null) return -1
       if (sha1Hex(cur) !== expectedSha) return 0
@@ -524,16 +541,18 @@ export function createMockRedis(): Redis & MockRedisExtras {
       if (claiming === 'remove') await m.zrem(claimingKey, id)
       if (lock === 'retire' || lock === 'drop') {
         await m.srem(locksKey, id)
-        await m.srem(jobLocks, id)
+        for (const key of semKeys) await m.srem(key, id)
       } else if (lock === 'take') {
         await m.sadd(locksKey, id)
-        await m.sadd(jobLocks, id)
+        for (const key of semKeys) await m.sadd(key, id)
+        await m.sadd(registry, jobName)
+        for (const name of resourceNames.slice(0, semKeys.length - 1)) await m.sadd(resourceRegistry, name)
       }
       if (delayed === 'add') await m.zadd(delayedKey, Number(delayedScore), id)
       return 1
     }
     if (source.includes('-- redisjm:purge')) {
-      const [logKey, locksKey, jobLocks, claimingKey, delayedKey, suspectsKey, laneKey] = keys
+      const [logKey, locksKey, claimingKey, delayedKey, suspectsKey, laneKey, ...semKeys] = keys
       const [id, mode, flags, witness] = argv
       if (mode === 'orphan') {
         const cur = await m.hget(logKey, id)
@@ -541,11 +560,11 @@ export function createMockRedis(): Redis & MockRedisExtras {
       }
       await m.hdel(logKey, id)
       await m.srem(locksKey, id)
-      await m.srem(jobLocks, id)
       if (flags.includes('q')) await m.lrem(laneKey, 1, id)
       if (flags.includes('c')) await m.zrem(claimingKey, id)
       if (flags.includes('d')) await m.zrem(delayedKey, id)
       if (flags.includes('s')) await m.hdel(suspectsKey, id)
+      for (const key of semKeys) await m.srem(key, id)
       return 1
     }
     if (source.includes('-- redisjm:delete-if-unchanged')) {
@@ -573,13 +592,7 @@ export function createMockRedis(): Redis & MockRedisExtras {
     if (source.includes('-- redisjm:prune-job')) {
       const [locks, jobLocks, jobLanes, registry] = keys
       const [jobName, sample] = argv
-      let pruned = 0
-      for (const id of await m.srandmember(jobLocks, Number(sample))) {
-        if ((await m.sismember(locks, id)) === 0) {
-          await m.srem(jobLocks, id)
-          pruned++
-        }
-      }
+      let pruned = await pruneSemaphore(locks, jobLocks, Number(sample))
       for (const key of await m.smembers(jobLanes)) {
         if ((await m.llen(key)) === 0) {
           await m.srem(jobLanes, key)
@@ -587,6 +600,16 @@ export function createMockRedis(): Redis & MockRedisExtras {
         }
       }
       if ((await m.scard(jobLocks)) === 0 && (await m.scard(jobLanes)) === 0) await m.srem(registry, jobName)
+      return pruned
+    }
+    if (source.includes('-- redisjm:prune-resources')) {
+      const [locks, resourceRegistry, ...resourceSets] = keys
+      const [sample, ...names] = argv
+      let pruned = 0
+      for (const [k, key] of resourceSets.entries()) {
+        pruned += await pruneSemaphore(locks, key, Number(sample))
+        if ((await m.scard(key)) === 0) await m.srem(resourceRegistry, names[k])
+      }
       return pruned
     }
     if (source.includes('-- redisjm:presence')) {

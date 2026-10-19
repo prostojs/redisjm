@@ -91,6 +91,26 @@ export interface JobMetadata {
    * Applies to every producer (timers, `every()`, manual triggers). Unset = unlimited.
    */
   maxInFlight?: number
+  /**
+   * Named resources this job's runs hold while they hold their run lock — fleet-wide concurrency caps
+   * shared ACROSS jobs. Each name needs a cap in `RedisJMOptions.resourceCaps` (else `registerJob` and
+   * every enqueue throw); an enqueue while one is at its cap returns `{ status: 'busy', limitedBy:
+   * '<resource>' }`. Names follow the lane rules; `'job'` is reserved. See the README's "Resources".
+   */
+  resources?: string[]
+  /**
+   * Max UTF-8 size in bytes of a run's `runId`; a longer single enqueue throws `RedisJMEnqueueError` with
+   * reason `'run-id-too-large'` before anything is written (`enqueueMany` reports such an entry as
+   * `{ status: 'run-id-too-large' }` instead). Overrides `RedisJMOptions.maxRunIdBytes` (default `1024`);
+   * `0` disables the limit for this job.
+   */
+  maxRunIdBytes?: number
+  /**
+   * Synchronous payload check run by every producer of this job before anything is written. A non-empty
+   * string refuses the entry with reason / status `'invalid'`; anything else accepts it. A throwing
+   * validator propagates and nothing of the call is written. See the README's "Payload contract".
+   */
+  validate?(entry: { runId: string; inputs: any }): string | undefined
 }
 
 /** Options for `queue` / `queueFirst` / `Job.queue` (and the base of `EnqueueOptions`). */
@@ -117,7 +137,8 @@ export interface EnqueueOptions extends QueueOptions {
  * Outcome of `RedisJM.enqueue` / `Job.enqueue`:
  * - `'queued'`  — the run was written (on its lane queue, or on the delayed set when `delay > 0`).
  * - `'deduped'` — the runId already holds a lock (queued/delayed/running); nothing was written.
- * - `'busy'`    — the job already has `>= maxInFlight` runs holding a lock; nothing was written.
+ * - `'busy'`    — the job already has `>= maxInFlight` runs holding a lock, or one of its `resources` is at
+ *                 its cap (see `limitedBy`); nothing was written.
  * - `'full'`    — the lane was at its cap (`maxQueued` / `laneCaps`); nothing was written.
  *
  * Redis failures are NOT a status: they throw `RedisJMEnqueueError`.
@@ -126,22 +147,34 @@ export interface EnqueueResult {
   status: 'queued' | 'deduped' | 'busy' | 'full'
   /** The `"jobName#runId"` the enqueue addressed. */
   jobId: string
+  /**
+   * Set on `'busy'` only: what was at its cap — `'job'` for the job's own `maxInFlight`, else the name of
+   * the first full resource (in the job's `resources` order).
+   */
+  limitedBy?: string
 }
 
 /**
  * Outcome of one `RedisJM.enqueueMany` / `Job.enqueueMany` entry: an {@link EnqueueResult}, or an entry
- * rejected before any Redis traffic (nothing written for it; the other entries are enqueued as usual):
- * - `'inputs-too-large'`      — its serialized inputs (`size` bytes, UTF-8) exceed `limit` (the effective
- *                               `maxInputsBytes`).
+ * rejected before any Redis traffic (nothing written for it; the other entries are enqueued as usual).
+ * Checked in this order:
+ * - `'run-id-too-large'`      — its runId (`size` bytes, UTF-8) exceeds `limit` (the effective
+ *                               `maxRunIdBytes`).
  * - `'inputs-unserializable'` — `JSON.stringify` of its inputs threw (`error`: a BigInt, a circular
  *                               reference, a throwing `toJSON`).
+ * - `'inputs-too-large'`      — its serialized inputs (`size` bytes, UTF-8) exceed `limit` (the effective
+ *                               `maxInputsBytes`).
+ * - `'invalid'`               — the job's `validate` returned `reason`.
  *
- * A single `enqueue` / `queue` / `queueFirst` throws `RedisJMEnqueueError` with the same `reason` instead.
+ * A single `enqueue` / `queue` / `queueFirst` throws `RedisJMEnqueueError` with the same `reason` instead
+ * (for `'invalid'`, the validator's string is the error's `detail`).
  */
 export type EnqueueManyResult =
   | EnqueueResult
+  | { status: 'run-id-too-large'; jobId: string; size: number; limit: number }
   | { status: 'inputs-too-large'; jobId: string; size: number; limit: number }
   | { status: 'inputs-unserializable'; jobId: string; error: Error }
+  | { status: 'invalid'; jobId: string; reason: string }
 
 /** Optional configuration for `RedisJM`. All fields have defaults. */
 export interface RedisJMOptions {
@@ -242,6 +275,21 @@ export interface RedisJMOptions {
    * which wins). `0`/unset = unlimited.
    */
   maxInputsBytes?: number
+  /**
+   * Default max UTF-8 size in bytes of a runId (see `JobMetadata.maxRunIdBytes`, which wins). Default
+   * `1024`; `0` = unlimited. A runId is stored about six times per live run (locks, job and resource sets,
+   * the log field, the record, the lane / delayed entry), so an unbounded one bypasses `maxInputsBytes`.
+   */
+  maxRunIdBytes?: number
+  /**
+   * Caps of the named resources jobs declare in `JobMetadata.resources`: the max number of runs — of
+   * ANY job declaring the resource — that may hold a run lock at once, across all instances. Like
+   * `laneCaps` the caps travel with each producer's options (they are not stored in Redis), so give every
+   * instance the same values. A job naming a resource missing here is a configuration error. Names
+   * follow the lane rules (`/^[A-Za-z0-9_-]+$/`, no `__` prefix, not `'job'`); a cap must be a finite
+   * number `>= 0` (floored; `0` refuses every run) — anything else throws a `TypeError`.
+   */
+  resourceCaps?: Record<string, number>
   /**
    * Upper bound on the work of one maintenance pass, per stage: at most about this many log records,
    * claiming entries and locks are examined per pass (default `1000`). The log and lock scans resume
@@ -367,6 +415,11 @@ export interface JobLogRecord<TInputs = unknown, TAttrs extends { [K in keyof TA
    * later finish records `finished`, and a throw schedules a retry when attempts remain (else `error`).
    */
   staleReason?: 'heartbeat' | 'orphaned' | 'maxRunMs'
+  /**
+   * The resources (`JobMetadata.resources`) this run took at enqueue — persisted so whichever instance
+   * releases the run lock (a different deploy, maintenance) releases exactly these slots.
+   */
+  resources?: string[]
 }
 
 /** Options for `Job.execute()`. */
@@ -491,7 +544,8 @@ export interface JobTimeoutEventPayload<TInputs = unknown> extends JobErrorEvent
 
 /**
  * Payload for the manager-level `enqueueFailed` event (an enqueue that threw `RedisJMEnqueueError`). Entries
- * `enqueueMany` reports per entry (`'inputs-too-large'` / `'inputs-unserializable'`) don't fire it.
+ * `enqueueMany` reports per entry (`'run-id-too-large'` / `'inputs-too-large'` / `'inputs-unserializable'` /
+ * `'invalid'`) don't fire it.
  */
 export interface EnqueueFailedEventPayload {
   jobId: string
@@ -589,7 +643,8 @@ export interface RedisJMHooks {
   timeout: (payload: JobTimeoutEventPayload) => void | Promise<void>
   /**
    * Fires when an enqueue failed with `RedisJMEnqueueError` (right before it is thrown to the caller). Not for
-   * the entries `enqueueMany` reports per entry (`'inputs-too-large'` / `'inputs-unserializable'`) —
+   * the entries `enqueueMany` reports per entry (`'run-id-too-large'` / `'inputs-too-large'` /
+   * `'inputs-unserializable'` / `'invalid'`) —
    * like `'busy'` / `'full'`, those are results, read them from the returned array.
    */
   enqueueFailed: (payload: EnqueueFailedEventPayload) => void | Promise<void>
@@ -641,6 +696,8 @@ export interface RedisJMHealth {
   stale: number | null
   /** Held locks (queued + delayed + running + claiming). */
   locks: number
+  /** Per resource in this instance's `resourceCaps`: runs holding it (one `SCARD`) and its cap. */
+  resources: Record<string, { inFlight: number; cap: number }>
 }
 
 /**
@@ -658,6 +715,16 @@ export interface InFlightCounts {
   queued: number
   delayed: number
   running: number
+}
+
+/**
+ * In-flight runs holding one resource, returned by `RedisJM.resourceInFlight()`: the counts of
+ * {@link InFlightCounts} over every job declaring the resource, plus `jobs` — `total` per job name. Like
+ * `InFlightCounts.total`, `total` can be lower than `resourceInFlightCount()` (the number the cap is
+ * enforced against) while the set holds drift that maintenance has not pruned yet.
+ */
+export interface ResourceInFlightCounts extends InFlightCounts {
+  jobs: Record<string, number>
 }
 
 /** Options for `RedisJM.listPage()`. Filters are applied to each scanned record. */

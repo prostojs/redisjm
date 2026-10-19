@@ -1,6 +1,6 @@
 # Redis Job Manager
 
-package @prostojs/redisjm — design spec as of 0.2.0
+package @prostojs/redisjm — design spec as of 0.2.0, with the 0.5.0 additions (named resources, enqueue payload contract) folded in
 
 ## Purpose
 
@@ -18,6 +18,10 @@ Each app instance polls the queue via `RedisJM.start()` and executes up to `conc
  - maintenance cost must be bounded per pass, and its writes must never clobber a concurrent writer
  - producers must be able to apply backpressure (caps, single-flight)
 
+0.5.0 additions (BREAKING minor):
+ - named resources: a fleet-wide counting semaphore shared ACROSS jobs, tied to the run lock (`JobMetadata.resources` + `RedisJMOptions.resourceCaps`), enforced at admission like `maxInFlight`
+ - enqueue payload contract: a built-in runId size bound (`maxRunIdBytes`, default 1024 — the runId is stored ~6 times per live run and bypassed `maxInputsBytes`) and a per-job synchronous `validate` hook; both are JS pre-pass refusals, no Lua change
+
 Glossary:
  - job - a function with metadata (jobName, inputs, status, ...)
  - job-run - a particular job execution that has it's runId (usually it is serialized inputs)
@@ -29,6 +33,7 @@ Glossary:
  - claiming set - a sorted set of jobId → pop ms: runs popped but not yet claimed by their executor
  - executionId - per-run fencing token; the record's owner is the execution whose start hook stamped it
  - lane - a named sub-queue within a target group; workers poll only the lanes of their registered jobs
+ - resource - a named counting semaphore of lock-holding jobIds shared by every job declaring it; a job's own lock set (`maxInFlight`) is the implicit per-job resource
  - stale threshold - `heartbeatInterval * roundsToStale`
 
 Features:
@@ -43,7 +48,8 @@ Features:
  - execution fencing (per-run executionId) so a zombie run can't clobber a re-enqueued successor
  - delayed runs and automatic retries with configurable backoff (attempts / backoff metadata)
  - per-instance and per-lane concurrency, cooperative cancellation (ctx.signal), `wake()`
- - backpressure: lane caps (`maxQueued` / `laneCaps`) and per-job `maxInFlight`
+ - backpressure: lane caps (`maxQueued` / `laneCaps`), per-job `maxInFlight`, and cross-job resource caps (`resources` / `resourceCaps`)
+ - enqueue payload contract: `maxRunIdBytes`, `maxInputsBytes`, per-job `validate`
  - progress tracking and custom attributes per job
  - maintenance on its own timer: lock-guarded, bounded per pass, delete-first, compare-and-set, emergency delete-only mode under OOM
  - memory guardrails: eviction-policy check, `health()`, `memoryPressure`, hash-field TTL on terminal records (Redis ≥ 7.4), `maxInputsBytes`
@@ -54,7 +60,7 @@ Features:
  - Typescript
  - pnpm
  - husky for commit lint
- - Redis ≥ 7.0 (shebang Lua scripts); ≥ 7.4 for hash-field TTL (optional). Not Redis Cluster (unhashed keys, multi-key scripts, the prune script builds undeclared lane keys).
+ - Redis ≥ 7.0 (shebang Lua scripts); ≥ 7.4 for hash-field TTL (optional). Not Redis Cluster (unhashed keys, multi-key scripts, the prune script builds undeclared lane keys). The 0.5 scripts declare every key they touch (resource sets are passed as KEYS), but share the same unhashed `redisjm:{tg}:` prefix, so the constraint stands.
 
 ## Redis Key Structure
 
@@ -71,6 +77,8 @@ Redis structures per target group:
 | `redisjm:{tg}:suspects` | Hash | jobId → first-seen ms. Backs the two-pass orphaned-lock reclaim. |
 | `redisjm:{tg}:jobs` | Set | Job registry: job names with per-job sets. Maintenance's index for per-job upkeep. |
 | `redisjm:{tg}:jobs:{jobName}:locks` | Set | This job's locked jobIds. `maxInFlight` compares its SCARD; `inFlight()` reads it. Maintained by the scripts; drift is pruned by maintenance. |
+| `redisjm:{tg}:res:{resource}:locks` | Set | jobIds holding the resource (any job declaring it). The resource's cap compares its SCARD; `resourceInFlight*()` read it. Taken / released atomically with the run lock by the scripts; drift pruned by maintenance. (0.5) |
+| `redisjm:{tg}:resources` | Set | Resource registry: names with (recent) holders. Registered by every script that adds to a resource set (enqueue, a transition's lock `take`); maintenance's index for resource upkeep. (0.5) |
 | `redisjm:{tg}:jobs:{jobName}:lanes` | Set | Lane LIST KEYS (`redisjm:{tg}:queue`, `redisjm:{tg}:lane:{lane}:queue`) this job has (had) entries on. Registered atomically with every push; consumers drain old lanes from it; maintenance prunes empty lanes. |
 | `redisjm:{tg}:maintenance-lock` | String, PX TTL | Maintenance lock (`SET NX PX`). Never released — expiry spaces passes across the fleet. |
 | `redisjm:{tg}:maintenance-cursor` / `-locks-cursor` / `-jobs-cursor` | String | Persisted HSCAN/SSCAN cursors of the bounded maintenance stages. |
@@ -78,20 +86,23 @@ Redis structures per target group:
 
 ### Scripts
 
-All scripts start with a `#!lua` shebang (Redis ≥ 7.0) and run via EVALSHA with an EVAL fallback on NOSCRIPT. Scripts that may write declare NO flags (shebang only): such a script is not `allow-oom`, so when Redis is over `maxmemory` the server refuses the whole script up front (nothing executed) — for the pop script this is what guarantees a full Redis pops (and loses) nothing; a legacy shebang-less script would LPOP and only fail at its first memory-growing write. Deletion-only scripts (purge, prune-job, delete-if-unchanged) are `allow-oom`: freeing memory while Redis is full is exactly when they matter.
+All scripts start with a `#!lua` shebang (Redis ≥ 7.0) and run via EVALSHA with an EVAL fallback on NOSCRIPT. Scripts that may write declare NO flags (shebang only): such a script is not `allow-oom`, so when Redis is over `maxmemory` the server refuses the whole script up front (nothing executed) — for the pop script this is what guarantees a full Redis pops (and loses) nothing; a legacy shebang-less script would LPOP and only fail at its first memory-growing write. Deletion-only scripts (purge, prune-job, prune-resources, delete-if-unchanged) are `allow-oom`: freeing memory while Redis is full is exactly when they matter.
+
+Semaphore sets: a job's lock set (cap `maxInFlight`) and each resource set (cap `resourceCaps[name]`) are the same structure — a counting semaphore of lock-holding jobIds. The enqueue, transition and purge scripts take them as ONE contiguous KEYS tail (the job lock set first, then the resource sets in declaration / record order; JS `semaphoreKeys(jobName, resources)`), so each script takes / releases them with one plain loop.
 
 | Script | Flags | Does |
 |---|---|---|
-| enqueue | — | Per entry, in entry order: locked → `deduped`; job lock set SCARD ≥ maxInFlight → `busy`; lane LLEN ≥ cap → `full`; else accepted. Then for accepted entries: SADD lock + job lock set, HSET record, RPUSH / LPUSH (reverse order, so a batch keeps its order at the head) / ZADD delayed; register the lane's list key in the job's lane set and the job in the registry. |
+| enqueue (v3) | — | Semaphores = the job lock set (cap maxInFlight, name `job`) then one per declared resource (cap from the producer's `resourceCaps`), in declaration order, each entry carrying its name; each SCARD read once, then counted up in-batch per accepted entry. Per entry, in entry order: locked (or accepted earlier in the batch) → `deduped`; first semaphore with count ≥ cap → `busy:<name>` (`busy:job` = maxInFlight; JS maps it to `limitedBy = status.slice(5)`); lane LLEN ≥ cap → `full`; else accepted. Then for accepted entries: SADD lock + every semaphore set, HSET record, RPUSH / LPUSH (reverse order, so a batch keeps its order at the head) / ZADD delayed; register the lane's list key in the job's lane set, the job in the registry and each resource semaphore's name in the resource registry. All-or-none per entry across the job set and every resource (one script). KEYS: 1 locks, 2 log, 3 delayed, 4 lane list, 5 job lane set, 6 job registry, 7 resource registry, 8.. semaphore sets. ARGV: 1 job name, 2 mode (`R`/`L`/`D`), 3 lane cap (-1 = none), 4 maxInFlight (-1 = none), 5 resource count R, R × (name, cap), then per entry (jobId, record JSON, delayed score). |
 | pop | — | Over the lane keys in poll order: own lane (`'*'`) → LPOP; old lane (allow-list `#jobA#jobB#`) → first entry within the first 100 whose jobName is allow-listed, LREM'd. ZADD the popped id to `claiming` (score = now) in the same step. |
-| transition | — | Compare-and-set of one record (expected value sent as its SHA-1) plus the structure side effects of the status change (see Record writes). Ops: claiming `take`/`remove`, delayed `take`/`add`, lock `take`/`retire`/`drop`, optional push. |
-| purge | allow-oom | Removes one run's record and run lock (global + job set) together, plus optionally its lane-list entry (LREM), `claiming`, delayed and suspects entries. Mode `force` = unconditional (`unqueue`, a popped id without '#'); mode `orphan` = only while the stored value still matches the witness the caller sends (`''` = absent, else the SHA-1 of the raw garbage bytes the manager's own parser rejected), so a run re-enqueued meanwhile is never deleted or unlocked. Validity is always judged in JS (`parseRecord`), never by Lua `cjson`, so the two can never disagree. |
-| prune-job | allow-oom | Per job: SREM a random sample (200) of job-lock-set members whose global lock is gone; SREM lane keys (read from the set, not declared — one reason Cluster is unsupported) whose list is empty; SREM the job from the registry when both sets are empty. |
+| transition (v5) | — | Compare-and-set of one record (expected value sent as its SHA-1) plus the structure side effects of the status change (see Record writes). Ops: claiming `take`/`remove`, delayed `take`/`add`, lock `take`/`retire`/`drop`, optional push. KEYS: 1 log, 2 claiming, 3 locks, 4 delayed, 5 push target list, 6 job lane set, 7 job registry, 8 resource registry, 9.. semaphore sets (only with a lock op; the resources are the RECORD's). ARGV: 1 jobId, 2 SHA-1 of the expected JSON, 3 new JSON, 4 push side, 5 claiming op, 6 delayed op, 7 delayed score, 8 lock op, 9 field TTL ms, 10 job name, 11.. resource names (one per resource set). `retire`/`drop` SREM the id from the global lock and every semaphore set; `take` SADDs it back (no cap check) and re-registers the job (job registry) and each resource (resource registry) — maintenance may have dropped them while their sets were empty, and it prunes only registered sets. |
+| purge | allow-oom | Removes one run's record and run lock (global + every semaphore set) together, plus optionally its lane-list entry (LREM), `claiming`, delayed and suspects entries. Mode `force` = unconditional (`unqueue`, a popped id without '#'); mode `orphan` = only while the stored value still matches the witness the caller sends (`''` = absent, else the SHA-1 of the raw garbage bytes the manager's own parser rejected), so a run re-enqueued meanwhile is never deleted or unlocked. Validity is always judged in JS (`parseRecord`), never by Lua `cjson`, so the two can never disagree. (v3) KEYS: 1 log, 2 locks, 3 claiming, 4 delayed, 5 suspects, 6 lane list, 7.. semaphore sets (the job lock set, then the caller's record's resource sets — `unqueue`; none in orphan mode (no record), left to prune-resources). ARGV: 1 jobId, 2 mode, 3 flags, 4 witness. |
+| prune-job (v3) | allow-oom | Per job: `pruneSemaphore` on the job lock set (SRANDMEMBER a sample of 200, one SMISMEMBER against the global locks, one SREM of the members whose lock is gone — the Lua body shared with prune-resources); SREM lane keys (read from the set, not declared — one reason Cluster is unsupported) whose list is empty; SREM the job from the registry when both sets are empty. |
+| prune-resources (v1) | allow-oom | All resources of a pass in ONE call (0.5): `pruneSemaphore` on each resource set; SREM the name from the resource registry once its set is empty. KEYS: 1 locks, 2 resource registry, 3.. resource sets; ARGV: 1 sample, 2.. names (ARGV[k − 1] names KEYS[k]). Catches what the lock paths cannot name: orphan purges, `releaseLocks` of garbage/record-less locks, releases by pre-0.5 instances. All touched keys are declared. |
 | delete-if-unchanged | allow-oom | Kind `h`: HDEL each hash field only while its raw value still has the SHA-1 that was judged (expired records and JS-judged garbage alike). Kind `z`: ZREM each sorted-set member only while its score is still the one read (maintenance's claiming drops, promotion's stray delayed entries) — a fresh pop/retry that re-scored the member in between survives. |
 
-Enqueue flow: validation (lane, delay, `first`+`delay`) and the inputs-size guard in JS (before any Redis traffic), then ONE enqueue-script call for the whole batch. There is no rollback path: a failed script wrote nothing. Statuses are per entry; a Redis failure throws one `RedisJMEnqueueError` for the call (reason classified; `jobId` = first entry). `queue()`/`queueFirst()` = `status === 'queued'`.
+Enqueue flow: validation (lane, delay, `first`+`delay`, declared resources — each must be a valid name with a cap in `resourceCaps`, else throw before any entry is judged) and the per-entry pre-pass in JS (before any Redis traffic, in this order: runId UTF-8 size vs maxRunIdBytes → `run-id-too-large` (measured from the built jobId: bytes(jobId) − bytes(jobName) − 1; skipped when 3 × the runId's UTF-16 length can't exceed the limit); `JSON.stringify(inputs)` throws → `inputs-unserializable`; serialized size vs maxInputsBytes → `inputs-too-large`; `validate({ runId, inputs })` returns a non-empty string → `invalid` (`''` / non-strings accept); a THROWING validator propagates and nothing of the call is written), then ONE enqueue-script call for the whole batch. The record persists `resources` (the deduped declared list) so every later lock op releases exactly those slots. There is no rollback path: a failed script wrote nothing. Statuses are per entry; a Redis failure throws one `RedisJMEnqueueError` for the call (reason classified; `jobId` = first entry). `queue()`/`queueFirst()` = `status === 'queued'`.
 
-Invariant upheld by the scripts: a `queued` record is on its lane list or in `claiming`; a `delayed` record is on the delayed set; a locked jobId is in both the global and its job's lock set.
+Invariant upheld by the scripts: a `queued` record is on its lane list or in `claiming`; a `delayed` record is on the delayed set; a locked jobId is in both the global and its job's lock set, and in the set of every resource its record names. The reverse (a set member without a lock) is drift, pruned by maintenance.
 
 ## Implementation
 
@@ -109,6 +120,8 @@ RedisJM constructor accepts an optional options object:
 - `laneConcurrency` — `Record<lane, number>` ('default' key = default lane): max simultaneous poll-loop runs of a lane on this instance, within `concurrency` (default {})
 - `laneCaps` — `Record<lane, number>`: enqueue cap on a lane's list length (default {})
 - `maxInputsBytes` — max JSON-serialized inputs size (default 0 = unlimited); JobMetadata.maxInputsBytes wins
+- `maxRunIdBytes` — max UTF-8 runId size (default 1024; 0 = unlimited); JobMetadata.maxRunIdBytes wins (0.5)
+- `resourceCaps` — `Record<resource, number>`: max lock-holding runs of any job declaring the resource, across the group (default {}). Names as lanes (`^[A-Za-z0-9_-]+$`, no `__` prefix) and not `job` (reserved `limitedBy`); a cap must be finite ≥ 0 (floored; 0 refuses every run) — else TypeError at construction. Not stored in Redis: each producer enforces its own values (0.5)
 - `maxRecordsPerPass` — per-stage bound of one maintenance pass (default 1000)
 - `memoryWarnRatio` — used/max memory ratio that fires `memoryPressure` (default 0.8; 0 disables)
 - `laneStrategy` / `lanePriority` — lane poll ordering (`roundRobin` default, or `priority` with an explicit high→low list)
@@ -124,6 +137,9 @@ Job metadata additionally accepts:
 - `maxQueued` — lane cap for this job's enqueues (effective cap = min of maxQueued and laneCaps[lane])
 - `maxInFlight` — max locked runs of this job (any runId) → `busy`
 - `maxInputsBytes` — overrides the manager default (0 opts out)
+- `resources` — resource names this job's runs hold while they hold their lock; each needs a cap in the manager's `resourceCaps` (else registerJob and every enqueue throw); deduped in declaration order (0.5)
+- `maxRunIdBytes` — overrides the manager default (0 opts out) (0.5)
+- `validate(entry: { runId, inputs }) => string | undefined` — synchronous payload contract, run by every producer after the built-in checks; a non-empty string refuses the entry (`invalid`); anything else accepts (0.5)
 
 Enqueue options (`enqueue`/`enqueueMany`/`queue`/`queueFirst`/Job variants):
 - `delay` — ms to stage the run on the delayed set instead of the live queue (finite ≥ 0)
@@ -144,18 +160,20 @@ RedisJM tracks registered Job instances by jobName. jobName must be unique among
 RedisJM Methods:
  - `isLocked(jobId)` — checks if jobId is in the locks set
  - `isQueued(jobId)` — deprecated alias for isLocked
- - `enqueue(job, runId, inputs, options?)` — one enqueue-script call → `{ status: 'queued'|'deduped'|'busy'|'full', jobId }`. Redis failure → `RedisJMEnqueueError` + `enqueueFailed` hook; OOM counted for health().
- - `enqueueMany(job, entries, options?)` — same, many runs of one job in ONE script call → per-entry `EnqueueManyResult`. An entry over maxInputsBytes → `{ status: 'inputs-too-large', jobId, size, limit }`, unserializable inputs → `{ status: 'inputs-unserializable', jobId, error }`: reported per entry, left out of the script (no cap/maxInFlight slot, no in-batch dedupe), no enqueueFailed; all entries rejected → no Redis call. All-or-nothing on a Redis failure (throws; jobId = first sent entry).
+ - `enqueue(job, runId, inputs, options?)` — one enqueue-script call → `{ status: 'queued'|'deduped'|'busy'|'full', jobId, limitedBy? }` (`limitedBy` on `busy` only: `'job'` = maxInFlight, else the first full resource). Pre-pass refusals throw `RedisJMEnqueueError` (`run-id-too-large` / `inputs-unserializable` / `inputs-too-large` / `invalid` with the validator's string as `detail`) + `enqueueFailed`. Redis failure → `RedisJMEnqueueError` + `enqueueFailed` hook; OOM counted for health().
+ - `enqueueMany(job, entries, options?)` — same, many runs of one job in ONE script call → per-entry `EnqueueManyResult`. A runId over maxRunIdBytes → `{ status: 'run-id-too-large', jobId, size, limit }`, unserializable inputs → `{ status: 'inputs-unserializable', jobId, error }`, an entry over maxInputsBytes → `{ status: 'inputs-too-large', jobId, size, limit }`, refused by validate → `{ status: 'invalid', jobId, reason }`: reported per entry, left out of the script (no cap/maxInFlight/resource slot, no in-batch dedupe), no enqueueFailed; all entries rejected → no Redis call. All-or-nothing on a Redis failure (throws; jobId = first sent entry).
  - `queue(job, runId, inputs, options?)` / `queueFirst(...)` — boolean shorthands (`true` iff queued).
  - `every(job, intervalMs, { inputs, runId?, immediate?, skipIfInFlight? })` — timer enqueue; returns a cancel fn; cleared by stop(). skipIfInFlight (default) = fixed runId (default 'every') so the lock dedupes across instances; false = `<runId>-<tickMs>`. Failures logged (+ enqueueFailed), never thrown.
  - `stats()` — best-effort snapshot: per-lane queue depths, delayed count, lock count, status histogram (full log scan). Non-transactional; lane visibility scoped to lanes this instance can name.
- - `health({ scan? })` — INFO memory (used/max/ratio/policy), oomRefusals, per-lane LLEN (known lanes), delayed/claiming/locks cardinalities, running (estimate = locks − Σqueues − delayed − claiming, floored at 0; exact with scan), stale (null unless scan).
+ - `health({ scan? })` — INFO memory (used/max/ratio/policy), oomRefusals, per-lane LLEN (known lanes), delayed/claiming/locks cardinalities, running (estimate = locks − Σqueues − delayed − claiming, floored at 0; exact with scan), stale (null unless scan), resources (per name in this instance's resourceCaps: `{ inFlight: SCARD, cap }`).
  - `inFlight(jobName)` — SMEMBERS job lock set + one HMGET → `{ total, queued, delayed, running }` (claiming counts as queued). O(runs of that job).
+ - `resourceInFlightCount(name)` — SCARD of the resource set: exactly what its cap is enforced against (drift included). (0.5)
+ - `resourceInFlight(name)` — SMEMBERS + one HMGET → `{ total, queued, delayed, running, jobs }` (`jobs` = holders per job name; members without a live record not counted). (0.5)
  - `queueSize(lane?)` — LLEN of one lane's queue list (default lane when omitted). Delayed runs not counted.
  - `list()` — returns all log records (JobLogRecord[]). Incremental HSCAN; corrupt/foreign fields skipped.
  - `listPage({ status?, lane?, jobName?, limit?, cursor? })` — HSCAN page (COUNT limit) with filters; keeps scanning until ~limit matches or the end → `{ records, cursor }` ('0' = done).
  - `get(jobId)` — single record via HGET, or undefined.
- - `unqueue(jobId)` — one atomic `force` purge: record, lock (global + job set), lane-queue entry (lane resolved from the record), delayed, claiming, and suspects entries.
+ - `unqueue(jobId)` — one atomic `force` purge: record, lock (global + job set + the record's resource sets), lane-queue entry (lane resolved from the record), delayed, claiming, and suspects entries.
  - `createJob(metadata, fn)` — creates Job instance and registers it
  - `registerJob(job)` — registers by jobName (must be unique), hooks on all events to handle Redis updates and re-dispatch
  - `unregisterJob(job)` — removes hooks and unregisters
@@ -237,8 +255,9 @@ Every record write (claim, heartbeat, update, finish, error/retry, promotion, un
 4. Side effects are DERIVED from the status change (stated once, in `transition`) and applied atomically with the write:
    - leaving `queued` (or a queued record pushed back) → ZREM claiming (with `takeFromClaiming`: only if still there, else -2 — so overlapping requeues push once);
    - `delayed` → `queued` (promotion) → ZREM delayed must succeed (else -2); entering `delayed` → ZADD delayed at readyAt;
-   - entering a terminal status → `retire`: write it, set `HPEXPIRE log keepFinishedInterval FIELDS 1 jobId` (when > 0; pcall → no-op below 7.4), SREM the lock (global + job set). With keepFinishedInterval 0, finished/error → `drop`: HDEL instead of writing. A `stale` record is always kept (a live run may still resurrect it) until maintenance deletes it. Doing any of HDEL/HPEXPIRE/SREM separately could hit a record re-enqueued (or resurrected) in between;
-   - `stale` → `running`/`delayed` (resurrection, retry off a staled run) → re-take the lock;
+   - entering a terminal status → `retire`: write it, set `HPEXPIRE log keepFinishedInterval FIELDS 1 jobId` (when > 0; pcall → no-op below 7.4), SREM the lock (global + every semaphore set: job set + the record's resource sets). With keepFinishedInterval 0, finished/error → `drop`: HDEL instead of writing. A `stale` record is always kept (a live run may still resurrect it) until maintenance deletes it. Doing any of HDEL/HPEXPIRE/SREM separately could hit a record re-enqueued (or resurrected) in between;
+   - `stale` → `running`/`delayed` (resurrection, retry off a staled run) → re-take the lock (global + job set + the record's resource sets, no cap check — the count can briefly exceed a cap, as with maxInFlight) and re-register the job and its resources in their registries;
+   - the resource sets always come from the RECORD (`recordResources`: well-formed names only), never from this instance's job definition — the releasing instance may run another deploy, or not register the job (maintenance);
    - an explicit push (requeue, promotion) → LPUSH/RPUSH onto the record's lane, registering the lane key in the job's lane set.
    A re-enqueue's HSET clears a field TTL.
 Writes from one instance to the same record are serialized locally (a per-jobId promise chain), so concurrent setProgress/setAttrs/heartbeat/finish of one run never exhaust each other's CAS budget; the retry budget is left for writers on other instances.
@@ -288,6 +307,9 @@ Self-heal (stale recovery): staleness detection can't tell a dead handler from o
 
 - Lane caps: effective cap = min(JobMetadata.maxQueued, laneCaps[laneLabel]) when either is defined; checked in the enqueue script against LLEN of the lane list (delayed entries don't count; a batch counts its own accepted non-delayed entries). Full → `full`, nothing written. Reject-only by design (no drop-oldest: silently dropping accepted work is the failure mode being prevented). Internal pushes (promotion, unknown-job requeue, start-failure requeue, maintenance requeue) bypass the cap.
 - maxInFlight: compared against SCARD of the job's lock set inside the enqueue script → `busy`. Drift (members whose lock is gone, e.g. released by a pre-0.2 instance) can over-count until pruned; pre-0.2 enqueues are not added, so it can under-count during a mixed deploy.
+- resources (0.5): each declared resource's set SCARD compared to the producer's `resourceCaps[name]` inside the enqueue script, after maxInFlight → `busy` + `limitedBy: name` (the first full one). Admission-time only — no wait queue; a refused producer re-enqueues (timers re-fire). Fairness = producer cadence; bound a member with its own maxInFlight. A slot lives exactly as long as the run lock: queued, delayed (incl. a retry's backoff) and running hold it; claiming → requeue keeps it. Release paths (all atomic with the lock): finish / final error / unknown-name drop (transition retire/drop), heartbeat-lapse and maxRunMs and orphaned-delayed stale (maintenance transition retire), `unqueue` (force purge with the record's resources). Not nameable (no record): orphan purges, maintenance `releaseLocks` (record-less / garbage locks) → prune-resources frees them in the same or a later pass. A resurrection (`take`) re-registers the job and its resources, so the sets it re-fills are always reachable by the prunes. A zombie's writes are fenced by CAS + executionId, so it can never release (or re-take) a successor's slots.
+- maxRunIdBytes (0.5): the runId's UTF-8 size (from the built jobId) checked in JS first → RedisJMEnqueueError('run-id-too-large') (+ enqueueFailed) for single enqueue/queue/queueFirst; per entry in enqueueMany. The error message quotes at most 200 chars of the jobId.
+- validate (0.5): called last in the pre-pass; a non-empty string → RedisJMEnqueueError('invalid', detail = the returned string) (+ enqueueFailed); per entry `{ status: 'invalid', reason }` in enqueueMany.
 - maxInputsBytes: Buffer.byteLength(JSON.stringify(inputs)) checked in JS before any Redis traffic → RedisJMEnqueueError('inputs-too-large') (+ enqueueFailed) for single enqueue/queue/queueFirst; a stringify throw → RedisJMEnqueueError('inputs-unserializable') (+ enqueueFailed). enqueueMany reports both per entry instead (no throw, no enqueueFailed).
 
 ### Lanes
@@ -325,7 +347,8 @@ Stored as JSON in the log hash:
   enqueuedAt?: number,          // epoch-ms last put on a lane list; presence marks a 0.2+ record
   suspectedAt?: number,         // orphan suspect timestamp (maintenance two-pass check)
   staleReason?: "heartbeat" | "orphaned" | "maxRunMs",
-  requeueCount?: number         // times re-queued for an unknown job name
+  requeueCount?: number,        // times re-queued for an unknown job name
+  resources?: string[]          // resources taken at enqueue (0.5); every lock op releases / re-takes exactly these
 }
 ```
 
@@ -341,7 +364,7 @@ Scheduling: `start()` (unless maintenanceInterval = 0) registers the maintenance
 
 `performMaintenance()` — one full pass, unguarded. Every stage bounded by maxRecordsPerPass; cursors persisted (a failed cursor write restarts that scan at 0); presence checks pipelined per batch; every operation individually guarded (failures counted, logged once per pass with the classified reason of the first).
 1. READ: log batch (HSCAN from the shared cursor) → garbage (unparseable / no string status), expired terminal (finishedAt older than keepFinishedInterval), live (running/queued/delayed). Presence: delayed → ZSCORE delayed; LEGACY queued (no enqueuedAt) → LPOS on its lane + ZSCORE claiming; while the legacy window is open (`legacy-seen` exists), also new-format queued records older than the stale threshold. Claiming: ZRANGEBYSCORE claiming -inf now-staleThreshold WITHSCORES LIMIT max + HGET each → still `queued` = requeue, else drop the entry only while its score is unchanged. Locks batch (SSCAN, own cursor) → pipelined HEXISTS; record-less locks: first sighting stamped in `suspects`, past the threshold = orphan. Suspects HSCAN → exonerate those with a record or no lock. Job registry batch (SSCAN, own cursor, ≤ 100).
-2. DELETE (before any write — deletions succeed at maxmemory): compare-and-delete expired + garbage (batches of 500; garbage re-read as raw bytes and re-judged by the JS parser first); SREM garbage locks; drop stale claiming entries (score-conditional); release orphan locks (staleCount); HDEL exonerated suspects; prune-job script per job.
+2. DELETE (before any write — deletions succeed at maxmemory): compare-and-delete expired + garbage (batches of 500; garbage re-read as raw bytes and re-judged by the JS parser first); SREM garbage locks; drop stale claiming entries (score-conditional); release orphan locks (staleCount); HDEL exonerated suspects; prune-job script per job; ONE prune-resources call for a random sample of ≤ 100 registry names (every path that adds to a resource set registers it, so the registry is complete).
 3. WRITE (each a CAS): running records overdue (maxRunMs from startedAt, else heartbeat ?? startedAt older than the stale threshold, re-checked on the CURRENT record and same executionId) → stale + unlock + field TTL. Presence-checked records: absent & unsuspected → stamp suspectedAt; absent & suspected past threshold → stale ('orphaned') + unlock; present & suspected → clear suspectedAt. Overdue claims → requeue at the HEAD of the record's lane with `takeFromClaiming` (requeuedCount). Stamp new lock suspects. Persist the three cursors.
 Returns `{ staleCount, cleanedCount, requeuedCount, mode: 'full' }`.
 
@@ -352,9 +375,16 @@ The legacy window: popping an entry of the maintenance job (0.2+ never enqueues 
 ### Memory
 
 - Recommended: `noeviction`, a dedicated instance, an alarm. `start()` reads `maxmemory_policy` from INFO memory (never CONFIG GET — managed services block it) and warns on `allkeys-*` (may evict queue/lock/log keys) and `volatile-*` (can't free TTL-less redisjm keys).
-- Under OOM: enqueue script refused (nothing written, `oom` error, oomRefusals++); pop script refused (nothing popped; logged once per episode); claim refused → requeue/defer; maintenance → emergency mode; deletion-only scripts (purge, prune-job, delete-if-unchanged) are allow-oom, so purges and pruning still work.
+- Under OOM: enqueue script refused (nothing written, `oom` error, oomRefusals++); pop script refused (nothing popped; logged once per episode); claim refused → requeue/defer; maintenance → emergency mode; deletion-only scripts (purge, prune-job, prune-resources, delete-if-unchanged) are allow-oom, so purges and pruning still work (an `unqueue` frees its resource slots under OOM; a refused enqueue took none). The emergency pass does not prune resource sets — drift waits for the next full pass.
 - History: terminal records get a field TTL (≥ 7.4) atomically with the terminal write; maintenance also sweeps them.
 - `memoryPressure`: after each timer pass, if used/max ≥ memoryWarnRatio and armed → snapshot health(), disarm, log, emit; re-armed when the ratio drops below. A failed snapshot leaves it armed.
+
+### Mixed rolling deploy (0.4 → 0.5)
+
+- Script versions changed (enqueue v3, transition v5, purge v3, prune-job v3, new prune-resources); each instance runs its own scripts by SHA, so versions coexist. Records written by 0.5 carry `resources`; 0.4 parses and re-serializes records whole, so the field survives 0.4 writes.
+- 0.4 instances neither add to nor remove from resource sets: runs a 0.4 producer admits aren't counted (under-enforcement); runs a 0.4 instance releases (finish, error, stale, unqueue) stay counted until a 0.5 instance's maintenance pass prunes them (a pass that a 0.4 instance wins prunes nothing); a 0.4 resurrection doesn't re-count. Declare `resources` only once the whole group runs 0.5.
+- `maxRunIdBytes` / `validate` are producer-side only: no coordination; a 0.4 producer simply doesn't apply them.
+- Caps are per-producer options: during a deploy that changes a cap, each producer enforces its own value.
 
 ## Notes
 

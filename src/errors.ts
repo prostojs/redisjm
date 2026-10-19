@@ -16,11 +16,16 @@ import { toError } from './utils'
 export type RedisErrorReason = 'oom' | 'readonly' | 'connection' | 'timeout' | 'unknown'
 
 /**
- * Reason carried by {@link RedisJMEnqueueError}: a classified Redis failure, `'inputs-too-large'` when the
- * serialized inputs exceed a configured size limit, or `'inputs-unserializable'` when `JSON.stringify` of
- * the inputs threw (a BigInt, a circular reference). The last two are rejected before any Redis write.
+ * Reason carried by {@link RedisJMEnqueueError}: a classified Redis failure, `'run-id-too-large'` when the
+ * runId exceeds `maxRunIdBytes`, `'inputs-too-large'` when the serialized inputs exceed a configured size
+ * limit, `'inputs-unserializable'` when `JSON.stringify` of the inputs threw (a BigInt, a circular
+ * reference), or `'invalid'` when the job's `validate` refused the entry. The last four are rejected
+ * before any Redis write.
  */
-export type EnqueueErrorReason = RedisErrorReason | 'inputs-too-large' | 'inputs-unserializable'
+export type EnqueueErrorReason = RedisErrorReason | 'run-id-too-large' | 'inputs-too-large' | 'inputs-unserializable' | 'invalid'
+
+/** Longest jobId quoted in full in an error message (a refused oversized runId would flood logs). */
+const MAX_MESSAGE_JOB_ID = 200
 
 /** Socket-level error codes (Node `err.code`) that mean the connection itself is unusable. */
 const CONNECTION_ERROR_CODES = new Set([
@@ -79,8 +84,9 @@ export function classifyRedisError(err: unknown): RedisErrorReason {
 /**
  * Thrown by `queue()` / `queueFirst()` / `enqueue()` / `enqueueMany()` (and their `Job` counterparts)
  * when Redis refuses or fails an enqueue, or — by the single-run calls only — before any write when the
- * inputs exceed the size limit (`'inputs-too-large'`) or can't be serialized (`'inputs-unserializable'`);
- * `enqueueMany()` reports those two per entry instead (see `EnqueueManyResult`). The enqueue is one atomic
+ * runId exceeds its size limit (`'run-id-too-large'`), the inputs exceed theirs (`'inputs-too-large'`) or
+ * can't be serialized (`'inputs-unserializable'`), or the job's `validate` refused them (`'invalid'`, the
+ * validator's string in `detail`); `enqueueMany()` reports those per entry instead (see `EnqueueManyResult`). The enqueue is one atomic
  * script, so a refused one (e.g. OOM — Redis refuses the script up front) wrote nothing and retrying the
  * same runId is safe. A `connection` /
  * `timeout` failure is ambiguous: the script may still have run on the server, so a retry can come back
@@ -98,19 +104,23 @@ export function classifyRedisError(err: unknown): RedisErrorReason {
  * ```
  */
 export class RedisJMEnqueueError extends Error {
-  /** Classified cause of the failure (see {@link RedisErrorReason}, plus `'inputs-too-large'` / `'inputs-unserializable'`). */
+  /** Classified cause of the failure (see {@link EnqueueErrorReason}). */
   readonly reason: EnqueueErrorReason
   /** The `"jobName#runId"` whose enqueue failed. */
   readonly jobId: string
-  /** The underlying error (the Redis reply / client error, or the `JSON.stringify` error). */
+  /** The underlying error (the Redis reply / client error, the `JSON.stringify` error, or a description of the refusal). */
   override readonly cause: Error
+  /** For `'invalid'`: the string the job's `validate` returned. */
+  readonly detail?: string
 
-  constructor(reason: EnqueueErrorReason, jobId: string, cause: unknown) {
+  constructor(reason: EnqueueErrorReason, jobId: string, cause: unknown, detail?: string) {
     const causeError = toError(cause)
-    super(`enqueue of "${jobId}" failed (${reason}): ${causeError.message}`)
+    const shownId = jobId.length > MAX_MESSAGE_JOB_ID ? `${jobId.slice(0, MAX_MESSAGE_JOB_ID)}…` : jobId
+    super(`enqueue of "${shownId}" failed (${reason}): ${causeError.message}`)
     this.name = 'RedisJMEnqueueError'
     this.reason = reason
     this.jobId = jobId
+    if (detail !== undefined) this.detail = detail
     // Assigned explicitly (not via `super(msg, { cause })`): with ES2022 class fields a declared
     // `cause` field would otherwise be re-initialized to `undefined` after `super()` returns.
     this.cause = causeError

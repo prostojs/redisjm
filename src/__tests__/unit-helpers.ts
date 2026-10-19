@@ -14,9 +14,13 @@ export const LOG = 'redisjm:g:log'
 export const LOCKS = 'redisjm:g:locks'
 export const QUEUE = 'redisjm:g:queue'
 export const CLAIMING = 'redisjm:g:claiming'
+export const DELAYED = 'redisjm:g:delayed'
+export const JOBS = 'redisjm:g:jobs'
+export const RESOURCES = 'redisjm:g:resources'
 export const laneKey = (lane: string): string => `redisjm:g:lane:${lane}:queue`
 export const jobLocks = (job: string): string => `redisjm:g:jobs:${job}:locks`
 export const jobLanes = (job: string): string => `redisjm:g:jobs:${job}:lanes`
+export const resKey = (name: string): string => `redisjm:g:res:${name}:locks`
 
 /** A handler that never settles. */
 export const hung = (): Promise<void> => new Promise<void>(() => {})

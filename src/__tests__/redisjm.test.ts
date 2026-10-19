@@ -39,6 +39,8 @@ describe('RedisJM', () => {
         laneConcurrency: {},
         laneCaps: {},
         maxInputsBytes: 0,
+        maxRunIdBytes: 1024,
+        resourceCaps: {},
         maxRecordsPerPass: 1000,
         memoryWarnRatio: 0.8,
       })
@@ -63,6 +65,8 @@ describe('RedisJM', () => {
         laneConcurrency: {},
         laneCaps: {},
         maxInputsBytes: 0,
+        maxRunIdBytes: 1024,
+        resourceCaps: {},
         maxRecordsPerPass: 1000,
         memoryWarnRatio: 0.8,
       })

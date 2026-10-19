@@ -32,46 +32,72 @@ function defineScript(source: string): LuaScript {
 
 /**
  * Atomic enqueue of one or more runs of ONE job (`enqueue` / `enqueueMany`). Per entry, in order:
- * already locked → `deduped`; job already has `>= maxInFlight` locked runs → `busy`; lane list already
- * `>= cap` long → `full`; else take the run lock, add it to the job's lock set, write the record, push
- * it onto its lane (or ZADD it to the delayed set), and register the lane's list KEY in the job's lane
- * set and the job in the registry → `queued`. Being one flag-less shebang script, a Redis at maxmemory refuses it
- * up front: an OOM-refused enqueue writes NOTHING (no lock, no record) — nothing to roll back.
+ * already locked → `deduped`; job already has `>= maxInFlight` locked runs → `busy`; one of the job's
+ * resources already has `>= cap` locked runs → `busy:<resource>` (the first full one, in declaration
+ * order); lane list already `>= cap` long → `full`; else take the run lock, add it to the job's lock set
+ * and to every resource set, write the record, push it onto its lane (or ZADD it to the delayed set),
+ * and register the lane's list KEY in the job's lane set, the job in the registry and the resources in
+ * the resource registry → `queued`. The job's own lock set and each resource set are the same thing —
+ * a counting semaphore of lock-holding jobIds checked against a cap — so they are one contiguous KEYS
+ * tail (the "semaphore sets", see `semaphoreKeys`) handled by one loop. Being one flag-less shebang
+ * script, a Redis at maxmemory refuses it up front: an OOM-refused enqueue writes NOTHING (no lock, no
+ * record) — nothing to roll back.
  *
- * KEYS: 1 locks, 2 log, 3 delayed, 4 lane list, 5 job lock set, 6 job lane set, 7 job registry.
+ * KEYS: 1 locks, 2 log, 3 delayed, 4 lane list, 5 job lane set, 6 job registry, 7 resource registry,
+ *       8.. semaphore sets: the job lock set, then one resource set per declared resource (ARGV order).
  * ARGV: 1 job name, 2 mode ('R' tail | 'L' head | 'D' delayed), 3 cap (-1 = none), 4 maxInFlight
- *       (-1 = none), then per entry: jobId, record JSON, delayed score.
- * Returns the status per entry, in entry order. Statuses are decided in entry order (earlier entries win
- * a cap / maxInFlight slot); mode 'L' then pushes the accepted entries in reverse so a batch keeps its
- * order at the head of the lane.
+ *       (-1 = none), 5 resource count R, then R pairs (resource name, cap), then per entry: jobId,
+ *       record JSON, delayed score.
+ * Returns the status per entry, in entry order: `'busy:job'` = maxInFlight, `'busy:<resource>'` = that
+ * resource was at its cap. Statuses are decided in entry order (earlier entries win
+ * a cap / maxInFlight / resource slot); mode 'L' then pushes the accepted entries in reverse so a batch
+ * keeps its order at the head of the lane.
  */
 export const ENQUEUE_SCRIPT = defineScript(`#!lua
--- redisjm:enqueue v2
+-- redisjm:enqueue v3
 local cap = tonumber(ARGV[3])
-local maxInFlight = tonumber(ARGV[4])
 local mode = ARGV[2]
-local n = (#ARGV - 4) / 3
+local r = tonumber(ARGV[5])
+local base = 5 + r * 2
+local n = (#ARGV - base) / 3
 local out = {}
--- Pass 1: decide every entry's status in ENTRY order (earlier entries win a cap / maxInFlight slot).
+-- Semaphores, checked in order: the job's own lock set (maxInFlight), then each resource set.
+local sems = { { key = KEYS[8], cap = tonumber(ARGV[4]), name = 'job' } }
+for j = 1, r do
+  -- Pair j is ARGV[4 + 2j] (name), ARGV[5 + 2j] (cap).
+  sems[j + 1] = { key = KEYS[8 + j], cap = tonumber(ARGV[5 + j * 2]), name = ARGV[4 + j * 2] }
+end
+-- cap -1 = none: only maxInFlight can be unset (every resource has a cap).
+for _, sem in ipairs(sems) do
+  sem.count = 0
+  if sem.cap >= 0 then sem.count = redis.call('SCARD', sem.key) end
+end
+-- Pass 1: decide every entry's status in ENTRY order (earlier entries win a slot).
 local accepted = {}
 local acceptedIds = {}
 local length = 0
 if cap >= 0 then length = redis.call('LLEN', KEYS[4]) end
-local inFlight = 0
-if maxInFlight >= 0 then inFlight = redis.call('SCARD', KEYS[5]) end
 for i = 0, n - 1 do
-  local id = ARGV[5 + i * 3]
+  local id = ARGV[base + 1 + i * 3]
+  local status = nil
   if acceptedIds[id] or redis.call('SISMEMBER', KEYS[1], id) == 1 then
-    out[i + 1] = 'deduped'
-  elseif maxInFlight >= 0 and inFlight >= maxInFlight then
-    out[i + 1] = 'busy'
-  elseif cap >= 0 and length >= cap then
-    out[i + 1] = 'full'
+    status = 'deduped'
+  else
+    for _, sem in ipairs(sems) do
+      if sem.cap >= 0 and sem.count >= sem.cap then
+        status = 'busy:' .. sem.name
+        break
+      end
+    end
+    if not status and cap >= 0 and length >= cap then status = 'full' end
+  end
+  if status then
+    out[i + 1] = status
   else
     out[i + 1] = 'queued'
     acceptedIds[id] = true
     accepted[#accepted + 1] = i
-    inFlight = inFlight + 1
+    for _, sem in ipairs(sems) do sem.count = sem.count + 1 end
     -- Caps count the lane LIST only: a delayed run doesn't occupy it until promoted.
     if mode ~= 'D' then length = length + 1 end
   end
@@ -81,12 +107,12 @@ local first, last, step = 1, #accepted, 1
 if mode == 'L' then first, last, step = #accepted, 1, -1 end
 for k = first, last, step do
   local i = accepted[k]
-  local id = ARGV[5 + i * 3]
+  local id = ARGV[base + 1 + i * 3]
   redis.call('SADD', KEYS[1], id)
-  redis.call('SADD', KEYS[5], id)
-  redis.call('HSET', KEYS[2], id, ARGV[6 + i * 3])
+  for _, sem in ipairs(sems) do redis.call('SADD', sem.key, id) end
+  redis.call('HSET', KEYS[2], id, ARGV[base + 2 + i * 3])
   if mode == 'D' then
-    redis.call('ZADD', KEYS[3], ARGV[7 + i * 3], id)
+    redis.call('ZADD', KEYS[3], ARGV[base + 3 + i * 3], id)
   elseif mode == 'L' then
     redis.call('LPUSH', KEYS[4], id)
   else
@@ -94,8 +120,9 @@ for k = first, last, step do
   end
 end
 if #accepted > 0 then
-  redis.call('SADD', KEYS[6], KEYS[4])
-  redis.call('SADD', KEYS[7], ARGV[1])
+  redis.call('SADD', KEYS[5], KEYS[4])
+  redis.call('SADD', KEYS[6], ARGV[1])
+  for j = 2, #sems do redis.call('SADD', KEYS[7], sems[j].name) end
 end
 return out
 `)
@@ -150,18 +177,23 @@ return false
  * meanwhile is never re-created (`-1`); the caller re-reads and retries.
  *
  * KEYS: 1 log hash, 2 claiming zset, 3 locks set, 4 delayed zset, 5 target list (any key when unused),
- *       6 the job's lock set, 7 the job's lane set.
+ *       6 the job's lane set, 7 job registry, 8 resource registry, 9.. with a lock op only: the semaphore
+ *       sets — the job's lock set, then the resource sets the run holds (from its record).
  * ARGV: 1 jobId, 2 SHA-1 hex of the expected JSON, 3 new JSON, 4 push side ('' | 'L' | 'R' onto KEYS[5]),
  *       5 claiming op, 6 delayed op, 7 delayed score (with delayed op 'add'), 8 lock op,
- *       9 field TTL in ms (with lock op 'retire'; 0 = none).
+ *       9 field TTL in ms (with lock op 'retire'; 0 = none), 10 job name, 11.. the resource names (one per
+ *       resource set, KEYS[10..]).
  * Ops ('' = none):
  * - claiming: 'take' = precondition: ZREM the claiming entry and abort unless it was there (a requeue of
  *   an unclaimed pop — two overlapping requeues must not BOTH push it back); 'remove' = ZREM it.
  * - delayed: 'take' = precondition: ZREM the delayed entry and abort unless it was there (the promotion
  *   claim); 'add' = ZADD it with ARGV[7] (retry scheduling).
- * - lock: 'take' = (re-)SADD the run lock (global + job set); 'retire' = the record turns terminal: write
- *   it, give it a hash-field TTL of ARGV[9] ms when > 0 (`HPEXPIRE`, Redis >= 7.4 — `pcall` makes it a
- *   no-op on older servers) and SREM the lock; 'drop' = like 'retire' but HDEL the record instead of
+ * - lock: 'take' = (re-)SADD the run lock (global + every semaphore set — no cap check: a resurrected run
+ *   already owns its slot) and re-register what it re-adds (the job in the job registry, each resource in
+ *   the resource registry — maintenance may have dropped them while their sets were empty, and only
+ *   registered sets are pruned); 'retire' = the record turns terminal: write it, give it a hash-field TTL
+ *   of ARGV[9] ms when > 0 (`HPEXPIRE`, Redis >= 7.4 — `pcall` makes it a no-op on older servers) and
+ *   SREM the lock (global + every semaphore set); 'drop' = like 'retire' but HDEL the record instead of
  *   writing it (no history kept). Retiring HERE, atomically with the terminal write, is what makes the
  *   order of record and lock moot: a separate HDEL / HPEXPIRE / SREM after the write could land on a
  *   record written in between — a re-enqueue of the runId (its lock is free) or a resurrected run — and
@@ -170,7 +202,7 @@ return false
  * Returns 1 written, 0 conflict (stored JSON changed), -1 record missing, -2 precondition failed.
  */
 export const TRANSITION_SCRIPT = defineScript(`#!lua
--- redisjm:transition v4
+-- redisjm:transition v5
 local id = ARGV[1]
 local cur = redis.call('HGET', KEYS[1], id)
 if not cur then return -1 end
@@ -188,15 +220,17 @@ else
 end
 if ARGV[4] == 'L' or ARGV[4] == 'R' then
   if ARGV[4] == 'L' then redis.call('LPUSH', KEYS[5], id) else redis.call('RPUSH', KEYS[5], id) end
-  redis.call('SADD', KEYS[7], KEYS[5])
+  redis.call('SADD', KEYS[6], KEYS[5])
 end
 if ARGV[5] == 'remove' then redis.call('ZREM', KEYS[2], id) end
 if lock == 'retire' or lock == 'drop' then
   redis.call('SREM', KEYS[3], id)
-  redis.call('SREM', KEYS[6], id)
+  for k = 9, #KEYS do redis.call('SREM', KEYS[k], id) end
 elseif lock == 'take' then
   redis.call('SADD', KEYS[3], id)
-  redis.call('SADD', KEYS[6], id)
+  for k = 9, #KEYS do redis.call('SADD', KEYS[k], id) end
+  redis.call('SADD', KEYS[7], ARGV[10])
+  for k = 10, #KEYS do redis.call('SADD', KEYS[8], ARGV[k + 1]) end
 end
 if ARGV[6] == 'add' then redis.call('ZADD', KEYS[4], ARGV[7], id) end
 return 1
@@ -208,8 +242,9 @@ return 1
  * and its lock go together: there is no window in which the lock is free while the record still exists,
  * which would let a producer re-enqueue the runId and then have its fresh record deleted.
  *
- * KEYS: 1 log, 2 locks, 3 the job's lock set, 4 claiming, 5 delayed, 6 suspects, 7 lane list (any key
- *       when unused).
+ * KEYS: 1 log, 2 locks, 3 claiming, 4 delayed, 5 suspects, 6 lane list (any key when unused), 7.. the
+ *       semaphore sets to SREM it from: the job's lock set, then the resource sets of the caller's record
+ *       (none without a record — maintenance prunes those).
  * ARGV: 1 jobId, 2 mode, 3 flags, 4 witness ('orphan' mode).
  * Modes: 'force' = purge unconditionally (`unqueue`, a malformed popped id); 'orphan' = purge only while
  *        the stored value is still what the CALLER judged not to be a record: absent (witness `''`), or
@@ -218,12 +253,12 @@ return 1
  *        accepted; nesting > 1000 rejected) — so the manager's parser stays the single source of truth.
  *        Any other value (the runId was re-enqueued meanwhile) belongs to that run → no-op. Garbage that
  *        vanished meanwhile still purges: nothing backs the jobId.
- * Flags: 'q' = LREM it from KEYS[7]; 'c' = ZREM from claiming; 'd' = ZREM from delayed; 's' = HDEL its
+ * Flags: 'q' = LREM it from KEYS[6]; 'c' = ZREM from claiming; 'd' = ZREM from delayed; 's' = HDEL its
  *        orphaned-lock suspicion.
  * Returns 1 purged, 0 skipped ('orphan' mode, the value changed).
  */
 export const PURGE_SCRIPT = defineScript(`#!lua flags=allow-oom
--- redisjm:purge v2
+-- redisjm:purge v3
 local id = ARGV[1]
 local flags = ARGV[3]
 if ARGV[2] == 'orphan' then
@@ -232,36 +267,47 @@ if ARGV[2] == 'orphan' then
 end
 redis.call('HDEL', KEYS[1], id)
 redis.call('SREM', KEYS[2], id)
-redis.call('SREM', KEYS[3], id)
-if string.find(flags, 'q', 1, true) then redis.call('LREM', KEYS[7], 1, id) end
-if string.find(flags, 'c', 1, true) then redis.call('ZREM', KEYS[4], id) end
-if string.find(flags, 'd', 1, true) then redis.call('ZREM', KEYS[5], id) end
-if string.find(flags, 's', 1, true) then redis.call('HDEL', KEYS[6], id) end
+if string.find(flags, 'q', 1, true) then redis.call('LREM', KEYS[6], 1, id) end
+if string.find(flags, 'c', 1, true) then redis.call('ZREM', KEYS[3], id) end
+if string.find(flags, 'd', 1, true) then redis.call('ZREM', KEYS[4], id) end
+if string.find(flags, 's', 1, true) then redis.call('HDEL', KEYS[5], id) end
+for k = 7, #KEYS do redis.call('SREM', KEYS[k], id) end
 return 1
 `)
 
 /**
- * Maintenance upkeep of one job's bookkeeping sets: drop job-lock-set members whose run lock is gone
- * (a random sample of up to `sample` members per call, so drift self-heals over passes without an O(k)
- * script), drop lane-list keys from the job's lane set whose list is empty (atomic with every push, which
- * re-registers its lane, so a lane can't be pruned while it holds an entry), and drop the job from the
- * registry once both sets are empty. It only ever deletes, so it is flagged `allow-oom` (it may run
- * while Redis is full — that is when freeing bookkeeping matters).
+ * Lua snippet shared by the prune scripts: `pruneSemaphore(key, sample)` drops the members of semaphore
+ * set `key` (a job lock set or a resource set) whose run lock (KEYS[1], the global locks set) is gone —
+ * a random sample of up to `sample` members per call, checked with one `SMISMEMBER` (Redis >= 6.2), so
+ * drift self-heals over passes without an O(k) script. Returns the number of pruned members.
+ */
+const LUA_PRUNE_SEMAPHORE = `local function pruneSemaphore(key, sample)
+  local ids = redis.call('SRANDMEMBER', key, sample)
+  if #ids == 0 then return 0 end
+  local held = redis.call('SMISMEMBER', KEYS[1], unpack(ids))
+  local gone = {}
+  for i, id in ipairs(ids) do
+    if held[i] == 0 then gone[#gone + 1] = id end
+  end
+  if #gone > 0 then redis.call('SREM', key, unpack(gone)) end
+  return #gone
+end`
+
+/**
+ * Maintenance upkeep of one job's bookkeeping sets: prune its lock set (`pruneSemaphore`), drop lane-list
+ * keys from the job's lane set whose list is empty (atomic with every push, which re-registers its lane,
+ * so a lane can't be pruned while it holds an entry), and drop the job from the registry once both sets
+ * are empty. It only ever deletes, so it is flagged `allow-oom` (it may run while Redis is full — that
+ * is when freeing bookkeeping matters).
  *
  * KEYS: 1 locks, 2 job lock set, 3 job lane set, 4 job registry.
  * ARGV: 1 job name, 2 sample size.
  * Returns the number of pruned lock-set members + lanes.
  */
 export const PRUNE_JOB_SCRIPT = defineScript(`#!lua flags=allow-oom
--- redisjm:prune-job v2
-local pruned = 0
-local sample = redis.call('SRANDMEMBER', KEYS[2], tonumber(ARGV[2]))
-for _, id in ipairs(sample) do
-  if redis.call('SISMEMBER', KEYS[1], id) == 0 then
-    redis.call('SREM', KEYS[2], id)
-    pruned = pruned + 1
-  end
-end
+-- redisjm:prune-job v3
+${LUA_PRUNE_SEMAPHORE}
+local pruned = pruneSemaphore(KEYS[2], tonumber(ARGV[2]))
 for _, key in ipairs(redis.call('SMEMBERS', KEYS[3])) do
   if redis.call('LLEN', key) == 0 then
     redis.call('SREM', KEYS[3], key)
@@ -270,6 +316,29 @@ for _, key in ipairs(redis.call('SMEMBERS', KEYS[3])) do
 end
 if redis.call('SCARD', KEYS[2]) == 0 and redis.call('SCARD', KEYS[3]) == 0 then
   redis.call('SREM', KEYS[4], ARGV[1])
+end
+return pruned
+`)
+
+/**
+ * Maintenance upkeep of a batch of resource sets (see `JobMetadata.resources`), in ONE call: prune each
+ * set (`pruneSemaphore`) and drop the resource from the registry once its set is empty. Every 0.5+ lock
+ * path releases a run's slots atomically with its lock, so this only catches what those paths cannot
+ * name: an orphan purge (no record to read the resources from), or a run finished / unqueued by a pre-0.5
+ * instance. Deletion-only, so `allow-oom`.
+ *
+ * KEYS: 1 locks, 2 resource registry, 3.. resource sets. ARGV: 1 sample size, 2.. the resource names
+ * (ARGV[k - 1] names KEYS[k]).
+ * Returns the number of pruned members.
+ */
+export const PRUNE_RESOURCES_SCRIPT = defineScript(`#!lua flags=allow-oom
+-- redisjm:prune-resources v1
+${LUA_PRUNE_SEMAPHORE}
+local sample = tonumber(ARGV[1])
+local pruned = 0
+for k = 3, #KEYS do
+  pruned = pruned + pruneSemaphore(KEYS[k], sample)
+  if redis.call('SCARD', KEYS[k]) == 0 then redis.call('SREM', KEYS[2], ARGV[k - 1]) end
 end
 return pruned
 `)

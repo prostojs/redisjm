@@ -13,6 +13,8 @@ When running multiple instances of the same application, `@prostojs/redisjm` ens
 - Delayed runs and automatic retries with configurable backoff
 - Execution timeouts (`jobTimeout` / `timeoutMs`) and a hung-handler backstop (`maxRunMs`)
 - Backpressure — per-lane queue caps (`maxQueued` / `laneCaps`) and per-job in-flight limits (`maxInFlight`)
+- Fleet-wide concurrency caps shared across jobs — named `resources` with `resourceCaps`, taken and released atomically with the run lock
+- Payload contract at enqueue — a built-in runId size bound (`maxRunIdBytes`) and a per-job `validate` hook, enforced for every producer
 - Execution fencing & self-heal — a staled-but-alive run resurrects on its next write (keeping its progress/attrs and lock); a genuinely superseded one can't clobber its successor's record
 - Cooperative cancellation via `ctx.signal` (ownership loss, timeout, or `stop({ abort: true })`) — and, with `abortGraceMs`, a handler that ignores an abort is abandoned after a grace period (`JobAbortedError`) so it can't hold a slot or a shutdown hostage
 - Per-instance concurrency (`concurrency`) and per-lane concurrency (`laneConcurrency`)
@@ -22,7 +24,7 @@ When running multiple instances of the same application, `@prostojs/redisjm` ens
 - Maintenance on its own timer — bounded, lock-guarded, compare-and-set, and still able to free memory when Redis is full
 - Memory guardrails — eviction-policy check, `health()` snapshot, `memoryPressure` alarm, per-record history TTL (Redis ≥ 7.4), inputs-size limit
 - Polling-based job execution with `start` / awaitable `stop` (graceful drain or fast abort) and `wake()` for push-style doorbells
-- Introspection — `stats()`, `health()`, `inFlight()` / `inFlightCount()`, `listPage()`, `queueSize()`, and terminal records observable for 60s by default
+- Introspection — `stats()`, `health()`, `inFlight()` / `inFlightCount()`, `resourceInFlight()` / `resourceInFlightCount()`, `listPage()`, `queueSize()`, and terminal records observable for 60s by default
 - Queue listing in pop order (`listQueued()`) and batch record reads (`getMany()`) — no private key names needed
 - Worker fleet registry — `fleet()` reports the live consumer instances and their capacity (`presence`, `instanceLabel`)
 - Failures visible by default — handler errors, timeouts, and start failures are logged (configurable / silenceable)
@@ -107,6 +109,8 @@ Redis structures per target group:
 | `redisjm:{tg}:suspects` | Hash | jobId -> first-seen epoch-ms; backs maintenance's two-pass orphaned-lock reclaim |
 | `redisjm:{tg}:jobs` | Set | Job names that have (or recently had) runs in the group — maintenance's index of per-job sets |
 | `redisjm:{tg}:jobs:{jobName}:locks` | Set | This job's jobIds holding a lock — backs `inFlight()` and `maxInFlight` |
+| `redisjm:{tg}:res:{resource}:locks` | Set | jobIds holding the resource (any job declaring it) — backs `resourceCaps` and `resourceInFlight*()` (see [Resources](#resources)) |
+| `redisjm:{tg}:resources` | Set | Resource names that have (or recently had) holders — maintenance's index of resource sets |
 | `redisjm:{tg}:jobs:{jobName}:lanes` | Set | Lane list keys (`redisjm:{tg}:queue`, `redisjm:{tg}:lane:{lane}:queue`) this job has queue entries on — lets consumers drain a job's old lane after a lane change |
 | `redisjm:{tg}:maintenance-lock` | String (PX TTL) | Group-wide maintenance lock. Never deleted — its expiry spaces passes about one `maintenanceInterval` apart across the fleet |
 | `redisjm:{tg}:maintenance-cursor`, `…:maintenance-locks-cursor`, `…:maintenance-jobs-cursor` | String | Persisted scan cursors, so consecutive maintenance passes (on any instance) continue where the last one stopped |
@@ -147,6 +151,8 @@ new RedisJM(redis: Redis, targetGroup: string, options?: RedisJMOptions)
 | `laneConcurrency` | `{}` | Per-lane cap on this instance's simultaneous poll-loop runs (`'default'` key = default lane), within `concurrency`. See [Concurrency](#concurrency) |
 | `laneCaps` | `{}` | Per-lane enqueue caps (`'default'` key = default lane): an enqueue onto a lane whose list already holds `>= cap` entries returns `'full'`. See [Backpressure](#backpressure) |
 | `maxInputsBytes` | `0` (unlimited) | Max size of a run's JSON-serialized inputs; a larger single enqueue throws `RedisJMEnqueueError` with reason `'inputs-too-large'` before anything is written (`enqueueMany` reports such an entry per entry instead). A job's own `maxInputsBytes` wins |
+| `maxRunIdBytes` | `1024` | Max UTF-8 size of a `runId`; a longer single enqueue throws `RedisJMEnqueueError` with reason `'run-id-too-large'` before anything is written (`enqueueMany` reports it per entry). A job's own `maxRunIdBytes` wins; `0` = unlimited. A runId is stored about six times per live run, so it needs its own bound besides `maxInputsBytes` |
+| `resourceCaps` | `{}` | Caps of the named resources jobs declare in `resources`: max runs (of any declaring job) holding the resource at once, across all instances. Give every instance the same values. Bad name or cap → `TypeError`. See [Resources](#resources) |
 | `maxRecordsPerPass` | `1000` | Upper bound on the items each maintenance stage examines per pass. See [Maintenance](#maintenance) |
 | `memoryWarnRatio` | `0.8` | `used_memory / maxmemory` ratio at which the maintenance timer fires `memoryPressure` and logs a warning (once per crossing). `0` disables; ignored when Redis has no `maxmemory` |
 | `unknownJobRequeueLimit` | `5` | Times a job whose name isn't registered on the popping instance is re-queued (lock held) for a sibling instance before being dropped as an error. `0` restores the legacy drop-on-first-pop behavior |
@@ -171,11 +177,11 @@ const job = manager.createJob(
 )
 ```
 
-See [Job metadata](#job-metadata) for every field (`lane`, `attempts`, `backoff`, `timeoutMs`, `maxQueued`, `maxInFlight`, `maxInputsBytes`).
+See [Job metadata](#job-metadata) for every field (`lane`, `attempts`, `backoff`, `timeoutMs`, `maxQueued`, `maxInFlight`, `resources`, `maxInputsBytes`, `maxRunIdBytes`, `validate`). Registering a job that declares a resource missing from `resourceCaps` throws.
 
 ##### `enqueue<TInputs>(job, runId, inputs, options?): Promise<EnqueueResult>`
 
-Enqueues a job run and reports what happened as `{ status, jobId }`. The whole enqueue — dedupe check, `maxInFlight` check, lane-cap check, lock, record, and queue (or delayed-set) entry — is **one atomic server-side script**: there is never a half-written run, and a refused enqueue wrote nothing.
+Enqueues a job run and reports what happened as `{ status, jobId, limitedBy? }`. The whole enqueue — dedupe check, `maxInFlight` and resource checks, lane-cap check, lock, record, and queue (or delayed-set) entry — is **one atomic server-side script**: there is never a half-written run, and a refused enqueue wrote nothing.
 
 Options:
 - `delay` (ms) — stage the run on the [delayed set](#retries--delayed-runs) instead of the live queue (finite number ≥ 0). The run holds its lock while it waits, so dedupe still applies.
@@ -185,10 +191,10 @@ Options:
 |---|---|---|
 | `'queued'` | The run was written (lane queue, or delayed set when `delay > 0`). | Done. |
 | `'deduped'` | A run with this `runId` already holds a lock (queued, delayed, or running). Nothing was written. | This is the dedupe working: for idempotent triggers (cron on every instance) treat it as success. Need a fresh run regardless? Use a distinct `runId`. |
-| `'busy'` | The job already has `>= maxInFlight` runs holding a lock. Nothing was written. | Skip this trigger, or try again later. See [Backpressure](#backpressure). |
+| `'busy'` | The job already has `>= maxInFlight` runs holding a lock (`limitedBy: 'job'`), or one of its `resources` is at its cap (`limitedBy: '<resource>'`). Nothing was written. | Skip this trigger, or try again later. See [Backpressure](#backpressure) and [Resources](#resources). |
 | `'full'` | The lane's queue is at its cap (`maxQueued` / `laneCaps`). Nothing was written. | Shed load upstream (e.g. respond 429/503) and retry later with backoff. |
 
-Redis failures are **not** a status: they throw [`RedisJMEnqueueError`](#redisjmenqueueerror) (and fire the manager-level `enqueueFailed` hook). So do inputs over `maxInputsBytes` (`'inputs-too-large'`) and inputs `JSON.stringify` can't serialize — a BigInt, a circular reference (`'inputs-unserializable'`) — both before any Redis traffic. Validation errors (bad lane, bad delay, `first` + `delay`) throw a plain `TypeError`/`Error`. See [Failure handling](#failure-handling).
+Redis failures are **not** a status: they throw [`RedisJMEnqueueError`](#redisjmenqueueerror) (and fire the manager-level `enqueueFailed` hook). So do, before any Redis traffic and in this order: a runId over `maxRunIdBytes` (`'run-id-too-large'`), inputs `JSON.stringify` can't serialize — a BigInt, a circular reference (`'inputs-unserializable'`), inputs over `maxInputsBytes` (`'inputs-too-large'`), and inputs the job's [`validate`](#payload-contract-validate) refused (`'invalid'`, the validator's string in `err.detail`). Validation errors (bad lane, bad delay, `first` + `delay`) throw a plain `TypeError`/`Error`. See [Failure handling](#failure-handling).
 
 ```typescript
 const { status } = await manager.enqueue(job, 'order-123', { orderId: '123' })
@@ -204,10 +210,12 @@ An entry whose inputs a single `enqueue` would reject before any Redis traffic i
 
 | `status` | Extra fields | Meaning |
 |---|---|---|
-| `'inputs-too-large'` | `size`, `limit` | Its serialized inputs are `size` bytes (UTF-8), over `limit` (the effective `maxInputsBytes`). |
+| `'run-id-too-large'` | `size`, `limit` | Its runId is `size` bytes (UTF-8), over `limit` (the effective `maxRunIdBytes`). |
 | `'inputs-unserializable'` | `error` | `JSON.stringify` of its inputs threw (a BigInt, a circular reference, a throwing `toJSON`). |
+| `'inputs-too-large'` | `size`, `limit` | Its serialized inputs are `size` bytes (UTF-8), over `limit` (the effective `maxInputsBytes`). |
+| `'invalid'` | `reason` | The job's `validate` returned `reason`. |
 
-The other entries enqueue as usual. A reported entry takes no lane-cap or `maxInFlight` slot and doesn't dedupe a later copy of its `runId` in the same batch (that copy can still be `'queued'`); when every entry is reported, Redis isn't called. Like `'busy'` / `'full'`, these are results: `enqueueFailed` doesn't fire for them — count them from the returned array.
+The other entries enqueue as usual. A reported entry takes no lane-cap, `maxInFlight` or resource slot and doesn't dedupe a later copy of its `runId` in the same batch (that copy can still be `'queued'`); when every entry is reported, Redis isn't called. Like `'busy'` / `'full'`, these are results: `enqueueFailed` doesn't fire for them — count them from the returned array.
 
 All-or-nothing on a Redis failure: it throws one `RedisJMEnqueueError` (its `jobId` is the first entry sent to Redis) and nothing was written.
 
@@ -288,6 +296,7 @@ Operational health snapshot, cheap enough for a liveness/metrics endpoint:
 | `usedMemory`, `maxMemory`, `usedRatio`, `maxmemoryPolicy` | From `INFO memory` (works on managed Redis that blocks `CONFIG`, and while Redis is full). `usedRatio` is `null` when there is no `maxmemory` |
 | `oomRefusals` | Enqueues refused with an OOM error by **this** instance since it was created |
 | `queues` | `LLEN` per lane this instance knows (default, `__maintenance`, registered jobs' lanes, lanes in `laneCaps` / `laneConcurrency`) |
+| `resources` | Per resource in this instance's `resourceCaps`: `{ inFlight, cap }` (one `SCARD` each) |
 | `delayed`, `claiming`, `locks` | Cardinalities of the delayed set, the `claiming` set (normally ~0 — a growing value means stuck pops), and the locks set |
 | `running` | **Estimate** `locks − Σqueues − delayed − claiming` (floored at 0) — also counts orphaned locks and runs queued on lanes this instance doesn't know. Exact with `{ scan: true }` |
 | `stale` | `null` unless `{ scan: true }` |
@@ -318,6 +327,18 @@ if (await manager.inFlightCount('send-email') >= 10) return // shed load
 ```
 
 > In a group where a pre-0.2 instance still writes, the count drifts — see [Upgrading to 0.3](#upgrading-to-03).
+
+##### `resourceInFlightCount(name): Promise<number>`
+
+Runs holding resource `name` — of every job declaring it, queued (including popped-not-yet-claimed), delayed and running — as **one O(1) `SCARD`**. Exactly what `resourceCaps[name]` is enforced against. Throws `TypeError` on an invalid name. See [Resources](#resources).
+
+##### `resourceInFlight(name): Promise<ResourceInFlightCounts>`
+
+`{ total, queued, delayed, running, jobs }` for resource `name`, where `jobs` maps each job name to its holders. `SMEMBERS` + one `HMGET` — O(runs holding it). Like `inFlight()`, `total` can briefly be lower than `resourceInFlightCount()` while the set holds drift maintenance hasn't pruned yet.
+
+```typescript
+const { total, jobs } = await manager.resourceInFlight('ticket-writes') // jobs: { reconcile: 1, evaluate: 1 }
+```
 
 ##### `queueSize(lane?): Promise<number>`
 
@@ -528,7 +549,10 @@ new Job<TInputs, TAttrs>(metadata: JobMetadata, fn: JobFunction<TInputs, TAttrs>
 | `abortGraceMs` | manager `abortGraceMs` | Grace after an abort (not a timeout) before the attempt is abandoned with a `JobAbortedError`; `false` opts this job out of the manager default. See [Settling aborted runs](#settling-aborted-runs) |
 | `maxQueued` | — | Enqueue cap on this job's lane list (combined with `laneCaps`; the smaller wins) → `'full'`. See [Backpressure](#backpressure) |
 | `maxInFlight` | unlimited | Max runs of this job holding a lock at once (queued + delayed + running, any runId, all instances) → `'busy'`. `1` = single-flight |
+| `resources` | — | Named cross-job concurrency caps each run holds while it holds its lock → `'busy'` with `limitedBy`. See [Resources](#resources) |
 | `maxInputsBytes` | manager `maxInputsBytes` | Max JSON-serialized inputs size; `0` disables the manager default for this job |
+| `maxRunIdBytes` | manager `maxRunIdBytes` (`1024`) | Max UTF-8 runId size → `'run-id-too-large'`; `0` disables the limit for this job. See [Failure handling](#failure-handling) |
+| `validate` | — | Synchronous payload check run by every producer; a non-empty string refuses the entry (`'invalid'`). See [Payload contract](#payload-contract-validate) |
 
 #### Job Function Signature
 
@@ -607,7 +631,7 @@ Returns `"jobName#runId"`.
 
 #### `RedisJMEnqueueError`
 
-Thrown by `enqueue` / `enqueueMany` / `queue` / `queueFirst` (and their `Job` counterparts) when Redis refuses or fails the enqueue, or — by the single-run calls — before any write when the inputs are too large or can't be serialized (`enqueueMany` reports those per entry). Fields: `reason`, `jobId` (`"jobName#runId"`; for a batch, the first entry sent to Redis), `cause` (the underlying error).
+Thrown by `enqueue` / `enqueueMany` / `queue` / `queueFirst` (and their `Job` counterparts) when Redis refuses or fails the enqueue, or — by the single-run calls — before any write when the runId or inputs are too large, the inputs can't be serialized, or `validate` refused them (`enqueueMany` reports those per entry). Fields: `reason`, `jobId` (`"jobName#runId"`; for a batch, the first entry sent to Redis), `cause` (the underlying error), `detail` (for `'invalid'`: the validator's string). The message quotes at most 200 characters of the jobId.
 
 | `reason` | Meaning | Was anything written? |
 |---|---|---|
@@ -615,7 +639,9 @@ Thrown by `enqueue` / `enqueueMany` / `queue` / `queueFirst` (and their `Job` co
 | `'readonly'` | The client is talking to a read-only replica (e.g. mid-failover) | No |
 | `'connection'` | The connection is gone or never came up | **Unknown** — the script may still have run. Retrying the same `runId` is safe (it may come back `'deduped'`) |
 | `'timeout'` | The client gave up waiting (ioredis `MaxRetriesPerRequestError`, `commandTimeout`) | **Unknown** — as above |
+| `'run-id-too-large'` | The runId exceeds `maxRunIdBytes` (single-run calls only) | No — rejected before any Redis traffic |
 | `'inputs-too-large'` | Serialized inputs exceed `maxInputsBytes` (single-run calls only) | No — rejected before any Redis traffic |
+| `'invalid'` | The job's `validate` refused the entry (single-run calls only; `detail` is its string) | No — rejected before any Redis traffic |
 | `'inputs-unserializable'` | `JSON.stringify` of the inputs threw — a BigInt, a circular reference (single-run calls only; `cause` is the stringify error) | No — rejected before any Redis traffic |
 | `'unknown'` | Anything else | Treat as unknown |
 
@@ -859,6 +885,40 @@ if (status === 'full') return reply(503, 'queue is full, try later')
 
 **Watching it:** `inFlightCount(jobName)` for the exact number `maxInFlight` is enforced against (one O(1) `SCARD` — fine on a hot path), `inFlight(jobName)` for the per-status split (O(runs of that job) — dashboards and occasional use), `listQueued()` for what is waiting and in which order, `health()` for lane lengths and memory.
 
+A cap shared by **several** jobs is a [resource](#resources).
+
+## Resources
+
+A resource is a fleet-wide counting semaphore shared **across jobs**: "at most N runs of any of these jobs at once, on every instance" — e.g. several jobs writing to the same external system that tolerates only one writer.
+
+```typescript
+const manager = new RedisJM(redis, 'my-app', {
+  resourceCaps: { 'ticket-writes': 1, 'crm-api': 4 }, // same values on every instance
+})
+
+manager.createJob({ jobName: 'reconcile', resources: ['ticket-writes'], maxInFlight: 1 }, reconcile)
+manager.createJob({ jobName: 'evaluate', resources: ['ticket-writes'] }, evaluate)
+manager.createJob({ jobName: 'reroute', resources: ['ticket-writes', 'crm-api'] }, reroute)
+
+const r = await manager.enqueue(evaluateJob, 'team-7', { teamId: 7 })
+if (r.status === 'busy') log.info(`not now: ${r.limitedBy} is at its cap`) // 'ticket-writes' (or 'job' for maxInFlight)
+```
+
+How it behaves:
+
+- **Admission-time, like `maxInFlight`.** A run holds its resources from enqueue until its lock is released — queued, delayed (including a retry waiting out its backoff) and running all count. An enqueue while any of the job's resources is at its cap returns `'busy'` with `limitedBy` naming the first full one and writes nothing. There is no wait queue: a refused producer enqueues again later (timers and `every()` do that by re-firing).
+- **Atomic.** The job's `maxInFlight` (checked first, `limitedBy: 'job'`), every resource, and the lane cap are checked and taken in the same script as the run lock — a job with several resources never holds one while waiting on another. In `enqueueMany`, earlier entries win the slots.
+- **Released on every path** that releases the lock: finish, final error, a heartbeat-lapse or `maxRunMs` stale, `unqueue`, and orphan reclaim. Whichever instance releases the run frees the resources stored on its **record**, not the ones in its own job definition. A stale run that resurrects re-takes its slots without a cap check, so the count can briefly exceed the cap (as with `maxInFlight`).
+- **Self-healing.** Maintenance prunes members whose run lock is gone (slots an orphan purge couldn't name, or a pre-0.5 instance released without them), so a leak lasts at most until the next pass.
+- **Configuration errors throw.** A job declaring a resource missing from `resourceCaps` throws at `registerJob` and at every enqueue — on producers that only construct the `Job`, and on consumers that register it. Names follow the lane rules (`/^[A-Za-z0-9_-]+$/`, no `__` prefix); `'job'` is reserved. A cap of `0` refuses every run.
+- **Caps travel with each instance's options**, like `laneCaps`; they are not stored in Redis. During a deploy that changes a cap, each producer enforces its own value.
+
+**Fairness.** Without a wait queue, under contention the job whose producer fires more often wins the slots. To keep one job from starving the others, combine caps: with `resourceCaps['ticket-writes'] = 3` and `maxInFlight: 1` on each member job, no member can hold more than one of the three slots.
+
+**Watching it:** `resourceInFlightCount(name)` (O(1), exactly what the cap is enforced against), `resourceInFlight(name)` (by status and job), `health().resources` (count and cap per configured resource).
+
+Declaring `resources` needs every instance of the group on 0.5 — see [Upgrading to 0.5](#upgrading-to-05).
+
 ## Cancellation
 
 Every execution's `ctx.signal` is an `AbortSignal` that aborts when the run should stop wasting work:
@@ -930,7 +990,9 @@ async function trigger(runId: string, inputs: Inputs) {
       case 'timeout':          // ambiguous: retrying with the SAME runId is safe (may return 'deduped')
         return (await job.enqueue(runId, inputs)).status
       case 'inputs-too-large': // store the payload elsewhere and enqueue a reference
+      case 'run-id-too-large': // derive a shorter runId (e.g. a hash of the inputs)
       case 'inputs-unserializable': // a BigInt / circular reference in the inputs: a producer bug
+      case 'invalid':          // the job's validate refused it — err.detail says why
         throw err
       default:
         throw err
@@ -939,7 +1001,30 @@ async function trigger(runId: string, inputs: Inputs) {
 }
 ```
 
-Every `RedisJMEnqueueError` also fires the manager-level `enqueueFailed` hook (wire it to metrics), and OOM refusals are counted in `health().oomRefusals`. `enqueueMany` reports `'inputs-too-large'` / `'inputs-unserializable'` entries in its results instead (no throw, no hook).
+Every `RedisJMEnqueueError` also fires the manager-level `enqueueFailed` hook (wire it to metrics), and OOM refusals are counted in `health().oomRefusals`. `enqueueMany` reports `'run-id-too-large'` / `'inputs-too-large'` / `'inputs-unserializable'` / `'invalid'` entries in its results instead (no throw, no hook).
+
+### Payload contract (`validate`)
+
+Checks every producer of a job must apply — timers, `every()`, manual triggers, `enqueueMany` — live on the job definition, so there is one refusal channel:
+
+```typescript
+const syncJob = manager.createJob<{ ids: string[] }>({
+  jobName: 'sync-records',
+  maxRunIdBytes: 128,
+  validate: ({ inputs }) => (inputs.ids.length > 500 ? 'too-many-ids' : undefined),
+}, sync)
+
+const results = await syncJob.enqueueMany(batches)
+for (const r of results) {
+  if (r.status === 'invalid') log.warn(`${r.jobId}: ${r.reason}`)        // 'too-many-ids'
+  if (r.status === 'run-id-too-large') log.warn(`${r.size} > ${r.limit}`)
+}
+```
+
+- `validate` runs after the built-in checks (`maxRunIdBytes`, serializability, `maxInputsBytes`) and before any Redis traffic. Return a non-empty string to refuse the entry; anything else (`undefined`, `''`, a non-string) accepts it.
+- A single enqueue throws `RedisJMEnqueueError` with `reason: 'invalid'` and `detail` = the string (`enqueueFailed` fires); `enqueueMany` reports `{ status: 'invalid', reason }` for that entry and enqueues the others. A refused entry takes no slot.
+- Keep it synchronous and cheap — it is on every enqueue path. A validator that **throws** is treated as a bug: the error propagates as is and nothing of that call is written.
+- Like `lane` and `maxInFlight`, the **producer's** `Job` metadata is what applies — keep it in sync with the consumer's.
 
 ### Start-failure recovery
 
@@ -1164,12 +1249,25 @@ Roll a lane-aware version out to **every** instance in the group **before** any 
 - [ ] `maxRunMs` set above your slowest healthy run, as a backstop.
 - [ ] `abortGraceMs` set if shutdown must be bounded against handlers that ignore `ctx.signal` (and `attempts > 1` for runs that must survive an abort).
 - [ ] Producers handle every enqueue outcome: `deduped`/`busy`/`full` vs `RedisJMEnqueueError` — never report an error as "already running". `enqueueFailed` wired to metrics.
-- [ ] Queue growth bounded: `laneCaps`/`maxQueued` for lanes fed by external traffic; `maxInputsBytes` set.
+- [ ] Queue growth bounded: `laneCaps`/`maxQueued` for lanes fed by external traffic; `maxInputsBytes` set (and `maxRunIdBytes` left on).
+- [ ] Same `resourceCaps` on every instance; every resource a job declares has a cap.
 - [ ] `keepFinishedInterval` sized for throughput (lower it for high-volume jobs observed via hooks).
 - [ ] Maintenance running: every consumer calls `start()` with `maintenanceInterval > 0`, or schedules `runMaintenance()`; `maxRecordsPerPass` sized for the log (see [Bounded passes](#bounded-passes)).
 - [ ] Graceful shutdown: `await manager.stop()` on `SIGTERM` before closing Redis.
 - [ ] Clocks synced (NTP) across instances.
 - [ ] Lane changes shipped in a separate deploy from library upgrades.
+
+## Upgrading to 0.5
+
+0.5 adds [resources](#resources) and the enqueue payload contract (`maxRunIdBytes`, `validate`). New keys (`res:{name}:locks`, `resources`); existing keys keep their format. Breaking changes:
+
+| Change | What to do |
+|---|---|
+| **`maxRunIdBytes` is on by default (`1024` bytes, UTF-8).** A longer runId — e.g. `JSON.stringify(inputs)` of a large payload used as the runId — is refused: single enqueue / `queue` / `queueFirst` throw `RedisJMEnqueueError('run-id-too-large')` (an `every()` tick logs it and enqueues nothing), `enqueueMany` reports it per entry. | Derive shorter runIds (a hash of the inputs), or raise / disable the limit (`maxRunIdBytes: 0`) on the manager or the job. |
+| **`EnqueueErrorReason` gains `'run-id-too-large'` and `'invalid'`; `EnqueueManyResult` gains `{ status: 'run-id-too-large', size, limit }` and `{ status: 'invalid', reason }`.** | An exhaustive `switch` over either needs the new cases. |
+| **`'busy'` results carry `limitedBy`** (`'job'` for `maxInFlight`, else the resource name). | Code comparing results with deep equality (`toEqual({ status: 'busy', jobId })`) must include it. |
+| **`RedisJMHealth` gains `resources`**; `ResolvedRedisJMOptions` gains `maxRunIdBytes` and `resourceCaps`. | Snapshot-style assertions on `health()` / `getOptions()` need the new fields. |
+| **Rolling deploy:** 0.4 instances neither add runs to nor remove them from resource sets. Runs a 0.4 producer admits aren't counted (under-enforcement); runs a 0.4 instance releases (finish, error, stale, `unqueue`) stay counted until a 0.5 instance's maintenance pass prunes them (over-count — a pass run by a 0.4 instance prunes nothing); a run a 0.4 instance resurrects isn't re-counted. | Don't declare `resources` on a job until every instance in the group runs 0.5. `maxRunIdBytes` / `validate` need no coordination (enqueue-side only). |
 
 ## Upgrading to 0.4
 
@@ -1321,13 +1419,15 @@ type JobStatus = 'queued' | 'running' | 'finished' | 'error' | 'stale' | 'delaye
 type LaneStrategy = 'roundRobin' | 'priority'
 type RedisJMLogger = (message: string, error?: Error) => void
 type RedisErrorReason = 'oom' | 'readonly' | 'connection' | 'timeout' | 'unknown'
-type EnqueueErrorReason = RedisErrorReason | 'inputs-too-large' | 'inputs-unserializable'
+type EnqueueErrorReason = RedisErrorReason | 'run-id-too-large' | 'inputs-too-large' | 'inputs-unserializable' | 'invalid'
 
-interface EnqueueResult { status: 'queued' | 'deduped' | 'busy' | 'full'; jobId: string }
+interface EnqueueResult { status: 'queued' | 'deduped' | 'busy' | 'full'; jobId: string; limitedBy?: string }
 type EnqueueManyResult =
   | EnqueueResult
+  | { status: 'run-id-too-large'; jobId: string; size: number; limit: number }
   | { status: 'inputs-too-large'; jobId: string; size: number; limit: number }
   | { status: 'inputs-unserializable'; jobId: string; error: Error }
+  | { status: 'invalid'; jobId: string; reason: string }
 interface QueueOptions { delay?: number }
 interface EnqueueOptions extends QueueOptions { first?: boolean }
 interface StopOptions { abort?: boolean }
@@ -1338,12 +1438,13 @@ interface StopOptions { abort?: boolean }
 | `RedisJMOptions` / `ResolvedRedisJMOptions` | Constructor options / the same with defaults applied (`getOptions()`, everything except `logger`) — see the [options table](#constructor) |
 | `JobMetadata` | Job definition — see [Job metadata](#job-metadata) |
 | `JobFunction`, `JobContext`, `JobExecuteOptions` | Handler signature, its `ctx`, and `execute()` options |
-| `JobLogRecord` | A log record: `jobId`, `jobName`, `runId`, `inputs`, `targetGroup`, `lane?`, `status`, `progress`, `attrs?`, `error?`, timestamps (`startedAt`, `finishedAt`, `heartbeat`, `readyAt`, `enqueuedAt`), `attempt`, `executionId`, `requeueCount`, `suspectedAt`, `staleReason` (`'heartbeat' \| 'orphaned' \| 'maxRunMs'`) |
+| `JobLogRecord` | A log record: `jobId`, `jobName`, `runId`, `inputs`, `targetGroup`, `lane?`, `status`, `progress`, `attrs?`, `error?`, timestamps (`startedAt`, `finishedAt`, `heartbeat`, `readyAt`, `enqueuedAt`), `attempt`, `executionId`, `requeueCount`, `suspectedAt`, `staleReason` (`'heartbeat' \| 'orphaned' \| 'maxRunMs'`), `resources?` (taken at enqueue) |
 | `JobHooks`, `RedisJMHooks` | Job-level and manager-level hook maps — see [Events](#events) |
 | `JobEventPayload`, `JobErrorEventPayload`, `JobRetryEventPayload`, `JobTimeoutEventPayload`, `JobUpdateEventPayload` | Run-event payloads |
 | `EnqueueFailedEventPayload`, `StartFailedEventPayload` | `enqueueFailed` / `startFailed` payloads |
 | `EveryOptions` | `every()` options |
 | `InFlightCounts` | `inFlight()` result `{ total, queued, delayed, running }` |
+| `ResourceInFlightCounts` | `resourceInFlight()` result: `InFlightCounts` plus `jobs` (holders per job name) |
 | `ListPageOptions`, `ListPage` | `listPage()` options / result |
 | `ListQueuedOptions`, `QueuedEntry`, `QueuedPage` | `listQueued()` options / entry `{ jobId, jobName, runId, lane?, status, poppedAt?, readyAt? }` / page `{ entries, nextOffset?, complete }` |
 | `FleetInstance`, `RedisJMFleet` | `fleet()` result — see [`fleet()`](#fleet-promiseredisjmfleet) |
