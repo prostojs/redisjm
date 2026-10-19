@@ -771,7 +771,7 @@ export class RedisJM extends Hookable<RedisJMHooks> {
    *
    * @example
    * ```ts
-   * const writers = await manager.resourceInFlightCount('ticket-writes')
+   * const writers = await manager.resourceInFlightCount('inventory-writes')
    * ```
    */
   async resourceInFlightCount(name: string): Promise<number> {
@@ -785,7 +785,7 @@ export class RedisJM extends Hookable<RedisJMHooks> {
    *
    * @example
    * ```ts
-   * const { total, jobs } = await manager.resourceInFlight('ticket-writes')
+   * const { total, jobs } = await manager.resourceInFlight('inventory-writes')
    * ```
    */
   async resourceInFlight(name: string): Promise<ResourceInFlightCounts> {

@@ -337,7 +337,7 @@ Runs holding resource `name` — of every job declaring it, queued (including po
 `{ total, queued, delayed, running, jobs }` for resource `name`, where `jobs` maps each job name to its holders. `SMEMBERS` + one `HMGET` — O(runs holding it). Like `inFlight()`, `total` can briefly be lower than `resourceInFlightCount()` while the set holds drift maintenance hasn't pruned yet.
 
 ```typescript
-const { total, jobs } = await manager.resourceInFlight('ticket-writes') // jobs: { reconcile: 1, evaluate: 1 }
+const { total, jobs } = await manager.resourceInFlight('inventory-writes') // jobs: { restock: 1, allocate: 1 }
 ```
 
 ##### `queueSize(lane?): Promise<number>`
@@ -893,15 +893,15 @@ A resource is a fleet-wide counting semaphore shared **across jobs**: "at most N
 
 ```typescript
 const manager = new RedisJM(redis, 'my-app', {
-  resourceCaps: { 'ticket-writes': 1, 'crm-api': 4 }, // same values on every instance
+  resourceCaps: { 'inventory-writes': 1, 'payments-api': 4 }, // same values on every instance
 })
 
-manager.createJob({ jobName: 'reconcile', resources: ['ticket-writes'], maxInFlight: 1 }, reconcile)
-manager.createJob({ jobName: 'evaluate', resources: ['ticket-writes'] }, evaluate)
-manager.createJob({ jobName: 'reroute', resources: ['ticket-writes', 'crm-api'] }, reroute)
+manager.createJob({ jobName: 'restock', resources: ['inventory-writes'], maxInFlight: 1 }, restock)
+manager.createJob({ jobName: 'allocate', resources: ['inventory-writes'] }, allocate)
+manager.createJob({ jobName: 'transfer', resources: ['inventory-writes', 'payments-api'] }, transfer)
 
-const r = await manager.enqueue(evaluateJob, 'team-7', { teamId: 7 })
-if (r.status === 'busy') log.info(`not now: ${r.limitedBy} is at its cap`) // 'ticket-writes' (or 'job' for maxInFlight)
+const r = await manager.enqueue(allocateJob, 'sku-7', { skuId: 7 })
+if (r.status === 'busy') log.info(`not now: ${r.limitedBy} is at its cap`) // 'inventory-writes' (or 'job' for maxInFlight)
 ```
 
 How it behaves:
@@ -913,7 +913,7 @@ How it behaves:
 - **Configuration errors throw.** A job declaring a resource missing from `resourceCaps` throws at `registerJob` and at every enqueue — on producers that only construct the `Job`, and on consumers that register it. Names follow the lane rules (`/^[A-Za-z0-9_-]+$/`, no `__` prefix); `'job'` is reserved. A cap of `0` refuses every run.
 - **Caps travel with each instance's options**, like `laneCaps`; they are not stored in Redis. During a deploy that changes a cap, each producer enforces its own value.
 
-**Fairness.** Without a wait queue, under contention the job whose producer fires more often wins the slots. To keep one job from starving the others, combine caps: with `resourceCaps['ticket-writes'] = 3` and `maxInFlight: 1` on each member job, no member can hold more than one of the three slots.
+**Fairness.** Without a wait queue, under contention the job whose producer fires more often wins the slots. To keep one job from starving the others, combine caps: with `resourceCaps['inventory-writes'] = 3` and `maxInFlight: 1` on each member job, no member can hold more than one of the three slots.
 
 **Watching it:** `resourceInFlightCount(name)` (O(1), exactly what the cap is enforced against), `resourceInFlight(name)` (by status and job), `health().resources` (count and cap per configured resource).
 

@@ -29,8 +29,8 @@ describe.skipIf(!REDIS_URL)('0.5.0 integration (shared Redis)', () => {
     const options = { resourceCaps: { writes: 3 } }
     const managers = [newManager(options, group, h.newClient()), newManager(options, group, h.newClient()), newManager(options, group, h.newClient())]
     const jobs = managers.flatMap((m) => [
-      new Job({ jobName: 'reconcile', resources: ['writes'] }, async () => {}),
-      new Job({ jobName: 'evaluate', resources: ['writes'] }, async () => {}),
+      new Job({ jobName: 'restock', resources: ['writes'] }, async () => {}),
+      new Job({ jobName: 'allocate', resources: ['writes'] }, async () => {}),
     ])
     const results = await Promise.all(Array.from({ length: 60 }, (_, i) => {
       const m = managers[i % managers.length]
